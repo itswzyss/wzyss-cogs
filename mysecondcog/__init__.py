@@ -3,6 +3,6 @@
 from .mysecondcog import MySecondCog
 
 
-def setup(bot):
+async def setup(bot):
     # Add the cog to the bot.
-    bot.add_cog(MySecondCog())
+    await bot.add_cog(MySecondCog())
