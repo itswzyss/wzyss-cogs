@@ -1,6 +1,6 @@
 # This init is required for each cog.
 # Import your main class from the cog's folder.
-from .myfristcog import MyFirstCog
+from .myfirstcog import MyFirstCog
 
 
 def setup(bot):
