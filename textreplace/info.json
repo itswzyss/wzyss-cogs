@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing Text Replace! Use `[p]help textreplace` to see available commands.",
+    "name": "TextReplace",
+    "short": "Replace text using Regex.",
+    "description": "Automatically replaces text using Regex. This cog can repost messages with text replaced according to configured regex patterns.",
+    "tags": ["text", "utility", "moderation", "regex"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+} 
