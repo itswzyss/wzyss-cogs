@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing Link Replacer! Use `[p]help linkreplacer` to see available commands.",
+    "name": "LinkReplacer",
+    "short": "Replace links with configured alternatives.",
+    "description": "Automatically replaces configured links with alternatives. For example, replace X.com links with fixupx.com links.",
+    "tags": ["links", "utility", "moderation"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+} 
