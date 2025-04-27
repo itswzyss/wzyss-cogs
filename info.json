@@ -1,6 +1,6 @@
 {
     "author" : ["Wzyss"],
-    "install_msg" : "Message the user will recieve when they agree to install your repository.",
+    "install_msg" : "Thanks for installing my cogs! If you have any issues, please contact me on Discord: `wzyss`",
     "name" : "Wzyss-Cogs",
     "short" : "Wzyss-Cogs",
     "description" : "A collection of cogs for Red-DiscordBot",
