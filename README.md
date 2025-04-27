@@ -1,11 +1,11 @@
 # Repository Name
-Description of your repository
+Wzyss-Cogs
 
 # Installation
-Provide installation instructions and possible 3rd party requirements.
+TBD
 
 # Contact
-Information on how to contact you about issues, bugs, and enhancements to your work
+Contact on Discord: `wzyss`
 
 # Credits
-Cite credit to anyone you collaborated with, or authors of code you used in your work that is not your own.
+TBD
