@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing Rockstar Newswire! Use `[p]help rockstarnewswire` to see available commands.",
+    "name": "RockstarNewswire",
+    "short": "Track and post Rockstar Games newswire updates.",
+    "description": "Automatically tracks Rockstar Games newswire feed and posts updates to configured channels. Supports multiple news types including GTA V, GTA VI, RDR2, music, fanart, and more.",
+    "tags": ["news", "rockstar", "gta", "rdr2", "notifications", "utility"],
+    "requirements": ["aiohttp", "beautifulsoup4"],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
