@@ -96,10 +96,12 @@ The cog comes with default form fields, but you can customize them:
 #### Add a new field
 
 ```
-[p]applications field add <name> <label> <type> [required]
+[p]applications field add <name> <label> <type> [required] [options]
 
-Types: text (short), paragraph (long), number
+Types: text (short), paragraph (long), number, select (multiple choice)
 ```
+
+For select fields, provide options separated by commas after the required parameter.
 
 Examples:
 
@@ -107,6 +109,22 @@ Examples:
 [p]applications field add age "What is your age?" text True
 [p]applications field add experience "Tell us about your experience" paragraph True
 [p]applications field add discord "How long have you used Discord?" number False
+[p]applications field add agreement "Do you agree to the rules?" select True "Yes,No"
+[p]applications field add experience_level "Experience Level" select True "Beginner,Intermediate,Advanced,Expert"
+```
+
+#### Set options for a select field
+
+```
+[p]applications field options <name> <options>
+
+Options should be separated by commas.
+```
+
+Example:
+
+```
+[p]applications field options agreement "Yes,No,Maybe"
 ```
 
 #### Remove a field

@@ -29,6 +29,14 @@ class ApplicationModal(Modal):
             required = field.get("required", True)
             default = field.get("default", "")
 
+            # For select fields, build placeholder from options
+            if field_type == "select":
+                options = field.get("options", [])
+                if options and not placeholder:
+                    placeholder = f"Options: {', '.join(options)}"
+                elif not placeholder:
+                    placeholder = "Enter one of the options"
+
             # Discord text input limits
             if field_type == "paragraph":
                 text_input = TextInput(
@@ -48,7 +56,7 @@ class ApplicationModal(Modal):
                     style=discord.TextStyle.short,
                     max_length=20,
                 )
-            else:  # text (short)
+            else:  # text (short) or select
                 text_input = TextInput(
                     label=label[:45],
                     placeholder=placeholder[:100] if placeholder else None,
@@ -64,8 +72,47 @@ class ApplicationModal(Modal):
     async def on_submit(self, interaction: discord.Interaction):
         """Handle form submission."""
         responses = {}
-        for field_name, text_input in self.inputs.items():
-            responses[field_name] = text_input.value
+        validation_errors = []
+
+        for field in self.form_fields:
+            field_name = field.get("name")
+            field_type = field.get("type", "text")
+            field_label = field.get("label", field_name)
+            text_input = self.inputs.get(field_name)
+
+            if not text_input:
+                continue
+
+            value = text_input.value.strip() if text_input.value else ""
+
+            # Validate select fields
+            if field_type == "select":
+                options = field.get("options", [])
+                if options:
+                    # Case-insensitive comparison
+                    value_lower = value.lower()
+                    matched_option = None
+                    for option in options:
+                        if option.lower() == value_lower:
+                            matched_option = option
+                            break
+
+                    if not matched_option:
+                        validation_errors.append(
+                            f"**{field_label}**: Must be one of: {', '.join(options)}"
+                        )
+                        continue
+                    else:
+                        # Use the original option value (preserve case)
+                        value = matched_option
+
+            responses[field_name] = value
+
+        # If validation errors, show them and don't submit
+        if validation_errors:
+            error_msg = "❌ **Validation Errors:**\n\n" + "\n".join(validation_errors)
+            await interaction.response.send_message(error_msg, ephemeral=True)
+            return
 
         # Store responses
         await self.cog.submit_application(interaction.user, interaction.channel, responses)
@@ -870,14 +917,41 @@ class Applications(commands.Cog):
         label: str,
         field_type: str,
         required: bool = True,
+        options: Optional[str] = None,
     ):
         """Add a form field.
 
-        Types: text (short), paragraph (long), number
+        Types: text (short), paragraph (long), number, select (multiple choice)
+        
+        For select fields, provide options separated by commas as the last argument.
+        Example: [p]applications field add experience "Experience Level" select True "Beginner,Intermediate,Advanced"
+        Example: [p]applications field add agreement "Do you agree?" select True "Yes,No"
         """
-        if field_type.lower() not in ["text", "paragraph", "number"]:
-            await ctx.send("Invalid field type. Use `text`, `paragraph`, or `number`.")
+        field_type_lower = field_type.lower()
+        if field_type_lower not in ["text", "paragraph", "number", "select"]:
+            await ctx.send("Invalid field type. Use `text`, `paragraph`, `number`, or `select`.")
             return
+
+        # Parse options for select fields
+        options_list = []
+        if field_type_lower == "select":
+            if not options:
+                await ctx.send(
+                    "Select fields require options. Provide them separated by commas.\n"
+                    "Example: `[p]applications field add experience \"Experience Level\" select True \"Beginner,Intermediate,Advanced\"`\n"
+                    "Example: `[p]applications field add agreement \"Do you agree?\" select True \"Yes,No\"`"
+                )
+                return
+            
+            # Split by comma
+            options_list = [opt.strip() for opt in options.split(",") if opt.strip()]
+            
+            if not options_list:
+                await ctx.send("At least one option is required for select fields.")
+                return
+            if len(options_list) < 2:
+                await ctx.send("Select fields require at least 2 options.")
+                return
 
         async with self.config.guild(ctx.guild).form_fields() as fields:
             # Check if field name already exists
@@ -885,17 +959,21 @@ class Applications(commands.Cog):
                 await ctx.send(f"A field with name `{name}` already exists.")
                 return
 
-            fields.append(
-                {
-                    "name": name,
-                    "label": label,
-                    "type": field_type.lower(),
-                    "required": required,
-                    "placeholder": "",
-                }
-            )
+            field_data = {
+                "name": name,
+                "label": label,
+                "type": field_type_lower,
+                "required": required,
+                "placeholder": "",
+            }
 
-        await ctx.send(f"Added field `{name}` to the application form.")
+            if field_type_lower == "select":
+                field_data["options"] = options_list
+
+            fields.append(field_data)
+
+        options_text = f" with options: {', '.join(options_list)}" if options_list else ""
+        await ctx.send(f"Added field `{name}` ({field_type_lower}){options_text} to the application form.")
 
     @_field.command(name="remove")
     async def _field_remove(self, ctx: commands.Context, name: str):
@@ -926,13 +1004,52 @@ class Applications(commands.Cog):
         for i, field in enumerate(fields, 1):
             field_type = field.get("type", "text")
             required = field.get("required", True)
+            options = field.get("options", [])
+            
+            value_text = f"**Name:** `{field.get('name')}`\n**Type:** {field_type}\n**Required:** {required}"
+            if options:
+                value_text += f"\n**Options:** {', '.join(options)}"
+            
             embed.add_field(
                 name=f"{i}. {field.get('label', field.get('name'))}",
-                value=f"**Name:** `{field.get('name')}`\n**Type:** {field_type}\n**Required:** {required}",
+                value=value_text,
                 inline=False,
             )
 
         await ctx.send(embed=embed)
+
+    @_field.command(name="options")
+    async def _field_options(self, ctx: commands.Context, name: str, *, options: str):
+        """Set options for a select field.
+        
+        Options should be separated by commas.
+        Example: [p]applications field options experience "Beginner,Intermediate,Advanced"
+        """
+        async with self.config.guild(ctx.guild).form_fields() as fields:
+            field = None
+            for f in fields:
+                if f.get("name") == name:
+                    field = f
+                    break
+
+            if not field:
+                await ctx.send(f"Field `{name}` not found.")
+                return
+
+            if field.get("type") != "select":
+                await ctx.send(f"Field `{name}` is not a select field. Only select fields can have options.")
+                return
+
+            options_list = [opt.strip() for opt in options.split(",") if opt.strip()]
+            if not options_list:
+                await ctx.send("At least one option is required.")
+                return
+            if len(options_list) < 2:
+                await ctx.send("Select fields require at least 2 options.")
+                return
+
+            field["options"] = options_list
+            await ctx.send(f"Updated options for field `{name}`: {', '.join(options_list)}")
 
     @_applications.command(name="settings")
     async def _settings(self, ctx: commands.Context):
