@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing Applications! Use `[p]help applications` to see available commands.",
+    "name": "Applications",
+    "short": "Server application system for member screening.",
+    "description": "Implements a server application system where new members must apply before gaining full access. Creates private channels for each applicant with configurable forms.",
+    "tags": ["applications", "moderation", "utility", "screening"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}

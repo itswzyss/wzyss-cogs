@@ -118,6 +118,28 @@ These are automatically installed when you install the cog.
 
 **Important:** After installing the cog, you **must** install Playwright browsers. The cog will not work without this step.
 
+#### Docker Installation (PhasecoreX/docker-red-discordbot)
+
+If you're using the [PhasecoreX/docker-red-discordbot](https://github.com/PhasecoreX/docker-red-discordbot) Docker image:
+
+```bash
+# Find your container name/ID
+docker ps
+
+# Execute playwright install inside the container
+docker exec -it <container_name_or_id> /data/venv/bin/playwright install chromium
+```
+
+Or if you're using docker-compose:
+
+```bash
+docker-compose exec redbot /data/venv/bin/playwright install chromium
+```
+
+**Note:** The virtual environment is located at `/data/venv` inside the container, so you need to use the full path to the playwright executable.
+
+#### Non-Docker Installation
+
 If you're running Red in a virtual environment (recommended):
 
 ```bash
