@@ -14,28 +14,58 @@ To install this cog, run the following commands in your Red bot:
 
 ## Setup
 
-### 1. Configure the Restricted Role
+### 1. Choose Your Role System
 
-Before enabling the system, you need to set up a restricted role in Discord:
+The cog supports two role systems - choose ONE:
+
+#### Option A: Restricted Role System (Default)
+- Members are assigned a restricted role on join that blocks access to most channels
+- On approval, the restricted role is removed, granting full access
+- Requires Discord role permission configuration
+
+#### Option B: Access Role System
+- Members join without any special role assignment
+- On approval, access roles are granted to grant server access
+- Simpler setup - no need to configure channel permissions
+
+**Note:** Use either restricted roles OR access roles, not both. Bypass roles work independently with either system.
+
+### 2. Configure the Role System
+
+#### If Using Restricted Role System:
 
 1. Create a new role (e.g., "Application Pending")
 2. In Server Settings → Roles, configure this role to:
    - **Deny** "View Channels" permission for all categories/channels
    - **Allow** "View Channels" permission for the application category only
-3. Set this role as the restricted role in the cog
+3. Set this role as the restricted role in the cog:
 
-### 2. Basic Configuration
+```
+[p]applications restrictedrole @Application Pending
+```
+
+#### If Using Access Role System:
+
+1. Create one or more roles that grant access to your server (e.g., "Member", "Verified")
+2. Add these roles as access roles:
+
+```
+[p]applications accessrole add @Member
+[p]applications accessrole add @Verified
+```
+
+To remove an access role:
+
+```
+[p]applications accessrole remove @Member
+```
+
+### 3. Basic Configuration
 
 #### Enable the system
 
 ```
 [p]applications toggle True
-```
-
-#### Set the restricted role
-
-```
-[p]applications restrictedrole @Application Pending
 ```
 
 #### Set the category for application channels
@@ -168,6 +198,24 @@ Example:
 ```
 [p]applications field remove <name>
 ```
+
+### 5. Troubleshooting
+
+#### Re-send Welcome Message
+
+If application buttons stop working after cog updates, you can re-send the welcome message:
+
+```
+[p]applications resend @user
+```
+
+Or, if run in an application channel without specifying a user, it will automatically detect the channel owner:
+
+```
+[p]applications resend
+```
+
+This will delete old welcome messages and send a fresh one with working buttons.
 
 ## Usage
 

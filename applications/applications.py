@@ -862,6 +862,7 @@ class Applications(commands.Cog):
         default_guild = {
             "enabled": False,
             "restricted_role": None,  # Role ID that blocks channel access
+            "access_roles": [],  # List of role IDs that grant access on approval (alternative to restricted_role)
             "bypass_roles": [],  # List of role IDs that skip application
             "manager_roles": [],  # List of role IDs that can manage applications
             "category_id": None,  # Category ID for application channels
@@ -1069,10 +1070,16 @@ class Applications(commands.Cog):
         )
 
         # Notify in channel
+        # Use allowed_mentions to ensure role mention is properly highlighted
+        allowed_mentions = None
+        if notification_role:
+            allowed_mentions = discord.AllowedMentions(roles=[notification_role])
+        
         await channel.send(
             content,
             embed=embed,
             view=view,
+            allowed_mentions=allowed_mentions,
         )
 
         log.info(f"Application submitted by {member.display_name} in {member.guild.name}")
@@ -1293,7 +1300,8 @@ class Applications(commands.Cog):
                             await self.send_welcome_message(channel, member)
                 return
 
-        # Assign restricted role
+        # Assign restricted role (if configured)
+        # Note: Either restricted_role OR access_roles should be used, not both
         restricted_role_id = await self.config.guild(member.guild).restricted_role()
         if restricted_role_id:
             restricted_role = member.guild.get_role(restricted_role_id)
@@ -1307,6 +1315,7 @@ class Applications(commands.Cog):
                     log.error(f"Error assigning restricted role: {e}")
             else:
                 log.warning(f"Restricted role {restricted_role_id} not found in {member.guild.name}")
+        # If access roles are configured (and no restricted role), no role assignment needed on join
 
         # Create application channel
         channel = await self.create_application_channel(member.guild, member)
@@ -1419,6 +1428,38 @@ class Applications(commands.Cog):
                 else:
                     await ctx.send(f"{role.mention} is not a bypass role.")
 
+    @_applications.command(name="accessrole")
+    async def _access_role(
+        self, ctx: commands.Context, action: str, role: Optional[discord.Role] = None
+    ):
+        """Add or remove an access role.
+
+        Access roles are granted to members when their application is approved.
+        This is an alternative to using a restricted role system.
+        Note: Use either restricted_role OR access_roles, not both.
+        """
+        if action.lower() not in ["add", "remove"]:
+            await ctx.send("Invalid action. Use `add` or `remove`.")
+            return
+
+        if role is None:
+            await ctx.send("Please specify a role.")
+            return
+
+        async with self.config.guild(ctx.guild).access_roles() as access_roles:
+            if action.lower() == "add":
+                if role.id not in access_roles:
+                    access_roles.append(role.id)
+                    await ctx.send(f"Added {role.mention} as an access role.")
+                else:
+                    await ctx.send(f"{role.mention} is already an access role.")
+            else:  # remove
+                if role.id in access_roles:
+                    access_roles.remove(role.id)
+                    await ctx.send(f"Removed {role.mention} from access roles.")
+                else:
+                    await ctx.send(f"{role.mention} is not an access role.")
+
     @_applications.command(name="managerrole")
     async def _manager_role(
         self, ctx: commands.Context, action: str, role: Optional[discord.Role] = None
@@ -1507,6 +1548,96 @@ class Applications(commands.Cog):
         await ctx.send("Cleaning up expired application channels...")
         cleaned = await self.cleanup_channels(ctx.guild)
         await ctx.send(f"✅ Cleaned up {cleaned} expired application channel(s).")
+
+    @_applications.command(name="resend", aliases=["refresh"])
+    async def _resend_welcome(self, ctx: commands.Context, member: Optional[discord.Member] = None):
+        """Re-send the welcome message to a user's application channel.
+        
+        Useful for troubleshooting when buttons stop working after cog updates.
+        If no member is specified and run in an application channel, uses the channel owner.
+        """
+        if not await self.config.guild(ctx.guild).enabled():
+            await ctx.send("The application system is not enabled.")
+            return
+
+        # If no member specified, try to find from current channel
+        if member is None:
+            applications = await self.config.guild(ctx.guild).applications()
+            current_channel_id = ctx.channel.id
+            
+            # Find application by channel ID
+            found_member = None
+            for user_id, app_data in applications.items():
+                if app_data.get("channel_id") == current_channel_id:
+                    found_member = ctx.guild.get_member(int(user_id))
+                    if found_member:
+                        member = found_member
+                        break
+            
+            if not member:
+                await ctx.send(
+                    "❌ No member specified and this doesn't appear to be an application channel. "
+                    "Please specify a member: `[p]applications resend @user`"
+                )
+                return
+
+        # Get the member's application data
+        applications = await self.config.guild(ctx.guild).applications()
+        if str(member.id) not in applications:
+            await ctx.send(f"❌ {member.mention} does not have an active application.")
+            return
+
+        app_data = applications[str(member.id)]
+        channel_id = app_data.get("channel_id")
+        
+        if not channel_id:
+            await ctx.send(f"❌ No application channel found for {member.mention}.")
+            return
+
+        channel = ctx.guild.get_channel(channel_id)
+        if not channel or not isinstance(channel, discord.TextChannel):
+            await ctx.send(f"❌ Application channel not found or invalid.")
+            return
+
+        # Check if application is still pending
+        if app_data.get("status") != "pending":
+            await ctx.send(
+                f"⚠️ {member.mention}'s application is already {app_data.get('status')}. "
+                f"Re-sending welcome message anyway for troubleshooting."
+            )
+
+        # Delete old welcome messages (messages from the bot in this channel)
+        try:
+            async for message in channel.history(limit=50):
+                if message.author == ctx.guild.me:
+                    # Check if it's a welcome message (contains "Welcome" in embed title or content)
+                    is_welcome = False
+                    if message.embeds:
+                        for embed in message.embeds:
+                            if embed.title and "Welcome" in embed.title:
+                                is_welcome = True
+                                break
+                    if not is_welcome and message.content and "Welcome" in message.content:
+                        is_welcome = True
+                    
+                    if is_welcome:
+                        try:
+                            await message.delete()
+                        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                            pass  # Ignore errors deleting old messages
+        except discord.Forbidden:
+            await ctx.send("⚠️ Permission denied reading channel history. Re-sending welcome message anyway.")
+        except discord.HTTPException:
+            pass  # Ignore errors
+
+        # Send fresh welcome message
+        try:
+            await self.send_welcome_message(channel, member)
+            await ctx.send(f"✅ Re-sent welcome message to {member.mention}'s application channel.")
+        except discord.Forbidden:
+            await ctx.send(f"❌ Permission denied sending message to {channel.mention}.")
+        except discord.HTTPException as e:
+            await ctx.send(f"❌ Error sending welcome message: {e}")
 
     @_applications.group(name="field")
     async def _field(self, ctx: commands.Context):
@@ -1760,6 +1891,11 @@ class Applications(commands.Cog):
             ctx.guild.get_role(restricted_role_id) if restricted_role_id else None
         )
 
+        access_role_ids = settings.get("access_roles", [])
+        access_roles = [
+            ctx.guild.get_role(rid) for rid in access_role_ids if ctx.guild.get_role(rid)
+        ]
+
         bypass_role_ids = settings.get("bypass_roles", [])
         bypass_roles = [
             ctx.guild.get_role(rid) for rid in bypass_role_ids if ctx.guild.get_role(rid)
@@ -1795,10 +1931,20 @@ class Applications(commands.Cog):
             inline=True,
         )
 
+        # Show which role system is active
+        role_system_info = ""
+        if restricted_role:
+            role_system_info = f"**Restricted Role:** {restricted_role.mention}"
+        elif access_roles:
+            access_list = ", ".join([r.mention for r in access_roles])
+            role_system_info = f"**Access Roles:** {access_list if len(access_list) <= 1024 else f'{len(access_roles)} roles'}"
+        else:
+            role_system_info = "**Role System:** Not configured"
+        
         embed.add_field(
-            name="Restricted Role",
-            value=restricted_role.mention if restricted_role else "Not set",
-            inline=True,
+            name="Role System",
+            value=role_system_info,
+            inline=False,
         )
 
         embed.add_field(
@@ -1903,9 +2049,13 @@ class Applications(commands.Cog):
             )
             return
 
-        # Remove restricted role
+        # Handle role changes on approval
+        # Either remove restricted role OR add access roles (not both)
         restricted_role_id = await self.config.guild(ctx.guild).restricted_role()
+        access_role_ids = await self.config.guild(ctx.guild).access_roles()
+        
         if restricted_role_id:
+            # Remove restricted role (existing behavior)
             restricted_role = ctx.guild.get_role(restricted_role_id)
             if restricted_role and restricted_role in member.roles:
                 try:
@@ -1921,6 +2071,24 @@ class Applications(commands.Cog):
                     log.error(f"Error removing restricted role: {e}")
                     await ctx.send(
                         f"⚠️ Approved the application but encountered an error removing the restricted role: {e}"
+                    )
+        elif access_role_ids:
+            # Add access roles (new behavior)
+            access_roles = [ctx.guild.get_role(rid) for rid in access_role_ids if ctx.guild.get_role(rid)]
+            if access_roles:
+                try:
+                    await member.add_roles(*access_roles, reason="Application approved")
+                    log.info(f"Added access roles to {member.display_name}")
+                except discord.Forbidden:
+                    log.error(f"Permission denied adding access roles to {member.display_name}")
+                    await ctx.send(
+                        f"⚠️ Approved the application but couldn't add access roles. "
+                        f"Please add them manually to {member.mention}."
+                    )
+                except discord.HTTPException as e:
+                    log.error(f"Error adding access roles: {e}")
+                    await ctx.send(
+                        f"⚠️ Approved the application but encountered an error adding access roles: {e}"
                     )
 
         # Update status
@@ -2070,9 +2238,13 @@ class Applications(commands.Cog):
             )
             return
 
-        # Remove restricted role
+        # Handle role changes on approval
+        # Either remove restricted role OR add access roles (not both)
         restricted_role_id = await self.config.guild(interaction.guild).restricted_role()
+        access_role_ids = await self.config.guild(interaction.guild).access_roles()
+        
         if restricted_role_id:
+            # Remove restricted role (existing behavior)
             restricted_role = interaction.guild.get_role(restricted_role_id)
             if restricted_role and restricted_role in member.roles:
                 try:
@@ -2082,6 +2254,17 @@ class Applications(commands.Cog):
                     log.error(f"Permission denied removing restricted role from {member.display_name}")
                 except discord.HTTPException as e:
                     log.error(f"Error removing restricted role: {e}")
+        elif access_role_ids:
+            # Add access roles (new behavior)
+            access_roles = [interaction.guild.get_role(rid) for rid in access_role_ids if interaction.guild.get_role(rid)]
+            if access_roles:
+                try:
+                    await member.add_roles(*access_roles, reason="Application approved")
+                    log.info(f"Added access roles to {member.display_name}")
+                except discord.Forbidden:
+                    log.error(f"Permission denied adding access roles to {member.display_name}")
+                except discord.HTTPException as e:
+                    log.error(f"Error adding access roles: {e}")
 
         # Update status
         app_data["status"] = "approved"
