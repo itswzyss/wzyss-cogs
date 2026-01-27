@@ -1,6 +1,7 @@
+import asyncio
 import logging
 from typing import Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import discord
 from discord.ui import Button, Modal, TextInput, View
@@ -218,6 +219,9 @@ class Applications(commands.Cog):
             "bypass_roles": [],  # List of role IDs that skip application
             "manager_roles": [],  # List of role IDs that can manage applications
             "category_id": None,  # Category ID for application channels
+            "log_channel": None,  # Channel ID for application logging
+            "notification_role": None,  # Role ID to ping on new submissions
+            "cleanup_delay": 24,  # Hours before deleting channels after approval/denial
             "form_fields": [
                 {
                     "name": "name",
@@ -238,7 +242,17 @@ class Applications(commands.Cog):
         }
 
         self.config.register_guild(**default_guild)
+        self.cleanup_task: Optional[asyncio.Task] = None
         log.info("Applications cog initialized")
+
+    async def cog_load(self):
+        """Called when the cog is loaded."""
+        self.cleanup_task = self.bot.loop.create_task(self.cleanup_loop())
+
+    async def cog_unload(self):
+        """Called when the cog is unloaded."""
+        if self.cleanup_task:
+            self.cleanup_task.cancel()
 
     async def has_bypass_role(self, member: discord.Member) -> bool:
         """Check if member has any bypass roles."""
@@ -399,6 +413,145 @@ class Applications(commands.Cog):
         )
 
         log.info(f"Application submitted by {member.display_name} in {member.guild.name}")
+
+        # Log to log channel and ping notification role
+        await self.log_application_event(member.guild, member, "submitted", responses=responses)
+
+    async def log_application_event(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        event_type: str,
+        decision_maker: Optional[discord.Member] = None,
+        reason: Optional[str] = None,
+        responses: Optional[Dict[str, str]] = None,
+    ):
+        """Log an application event to the log channel."""
+        log_channel_id = await self.config.guild(guild).log_channel()
+        if not log_channel_id:
+            return
+
+        log_channel = guild.get_channel(log_channel_id)
+        if not log_channel or not isinstance(log_channel, discord.TextChannel):
+            # Channel was deleted, clear from config
+            await self.config.guild(guild).log_channel.set(None)
+            log.warning(f"Log channel {log_channel_id} not found in {guild.name}")
+            return
+
+        # Get notification role for submissions
+        notification_role = None
+        if event_type == "submitted":
+            notification_role_id = await self.config.guild(guild).notification_role()
+            if notification_role_id:
+                notification_role = guild.get_role(notification_role_id)
+                if not notification_role:
+                    # Role was deleted, clear from config
+                    await self.config.guild(guild).notification_role.set(None)
+
+        # Create embed based on event type
+        if event_type == "submitted":
+            embed = await self.create_log_embed(member, "submitted", responses=responses)
+            content = ""
+            if notification_role:
+                content = f"{notification_role.mention} - New application submitted"
+        elif event_type == "approved":
+            embed = await self.create_log_embed(member, "approved", decision_maker=decision_maker)
+            content = f"✅ Application approved by {decision_maker.mention if decision_maker else 'Unknown'}"
+        elif event_type == "denied":
+            embed = await self.create_log_embed(
+                member, "denied", decision_maker=decision_maker, reason=reason
+            )
+            content = f"❌ Application denied by {decision_maker.mention if decision_maker else 'Unknown'}"
+        else:
+            return
+
+        try:
+            await log_channel.send(content=content if content else None, embed=embed)
+        except discord.Forbidden:
+            log.error(f"Permission denied sending to log channel {log_channel.name} in {guild.name}")
+        except discord.HTTPException as e:
+            log.error(f"Error sending to log channel: {e}")
+
+    async def create_log_embed(
+        self,
+        member: discord.Member,
+        event_type: str,
+        decision_maker: Optional[discord.Member] = None,
+        reason: Optional[str] = None,
+        responses: Optional[Dict[str, str]] = None,
+    ) -> discord.Embed:
+        """Create an embed for logging application events."""
+        status_colors = {
+            "submitted": discord.Color.orange(),
+            "approved": discord.Color.green(),
+            "denied": discord.Color.red(),
+        }
+
+        titles = {
+            "submitted": "Application Submitted",
+            "approved": "Application Approved",
+            "denied": "Application Denied",
+        }
+
+        embed = discord.Embed(
+            title=titles.get(event_type, "Application Event"),
+            color=status_colors.get(event_type, discord.Color.blue()),
+            timestamp=discord.utils.utcnow(),
+        )
+
+        embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
+        embed.set_thumbnail(url=member.display_avatar.url)
+
+        # Add user info
+        embed.add_field(
+            name="User",
+            value=f"{member.mention} ({member.display_name})\nID: {member.id}",
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Account Created",
+            value=f"<t:{int(member.created_at.timestamp())}:R>",
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Joined Server",
+            value=f"<t:{int(member.joined_at.timestamp())}:R>",
+            inline=True,
+        )
+
+        # Add form responses for submissions
+        if event_type == "submitted" and responses:
+            form_fields = await self.config.guild(member.guild).form_fields()
+            responses_text = ""
+            for field in form_fields:
+                field_name = field.get("name")
+                field_label = field.get("label", field_name)
+                response = responses.get(field_name, "Not provided")
+                # Truncate long responses
+                if len(str(response)) > 500:
+                    response = str(response)[:497] + "..."
+                responses_text += f"**{field_label}:** {box(str(response), lang='')}\n"
+
+            if responses_text:
+                embed.add_field(name="Application Responses", value=responses_text, inline=False)
+
+        # Add decision maker for approvals/denials
+        if event_type in ["approved", "denied"] and decision_maker:
+            embed.add_field(
+                name="Decision By",
+                value=f"{decision_maker.mention} ({decision_maker.display_name})",
+                inline=True,
+            )
+
+        # Add denial reason
+        if event_type == "denied" and reason:
+            embed.add_field(name="Denial Reason", value=reason, inline=False)
+
+        embed.set_footer(text=f"Guild: {member.guild.name}")
+
+        return embed
 
     async def create_review_embed(
         self, member: discord.Member, responses: Dict[str, str], status: str
@@ -657,6 +810,53 @@ class Applications(commands.Cog):
             await self.config.guild(ctx.guild).category_id.set(category.id)
             await ctx.send(f"Application channels will be created in {category.mention}.")
 
+    @_applications.command(name="logchannel")
+    async def _set_log_channel(
+        self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None
+    ):
+        """Set the channel for logging application events."""
+        if channel is None:
+            await self.config.guild(ctx.guild).log_channel.set(None)
+            await ctx.send("Log channel cleared.")
+        else:
+            await self.config.guild(ctx.guild).log_channel.set(channel.id)
+            await ctx.send(f"Application events will be logged to {channel.mention}.")
+
+    @_applications.command(name="notificationrole")
+    async def _set_notification_role(
+        self, ctx: commands.Context, role: Optional[discord.Role] = None
+    ):
+        """Set the role to ping when new applications are submitted."""
+        if role is None:
+            await self.config.guild(ctx.guild).notification_role.set(None)
+            await ctx.send("Notification role cleared.")
+        else:
+            await self.config.guild(ctx.guild).notification_role.set(role.id)
+            await ctx.send(
+                f"Notification role set to {role.mention}. "
+                f"This role will be pinged when new applications are submitted."
+            )
+
+    @_applications.command(name="cleanupdelay")
+    async def _set_cleanup_delay(self, ctx: commands.Context, hours: int):
+        """Set the delay in hours before deleting channels after approval/denial."""
+        if hours < 0:
+            await ctx.send("Delay must be a positive number.")
+            return
+
+        await self.config.guild(ctx.guild).cleanup_delay.set(hours)
+        await ctx.send(
+            f"Cleanup delay set to {hours} hour(s). "
+            f"Application channels will be deleted {hours} hour(s) after approval or denial."
+        )
+
+    @_applications.command(name="cleanup")
+    async def _cleanup(self, ctx: commands.Context):
+        """Manually trigger cleanup of expired application channels."""
+        await ctx.send("Cleaning up expired application channels...")
+        cleaned = await self.cleanup_channels(ctx.guild)
+        await ctx.send(f"✅ Cleaned up {cleaned} expired application channel(s).")
+
     @_applications.group(name="field")
     async def _field(self, ctx: commands.Context):
         """Manage application form fields."""
@@ -752,6 +952,16 @@ class Applications(commands.Cog):
         category_id = settings.get("category_id")
         category = ctx.guild.get_channel(category_id) if category_id else None
 
+        log_channel_id = settings.get("log_channel")
+        log_channel = ctx.guild.get_channel(log_channel_id) if log_channel_id else None
+
+        notification_role_id = settings.get("notification_role")
+        notification_role = (
+            ctx.guild.get_role(notification_role_id) if notification_role_id else None
+        )
+
+        cleanup_delay = settings.get("cleanup_delay", 24)
+
         form_fields = settings.get("form_fields", [])
         applications = settings.get("applications", {})
         pending_count = sum(
@@ -778,6 +988,24 @@ class Applications(commands.Cog):
         embed.add_field(
             name="Category",
             value=category.mention if category else "Not set",
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Log Channel",
+            value=log_channel.mention if log_channel else "Not set",
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Notification Role",
+            value=notification_role.mention if notification_role else "Not set",
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Cleanup Delay",
+            value=f"{cleanup_delay} hour(s)",
             inline=True,
         )
 
@@ -858,8 +1086,20 @@ class Applications(commands.Cog):
         app_data["status"] = "approved"
         app_data["approved_by"] = ctx.author.id
         app_data["approved_at"] = datetime.utcnow().isoformat()
+        
+        # Schedule cleanup
+        cleanup_delay = await self.config.guild(ctx.guild).cleanup_delay()
+        cleanup_time = datetime.utcnow() + timedelta(hours=cleanup_delay)
+        app_data["cleanup_scheduled_at"] = cleanup_time.isoformat()
+        
         applications[str(member.id)] = app_data
         await self.config.guild(ctx.guild).applications.set(applications)
+
+        # Log to log channel
+        decision_maker = ctx.guild.get_member(ctx.author.id)
+        await self.log_application_event(
+            ctx.guild, member, "approved", decision_maker=decision_maker
+        )
 
         # Notify in channel
         channel_id = app_data.get("channel_id")
@@ -908,8 +1148,20 @@ class Applications(commands.Cog):
         app_data["denied_at"] = datetime.utcnow().isoformat()
         if reason:
             app_data["denial_reason"] = reason
+        
+        # Schedule cleanup
+        cleanup_delay = await self.config.guild(ctx.guild).cleanup_delay()
+        cleanup_time = datetime.utcnow() + timedelta(hours=cleanup_delay)
+        app_data["cleanup_scheduled_at"] = cleanup_time.isoformat()
+        
         applications[str(member.id)] = app_data
         await self.config.guild(ctx.guild).applications.set(applications)
+
+        # Log to log channel
+        decision_maker = ctx.guild.get_member(ctx.author.id)
+        await self.log_application_event(
+            ctx.guild, member, "denied", decision_maker=decision_maker, reason=reason
+        )
 
         # Notify in channel
         channel_id = app_data.get("channel_id")
@@ -969,8 +1221,20 @@ class Applications(commands.Cog):
         app_data["status"] = "approved"
         app_data["approved_by"] = interaction.user.id
         app_data["approved_at"] = datetime.utcnow().isoformat()
+        
+        # Schedule cleanup
+        cleanup_delay = await self.config.guild(interaction.guild).cleanup_delay()
+        cleanup_time = datetime.utcnow() + timedelta(hours=cleanup_delay)
+        app_data["cleanup_scheduled_at"] = cleanup_time.isoformat()
+        
         applications[str(member.id)] = app_data
         await self.config.guild(interaction.guild).applications.set(applications)
+
+        # Log to log channel
+        decision_maker = interaction.guild.get_member(interaction.user.id)
+        await self.log_application_event(
+            interaction.guild, member, "approved", decision_maker=decision_maker
+        )
 
         # Update the message to remove buttons
         embed = await self.create_review_embed(
@@ -1048,8 +1312,20 @@ class Applications(commands.Cog):
         app_data["denied_by"] = interaction.user.id
         app_data["denied_at"] = datetime.utcnow().isoformat()
         app_data["denial_reason"] = reason
+        
+        # Schedule cleanup
+        cleanup_delay = await self.config.guild(interaction.guild).cleanup_delay()
+        cleanup_time = datetime.utcnow() + timedelta(hours=cleanup_delay)
+        app_data["cleanup_scheduled_at"] = cleanup_time.isoformat()
+        
         applications[str(member.id)] = app_data
         await self.config.guild(interaction.guild).applications.set(applications)
+
+        # Log to log channel
+        decision_maker = interaction.guild.get_member(interaction.user.id)
+        await self.log_application_event(
+            interaction.guild, member, "denied", decision_maker=decision_maker, reason=reason
+        )
 
         # Respond to modal
         await interaction.response.send_message(
@@ -1193,6 +1469,132 @@ class Applications(commands.Cog):
         # Remove from applications
         del applications[str(member.id)]
         await self.config.guild(ctx.guild).applications.set(applications)
+
+    async def cleanup_loop(self):
+        """Background task to periodically clean up expired application channels."""
+        await self.bot.wait_until_ready()
+
+        while True:
+            try:
+                # Wait 1 hour before checking again
+                await asyncio.sleep(3600)
+
+                log.debug("Running application channel cleanup check")
+
+                for guild in self.bot.guilds:
+                    try:
+                        if not await self.config.guild(guild).enabled():
+                            continue
+
+                        applications = await self.config.guild(guild).applications()
+                        current_time = datetime.utcnow()
+
+                        to_remove = []
+                        for user_id, app_data in applications.items():
+                            cleanup_time_str = app_data.get("cleanup_scheduled_at")
+                            if not cleanup_time_str:
+                                continue
+
+                            try:
+                                cleanup_time = datetime.fromisoformat(cleanup_time_str)
+                                if current_time >= cleanup_time:
+                                    # Time to clean up
+                                    channel_id = app_data.get("channel_id")
+                                    if channel_id:
+                                        channel = guild.get_channel(channel_id)
+                                        if channel:
+                                            try:
+                                                await channel.delete(
+                                                    reason="Application channel cleanup (approved/denied)"
+                                                )
+                                                log.info(
+                                                    f"Cleaned up application channel {channel.name} for user {user_id} in {guild.name}"
+                                                )
+                                            except discord.Forbidden:
+                                                log.warning(
+                                                    f"Permission denied deleting channel {channel_id} in {guild.name}"
+                                                )
+                                            except discord.HTTPException as e:
+                                                log.error(f"Error deleting channel {channel_id}: {e}")
+                                        else:
+                                            # Channel already deleted
+                                            log.debug(f"Channel {channel_id} already deleted, removing from tracking")
+                                    to_remove.append(user_id)
+                            except (ValueError, TypeError) as e:
+                                log.warning(f"Invalid cleanup_scheduled_at for user {user_id}: {e}")
+                                continue
+
+                        # Remove cleaned up applications
+                        if to_remove:
+                            async with self.config.guild(guild).applications() as apps:
+                                for user_id in to_remove:
+                                    if user_id in apps:
+                                        del apps[user_id]
+                            log.info(f"Removed {len(to_remove)} cleaned up applications from {guild.name}")
+
+                    except Exception as e:
+                        log.error(f"Error in cleanup loop for guild {guild.name}: {e}", exc_info=True)
+
+            except asyncio.CancelledError:
+                log.info("Cleanup loop cancelled")
+                break
+            except Exception as e:
+                log.error(f"Error in cleanup loop: {e}", exc_info=True)
+                # Wait a bit before retrying
+                await asyncio.sleep(300)  # 5 minutes
+
+    async def cleanup_channels(self, guild: discord.Guild) -> int:
+        """Manually trigger cleanup of expired channels. Returns number of channels cleaned."""
+        if not await self.config.guild(guild).enabled():
+            return 0
+
+        applications = await self.config.guild(guild).applications()
+        current_time = datetime.utcnow()
+        cleaned = 0
+
+        to_remove = []
+        for user_id, app_data in applications.items():
+            cleanup_time_str = app_data.get("cleanup_scheduled_at")
+            if not cleanup_time_str:
+                continue
+
+            try:
+                cleanup_time = datetime.fromisoformat(cleanup_time_str)
+                if current_time >= cleanup_time:
+                    channel_id = app_data.get("channel_id")
+                    if channel_id:
+                        channel = guild.get_channel(channel_id)
+                        if channel:
+                            try:
+                                await channel.delete(
+                                    reason="Manual application channel cleanup"
+                                )
+                                cleaned += 1
+                                log.info(
+                                    f"Manually cleaned up application channel {channel.name} for user {user_id} in {guild.name}"
+                                )
+                            except discord.Forbidden:
+                                log.warning(
+                                    f"Permission denied deleting channel {channel_id} in {guild.name}"
+                                )
+                            except discord.HTTPException as e:
+                                log.error(f"Error deleting channel {channel_id}: {e}")
+                        else:
+                            # Channel already deleted
+                            cleaned += 1
+                    to_remove.append(user_id)
+            except (ValueError, TypeError) as e:
+                log.warning(f"Invalid cleanup_scheduled_at for user {user_id}: {e}")
+                continue
+
+        # Remove cleaned up applications
+        if to_remove:
+            async with self.config.guild(guild).applications() as apps:
+                for user_id in to_remove:
+                    if user_id in apps:
+                        del apps[user_id]
+
+        return cleaned
 
 
 async def setup(bot: Red):

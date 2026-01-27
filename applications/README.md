@@ -44,6 +44,30 @@ Before enabling the system, you need to set up a restricted role in Discord:
 [p]applications category @Applications
 ```
 
+#### Set the log channel
+
+```
+[p]applications logchannel #application-logs
+```
+
+This channel will receive logs of all application submissions, approvals, and denials.
+
+#### Set the notification role
+
+```
+[p]applications notificationrole @Application Reviewers
+```
+
+This role will be pinged when new applications are submitted.
+
+#### Set cleanup delay
+
+```
+[p]applications cleanupdelay 24
+```
+
+Set the delay in hours before application channels are automatically deleted after approval or denial. Default is 24 hours.
+
 ### 3. Configure Bypass Roles (Optional)
 
 Members with bypass roles will skip the application process entirely:
@@ -104,11 +128,19 @@ Examples:
    - User clicks "Start Application" button
    - User fills out the form (Discord modal)
    - Application is submitted and stored
+   - **Application is logged to the log channel (if configured)**
+   - **Notification role is pinged (if configured)**
 
 3. **Review Process**:
-   - Admins can view, approve, or deny applications
-   - On approval: Restricted role is removed → User gains full access
-   - On denial: User is notified but channel remains open for appeal
+   - Admins/managers can view, approve, or deny applications
+   - On approval: Restricted role is removed → User gains full access → **Logged to log channel** → **Channel cleanup scheduled**
+   - On denial: User is notified with reason → **Logged to log channel with reason** → **Channel cleanup scheduled**
+
+4. **Cleanup Process**:
+   - After approval or denial, channels are scheduled for deletion
+   - Channels are automatically deleted after the configured delay (default: 24 hours)
+   - Cleanup runs automatically every hour
+   - Manual cleanup can be triggered with `[p]applications cleanup`
 
 ### Admin Commands
 
@@ -117,6 +149,16 @@ Examples:
 ```
 [p]applications settings
 ```
+
+#### Manual cleanup
+
+Manually trigger cleanup of expired application channels:
+
+```
+[p]applications cleanup
+```
+
+This will immediately delete any channels that have passed their cleanup time.
 
 #### View Applications
 
@@ -164,6 +206,25 @@ The bot needs the following permissions:
 - **Embed Links** - To display application information
 - **Read Message History** - To view channel history
 
+## Logging and Cleanup
+
+### Application Logging
+
+When a log channel is configured, all application events are logged:
+- **Submissions**: User info, form responses, timestamp
+- **Approvals**: Who approved, when, user info
+- **Denials**: Who denied, when, reason, user info
+
+The notification role (if configured) will be pinged in the log channel when new applications are submitted.
+
+### Channel Cleanup
+
+Application channels are automatically deleted after approval or denial:
+- Default delay: 24 hours (configurable)
+- Cleanup runs automatically every hour
+- Channels scheduled for cleanup are tracked until deletion
+- Manual cleanup can be triggered at any time
+
 ## Important Notes
 
 ### Restricted Role Setup
@@ -188,11 +249,13 @@ The cog stores:
 - Application responses and status
 - Channel associations
 - Submission timestamps
-- Approval/denial information
+- Approval/denial information (including denial reasons)
+- Cleanup scheduling timestamps
 
 Application data is retained until:
 - The user leaves the server (automatic cleanup)
 - An admin manually closes the application channel
+- The channel is automatically deleted after cleanup delay
 - The application is deleted via commands
 
 ## Troubleshooting
