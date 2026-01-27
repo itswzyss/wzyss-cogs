@@ -65,7 +65,13 @@ class RockstarNewswire(commands.Cog):
             self.news_hash = await self.get_hash_token()
             log.info("Successfully obtained news hash token")
         except Exception as e:
-            log.error(f"Failed to get initial hash token: {e}", exc_info=True)
+            error_msg = str(e)
+            if "Executable doesn't exist" in error_msg or "browser" in error_msg.lower():
+                log.error(
+                    "Playwright browsers not installed. Please run: playwright install chromium"
+                )
+            else:
+                log.error(f"Failed to get initial hash token: {e}", exc_info=True)
         # Start the periodic check task
         self.check_task = self.bot.loop.create_task(self.periodic_check())
 
@@ -87,7 +93,14 @@ class RockstarNewswire(commands.Cog):
         
         try:
             playwright = await async_playwright().start()
-            browser = await playwright.chromium.launch(headless=True)
+            try:
+                browser = await playwright.chromium.launch(headless=True)
+            except Exception as e:
+                if "Executable doesn't exist" in str(e) or "browser" in str(e).lower():
+                    raise Exception(
+                        "Playwright browsers not installed. Please run: playwright install chromium"
+                    )
+                raise
             page = await browser.new_page()
 
             hash_token = None
@@ -548,6 +561,23 @@ class RockstarNewswire(commands.Cog):
             )
             return
 
+        if not self.news_hash:
+            await ctx.send("No hash token available. Attempting to fetch one...")
+            try:
+                self.news_hash = await self.get_hash_token()
+            except Exception as e:
+                error_msg = str(e)
+                if "Executable doesn't exist" in error_msg or "browser" in error_msg.lower():
+                    await ctx.send(
+                        "❌ **Playwright browsers not installed!**\n\n"
+                        "Please run: `playwright install chromium`\n\n"
+                        "Use `[p]rockstarnewswire checkplaywright` to verify installation."
+                    )
+                    return
+                else:
+                    await ctx.send(f"Error fetching hash token: {e}")
+                    return
+
         await ctx.send(f"Fetching {news_type} articles...")
         try:
             article = await self.get_new_article(news_type)
@@ -564,7 +594,14 @@ class RockstarNewswire(commands.Cog):
 
         except Exception as e:
             log.error(f"Error in test fetch: {e}", exc_info=True)
-            await ctx.send(f"Error fetching articles: {e}")
+            error_msg = str(e)
+            if "Executable doesn't exist" in error_msg or "browser" in error_msg.lower():
+                await ctx.send(
+                    "❌ **Playwright browsers not installed!**\n\n"
+                    "Please run: `playwright install chromium`"
+                )
+            else:
+                await ctx.send(f"Error fetching articles: {e}")
 
     @_rockstarnewswire.command(name="refreshhash")
     async def _refresh_hash(self, ctx: commands.Context):
@@ -575,7 +612,43 @@ class RockstarNewswire(commands.Cog):
             await ctx.send(f"Hash token refreshed successfully: `{self.news_hash[:20]}...`")
         except Exception as e:
             log.error(f"Error refreshing hash: {e}", exc_info=True)
-            await ctx.send(f"Error refreshing hash token: {e}")
+            error_msg = str(e)
+            if "Executable doesn't exist" in error_msg or "browser" in error_msg.lower():
+                await ctx.send(
+                    "❌ **Playwright browsers not installed!**\n\n"
+                    "Please run the following command in your bot's environment:\n"
+                    "```bash\nplaywright install chromium\n```\n\n"
+                    "If you're using Red's virtual environment, activate it first:\n"
+                    "```bash\n# Activate venv, then:\nplaywright install chromium\n```"
+                )
+            else:
+                await ctx.send(f"Error refreshing hash token: {e}")
+
+    @_rockstarnewswire.command(name="checkplaywright")
+    async def _check_playwright(self, ctx: commands.Context):
+        """Check if Playwright is properly installed and configured."""
+        await ctx.send("Checking Playwright installation...")
+        try:
+            playwright = await async_playwright().start()
+            try:
+                browser = await playwright.chromium.launch(headless=True)
+                await browser.close()
+                await playwright.stop()
+                await ctx.send("✅ Playwright is properly installed and working!")
+            except Exception as e:
+                await playwright.stop()
+                error_msg = str(e)
+                if "Executable doesn't exist" in error_msg or "browser" in error_msg.lower():
+                    await ctx.send(
+                        "❌ **Playwright browsers not installed!**\n\n"
+                        "Please run the following command:\n"
+                        "```bash\nplaywright install chromium\n```\n\n"
+                        "If you're using Red's virtual environment, activate it first."
+                    )
+                else:
+                    await ctx.send(f"❌ Playwright error: {e}")
+        except Exception as e:
+            await ctx.send(f"❌ Failed to check Playwright: {e}")
 
     def _get_type_description(self, news_type: str) -> str:
         """Get a human-readable description for a news type."""

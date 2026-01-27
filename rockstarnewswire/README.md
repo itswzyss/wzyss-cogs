@@ -114,18 +114,37 @@ Force an immediate check for new posts:
 
 These are automatically installed when you install the cog.
 
-**Important:** After installing the cog, you need to install Playwright browsers:
+### Installing Playwright Browsers
+
+**Important:** After installing the cog, you **must** install Playwright browsers. The cog will not work without this step.
+
+If you're running Red in a virtual environment (recommended):
+
+```bash
+# Activate Red's virtual environment first
+source redenv/bin/activate  # Linux/Mac
+# OR
+redenv\Scripts\activate  # Windows
+
+# Then install browsers
+playwright install chromium
+```
+
+If you're running Red without a virtual environment:
 
 ```bash
 playwright install chromium
 ```
 
-Or if you're using Red's virtual environment:
+### Verifying Installation
 
-```bash
-# Activate Red's venv first, then:
-playwright install chromium
+After installation, you can verify Playwright is working:
+
 ```
+[p]rockstarnewswire checkplaywright
+```
+
+This command will tell you if Playwright is properly installed and ready to use.
 
 ## Privacy
 
