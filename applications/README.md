@@ -96,12 +96,13 @@ The cog comes with default form fields, but you can customize them:
 #### Add a new field
 
 ```
-[p]applications field add <name> <label> <type> [required] [options]
+[p]applications field add <name> <label> <type> [required] [options_or_confirm_text]
 
-Types: text (short), paragraph (long), number, select (multiple choice)
+Types: text (short), paragraph (long), number, select (multiple choice), confirm (text confirmation)
 ```
 
-For select fields, provide options separated by commas after the required parameter.
+For select fields, provide options separated by commas.
+For confirm fields, provide the exact text users must type.
 
 Examples:
 
@@ -111,6 +112,7 @@ Examples:
 [p]applications field add discord "How long have you used Discord?" number False
 [p]applications field add agreement "Do you agree to the rules?" select True "Yes,No"
 [p]applications field add experience_level "Experience Level" select True "Beginner,Intermediate,Advanced,Expert"
+[p]applications field add rules_confirm "I agree to the server rules" confirm True "I agree"
 ```
 
 #### Set options for a select field
@@ -125,6 +127,18 @@ Example:
 
 ```
 [p]applications field options agreement "Yes,No,Maybe"
+```
+
+#### Set confirmation text for a confirm field
+
+```
+[p]applications field confirmtext <name> <text>
+```
+
+Example:
+
+```
+[p]applications field confirmtext rules_confirm "I agree"
 ```
 
 #### Remove a field

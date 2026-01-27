@@ -36,6 +36,14 @@ class ApplicationModal(Modal):
                     placeholder = f"Options: {', '.join(options)}"
                 elif not placeholder:
                     placeholder = "Enter one of the options"
+            
+            # For confirm fields, build placeholder from required text
+            if field_type == "confirm":
+                confirm_text = field.get("confirm_text", "")
+                if confirm_text and not placeholder:
+                    placeholder = f"Type exactly: {confirm_text}"
+                elif not placeholder:
+                    placeholder = "Type the required confirmation text"
 
             # Discord text input limits
             if field_type == "paragraph":
@@ -105,6 +113,20 @@ class ApplicationModal(Modal):
                     else:
                         # Use the original option value (preserve case)
                         value = matched_option
+
+            # Validate confirm fields
+            if field_type == "confirm":
+                confirm_text = field.get("confirm_text", "")
+                if confirm_text:
+                    # Case-insensitive comparison for confirmation
+                    if value.lower() != confirm_text.lower():
+                        validation_errors.append(
+                            f"**{field_label}**: Must type exactly: `{confirm_text}`"
+                        )
+                        continue
+                    else:
+                        # Use the original confirmation text (preserve case)
+                        value = confirm_text
 
             responses[field_name] = value
 
@@ -917,40 +939,56 @@ class Applications(commands.Cog):
         label: str,
         field_type: str,
         required: bool = True,
-        options: Optional[str] = None,
+        confirm_or_options: Optional[str] = None,
     ):
         """Add a form field.
 
-        Types: text (short), paragraph (long), number, select (multiple choice)
+        Types: text (short), paragraph (long), number, select (multiple choice), confirm (text confirmation)
         
-        For select fields, provide options separated by commas as the last argument.
+        For select fields, provide options separated by commas.
         Example: [p]applications field add experience "Experience Level" select True "Beginner,Intermediate,Advanced"
-        Example: [p]applications field add agreement "Do you agree?" select True "Yes,No"
+        
+        For confirm fields, provide the exact text users must type.
+        Example: [p]applications field add agreement "I agree to the rules" confirm True "I agree"
         """
         field_type_lower = field_type.lower()
-        if field_type_lower not in ["text", "paragraph", "number", "select"]:
-            await ctx.send("Invalid field type. Use `text`, `paragraph`, `number`, or `select`.")
+        if field_type_lower not in ["text", "paragraph", "number", "select", "confirm"]:
+            await ctx.send("Invalid field type. Use `text`, `paragraph`, `number`, `select`, or `confirm`.")
             return
 
         # Parse options for select fields
         options_list = []
         if field_type_lower == "select":
-            if not options:
+            if not confirm_or_options:
                 await ctx.send(
                     "Select fields require options. Provide them separated by commas.\n"
-                    "Example: `[p]applications field add experience \"Experience Level\" select True \"Beginner,Intermediate,Advanced\"`\n"
-                    "Example: `[p]applications field add agreement \"Do you agree?\" select True \"Yes,No\"`"
+                    "Example: `[p]applications field add experience \"Experience Level\" select True \"Beginner,Intermediate,Advanced\"`"
                 )
                 return
             
             # Split by comma
-            options_list = [opt.strip() for opt in options.split(",") if opt.strip()]
+            options_list = [opt.strip() for opt in confirm_or_options.split(",") if opt.strip()]
             
             if not options_list:
                 await ctx.send("At least one option is required for select fields.")
                 return
             if len(options_list) < 2:
                 await ctx.send("Select fields require at least 2 options.")
+                return
+
+        # Parse confirmation text for confirm fields
+        confirm_text = ""
+        if field_type_lower == "confirm":
+            if not confirm_or_options:
+                await ctx.send(
+                    "Confirm fields require the exact text users must type.\n"
+                    "Example: `[p]applications field add agreement \"I agree to the rules\" confirm True \"I agree\"`"
+                )
+                return
+            
+            confirm_text = confirm_or_options.strip()
+            if not confirm_text:
+                await ctx.send("Confirmation text cannot be empty.")
                 return
 
         async with self.config.guild(ctx.guild).form_fields() as fields:
@@ -969,10 +1007,17 @@ class Applications(commands.Cog):
 
             if field_type_lower == "select":
                 field_data["options"] = options_list
+            elif field_type_lower == "confirm":
+                field_data["confirm_text"] = confirm_text
 
             fields.append(field_data)
 
-        options_text = f" with options: {', '.join(options_list)}" if options_list else ""
+        if options_list:
+            options_text = f" with options: {', '.join(options_list)}"
+        elif confirm_text:
+            options_text = f" requiring confirmation: `{confirm_text}`"
+        else:
+            options_text = ""
         await ctx.send(f"Added field `{name}` ({field_type_lower}){options_text} to the application form.")
 
     @_field.command(name="remove")
@@ -1005,10 +1050,13 @@ class Applications(commands.Cog):
             field_type = field.get("type", "text")
             required = field.get("required", True)
             options = field.get("options", [])
+            confirm_text = field.get("confirm_text", "")
             
             value_text = f"**Name:** `{field.get('name')}`\n**Type:** {field_type}\n**Required:** {required}"
             if options:
                 value_text += f"\n**Options:** {', '.join(options)}"
+            if confirm_text:
+                value_text += f"\n**Must type:** `{confirm_text}`"
             
             embed.add_field(
                 name=f"{i}. {field.get('label', field.get('name'))}",
@@ -1050,6 +1098,35 @@ class Applications(commands.Cog):
 
             field["options"] = options_list
             await ctx.send(f"Updated options for field `{name}`: {', '.join(options_list)}")
+
+    @_field.command(name="confirmtext")
+    async def _field_confirm_text(self, ctx: commands.Context, name: str, *, confirm_text: str):
+        """Set the confirmation text for a confirm field.
+        
+        Example: [p]applications field confirmtext agreement "I agree"
+        """
+        async with self.config.guild(ctx.guild).form_fields() as fields:
+            field = None
+            for f in fields:
+                if f.get("name") == name:
+                    field = f
+                    break
+
+            if not field:
+                await ctx.send(f"Field `{name}` not found.")
+                return
+
+            if field.get("type") != "confirm":
+                await ctx.send(f"Field `{name}` is not a confirm field. Only confirm fields can have confirmation text.")
+                return
+
+            confirm_text = confirm_text.strip()
+            if not confirm_text:
+                await ctx.send("Confirmation text cannot be empty.")
+                return
+
+            field["confirm_text"] = confirm_text
+            await ctx.send(f"Updated confirmation text for field `{name}`: `{confirm_text}`")
 
     @_applications.command(name="settings")
     async def _settings(self, ctx: commands.Context):
