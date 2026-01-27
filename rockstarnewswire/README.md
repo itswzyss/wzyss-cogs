@@ -110,9 +110,22 @@ Force an immediate check for new posts:
 ## Requirements
 
 - `aiohttp` - For HTTP requests
-- `beautifulsoup4` - For HTML parsing
+- `playwright` - For headless browser automation (to extract API hash tokens)
 
 These are automatically installed when you install the cog.
+
+**Important:** After installing the cog, you need to install Playwright browsers:
+
+```bash
+playwright install chromium
+```
+
+Or if you're using Red's virtual environment:
+
+```bash
+# Activate Red's venv first, then:
+playwright install chromium
+```
 
 ## Privacy
 

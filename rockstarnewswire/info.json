@@ -5,7 +5,7 @@
     "short": "Track and post Rockstar Games newswire updates.",
     "description": "Automatically tracks Rockstar Games newswire feed and posts updates to configured channels. Supports multiple news types including GTA V, GTA VI, RDR2, music, fanart, and more.",
     "tags": ["news", "rockstar", "gta", "rdr2", "notifications", "utility"],
-    "requirements": ["aiohttp", "beautifulsoup4"],
+    "requirements": ["aiohttp", "playwright"],
     "min_bot_version": "3.4.0",
     "hidden": false,
     "disabled": false,

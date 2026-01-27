@@ -1,34 +1,37 @@
 import asyncio
+import json
 import logging
-import re
 from typing import Dict, List, Optional
-from urllib.parse import urljoin
+from urllib.parse import urlencode
 
 import aiohttp
 import discord
-from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright, Browser, Page
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 
 log = logging.getLogger("red.wzyss-cogs.rockstarnewswire")
 
-# Rockstar newswire base URL
-NEWSWIRE_BASE_URL = "https://www.rockstargames.com/newswire"
+# Rockstar GraphQL API endpoint
+GRAPHQL_URL = "https://graph.rockstargames.com"
 
-# News type mappings to URL paths
-NEWS_TYPE_PATHS = {
-    "latest": "",
-    "gtav": "category/gta-v",
-    "gtavi": "category/gta-vi",
-    "rdr2": "category/red-dead-redemption-2",
-    "music": "category/music",
-    "fanart": "category/fan-art",
-    "fanvideos": "category/fan-videos",
-    "creator": "category/creator",
-    "tips": "category/tips",
-    "rockstar": "category/rockstar",
-    "updates": "category/updates",
+# Genre IDs mapping (from reference.js)
+GENRE_IDS = {
+    "latest": None,
+    "music": 30,
+    "rockstar": 43,
+    "tips": 121,
+    "gtavi": 666,
+    "gtav": 702,
+    "updates": 705,
+    "fanvideos": 706,
+    "fanart": 708,
+    "creator": 728,
+    "rdr2": 736,
 }
+
+# Refresh interval: 2 hours in seconds
+REFRESH_INTERVAL = 7200
 
 
 class RockstarNewswire(commands.Cog):
@@ -44,169 +47,259 @@ class RockstarNewswire(commands.Cog):
             "enabled": False,
             "channel": None,  # Channel ID for notifications
             "news_types": ["latest"],  # List of news types to track
-            "last_posts": {},  # {news_type: {"url": str, "title": str, "date": str}}
+            "article_ids": {},  # {news_type: [article_id1, article_id2, ...]}
         }
 
         self.config.register_guild(**default_guild)
         self.session: Optional[aiohttp.ClientSession] = None
+        self.news_hash: Optional[str] = None
+        self.playwright_browser: Optional[Browser] = None
+        self.check_task: Optional[asyncio.Task] = None
         log.info("RockstarNewswire cog initialized")
 
     async def cog_load(self):
         """Called when the cog is loaded."""
         self.session = aiohttp.ClientSession()
+        # Get initial hash token
+        try:
+            self.news_hash = await self.get_hash_token()
+            log.info("Successfully obtained news hash token")
+        except Exception as e:
+            log.error(f"Failed to get initial hash token: {e}", exc_info=True)
         # Start the periodic check task
         self.check_task = self.bot.loop.create_task(self.periodic_check())
 
     async def cog_unload(self):
         """Called when the cog is unloaded."""
-        if hasattr(self, "check_task"):
+        if self.check_task:
             self.check_task.cancel()
         if self.session:
             await self.session.close()
+        if self.playwright_browser:
+            await self.playwright_browser.close()
 
-    async def get_newswire_articles(
-        self, news_type: str = "latest"
-    ) -> List[Dict[str, str]]:
-        """Fetch articles from Rockstar newswire for a specific type.
+    async def get_hash_token(self) -> str:
+        """Extract the hash token from Rockstar's newswire page using Playwright."""
+        log.debug("Extracting hash token from Rockstar newswire...")
+        
+        playwright = None
+        browser = None
+        
+        try:
+            playwright = await async_playwright().start()
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page()
 
-        Returns a list of article dictionaries with keys: url, title, date, description, image
-        """
+            hash_token = None
+            hash_extracted = asyncio.Event()
+
+            async def handle_request(request):
+                nonlocal hash_token
+                url = request.url
+                if "operationName=NewswireList" in url:
+                    # Extract hash from URL parameters
+                    if "?" in url:
+                        from urllib.parse import parse_qs, unquote
+                        params_str = url.split("?")[1]
+                        params = parse_qs(params_str)
+
+                        if "extensions" in params:
+                            extensions_str = unquote(params["extensions"][0])
+                            try:
+                                extensions = json.loads(extensions_str)
+                                if "persistedQuery" in extensions:
+                                    hash_token = extensions["persistedQuery"]["sha256Hash"]
+                                    hash_extracted.set()
+                                    await request.abort()
+                                    return
+                            except (json.JSONDecodeError, KeyError) as e:
+                                log.debug(f"Error parsing extensions: {e}")
+
+                await request.continue_()
+
+            page.on("request", handle_request)
+
+            # Navigate to newswire page
+            await page.goto("https://www.rockstargames.com/newswire", wait_until="networkidle", timeout=30000)
+
+            # Wait for hash to be extracted (with timeout)
+            try:
+                await asyncio.wait_for(hash_extracted.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                log.warning("Timeout waiting for hash token extraction")
+
+            if browser:
+                await browser.close()
+            if playwright:
+                await playwright.stop()
+
+            if hash_token:
+                log.info(f"Successfully extracted hash token: {hash_token[:20]}...")
+                return hash_token
+            else:
+                raise Exception("Failed to extract hash token from newswire page")
+
+        except Exception as e:
+            if browser:
+                try:
+                    await browser.close()
+                except:
+                    pass
+            if playwright:
+                try:
+                    await playwright.stop()
+                except:
+                    pass
+            log.error(f"Error extracting hash token: {e}", exc_info=True)
+            raise
+
+    async def process_graphql_request(
+        self, news_type: str
+    ) -> Optional[Dict]:
+        """Make a GraphQL request to Rockstar's API for a specific news type."""
         if not self.session:
             self.session = aiohttp.ClientSession()
 
+        if not self.news_hash:
+            log.warning("No hash token available, fetching new one...")
+            self.news_hash = await self.get_hash_token()
+
+        genre_id = GENRE_IDS.get(news_type)
+        if genre_id is None and news_type != "latest":
+            log.error(f"Invalid news type: {news_type}")
+            return None
+
+        # Build query parameters (POST request with query string, as per reference)
+        variables = {
+            "page": 1,
+            "tagId": genre_id,
+            "metaUrl": "/newswire",
+            "locale": "en_us",
+        }
+
+        extensions = {
+            "persistedQuery": {
+                "version": 1,
+                "sha256Hash": self.news_hash,
+            }
+        }
+
+        params = {
+            "operationName": "NewswireList",
+            "variables": json.dumps(variables),
+            "extensions": json.dumps(extensions),
+        }
+
+        query_string = urlencode(params)
+        url = f"{GRAPHQL_URL}?{query_string}"
+
         try:
-            # Build the URL
-            path = NEWS_TYPE_PATHS.get(news_type, "")
-            if path:
-                url = f"{NEWSWIRE_BASE_URL}/{path}"
-            else:
-                url = NEWSWIRE_BASE_URL
-
-            log.debug(f"Fetching newswire from: {url}")
-
-            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            # Note: Reference uses POST method with query string (unusual but that's how it works)
+            async with self.session.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
                 if response.status != 200:
-                    log.error(f"Failed to fetch newswire: HTTP {response.status}")
-                    return []
+                    error_text = await response.text()
+                    log.error(
+                        f"GraphQL request failed: HTTP {response.status} - {error_text}"
+                    )
+                    return None
 
-                html = await response.text()
-                soup = BeautifulSoup(html, "html.parser")
+                data = await response.json()
 
-                articles = []
+                # Check for errors
+                if data.get("errors"):
+                    error_msg = data["errors"][0].get("message", "Unknown error")
+                    if error_msg == "PersistedQueryNotFound":
+                        log.warning("Hash token expired, fetching new one...")
+                        self.news_hash = await self.get_hash_token()
+                        # Retry the request
+                        return await self.process_graphql_request(news_type)
+                    else:
+                        log.error(f"GraphQL error: {error_msg}")
+                        return None
 
-                # Find article elements - this selector may need adjustment based on actual HTML structure
-                # Common patterns for newswire sites
-                article_selectors = [
-                    "article",
-                    ".article",
-                    ".news-item",
-                    ".newswire-item",
-                    "[data-article-id]",
-                ]
-
-                article_elements = []
-                for selector in article_selectors:
-                    found = soup.select(selector)
-                    if found:
-                        article_elements = found
-                        log.debug(f"Found {len(found)} articles using selector: {selector}")
-                        break
-
-                if not article_elements:
-                    # Fallback: try to find links that look like article links
-                    article_elements = soup.select('a[href*="/newswire/"]')
-
-                for element in article_elements[:10]:  # Limit to 10 most recent
-                    try:
-                        article_data = self._parse_article_element(element, soup)
-                        if article_data:
-                            articles.append(article_data)
-                    except Exception as e:
-                        log.debug(f"Error parsing article element: {e}")
-                        continue
-
-                log.info(f"Successfully fetched {len(articles)} articles for type: {news_type}")
-                return articles
+                return data
 
         except aiohttp.ClientError as e:
-            log.error(f"Network error fetching newswire: {e}")
-            return []
+            log.error(f"Network error in GraphQL request: {e}")
+            return None
         except Exception as e:
-            log.error(f"Error fetching newswire: {e}", exc_info=True)
-            return []
-
-    def _parse_article_element(self, element, soup: BeautifulSoup) -> Optional[Dict[str, str]]:
-        """Parse an article element and extract relevant data."""
-        article = {}
-
-        # Try to find the link
-        link_elem = element if element.name == "a" else element.find("a")
-        if not link_elem or not link_elem.get("href"):
+            log.error(f"Error processing GraphQL request: {e}", exc_info=True)
             return None
 
-        href = link_elem.get("href")
-        if href.startswith("/"):
-            article["url"] = urljoin(NEWSWIRE_BASE_URL, href)
-        elif href.startswith("http"):
-            article["url"] = href
-        else:
+    async def get_new_article(self, news_type: str) -> Optional[Dict]:
+        """Get the latest article for a news type, checking if it's new."""
+        log.debug(f"Checking for new articles in {news_type}")
+
+        response = await self.process_graphql_request(news_type)
+        if not response or not response.get("data"):
             return None
 
-        # Try to find title
-        title_elem = (
-            element.find(class_=re.compile(r"title|heading|headline", re.I))
-            or element.find("h1")
-            or element.find("h2")
-            or element.find("h3")
-            or link_elem
-        )
-        if title_elem:
-            article["title"] = title_elem.get_text(strip=True)
+        try:
+            article = response["data"]["posts"]["results"][0]
+        except (KeyError, IndexError):
+            log.warning(f"No articles found for type: {news_type}")
+            return None
 
-        # Try to find description/excerpt
-        desc_elem = (
-            element.find(class_=re.compile(r"description|excerpt|summary|content", re.I))
-            or element.find("p")
-        )
-        if desc_elem:
-            article["description"] = desc_elem.get_text(strip=True)[:500]  # Limit length
+        article_id = str(article["id"])
 
-        # Try to find image
-        img_elem = element.find("img")
-        if img_elem and img_elem.get("src"):
-            img_src = img_elem.get("src")
-            if img_src.startswith("/"):
-                article["image"] = urljoin(NEWSWIRE_BASE_URL, img_src)
-            elif img_src.startswith("http"):
-                article["image"] = img_src
+        # Extract tags
+        tags = []
+        if "primary_tags" in article:
+            for tag in article["primary_tags"]:
+                if "name" in tag:
+                    tags.append(tag["name"])
 
-        # Try to find date
-        date_elem = element.find(class_=re.compile(r"date|time|published", re.I))
-        if date_elem:
-            article["date"] = date_elem.get_text(strip=True)
+        # Build article URL
+        article_url = article.get("url", "")
+        if article_url and not article_url.startswith("http"):
+            article_url = f"https://www.rockstargames.com{article_url}"
 
-        # Only return if we have at least URL and title
-        if article.get("url") and article.get("title"):
-            return article
+        # Get image
+        image_url = None
+        if "preview_images_parsed" in article:
+            preview = article["preview_images_parsed"]
+            if "newswire_block" in preview:
+                image_url = preview["newswire_block"].get("d16x9")
 
-        return None
+        return {
+            "id": article_id,
+            "title": article.get("title", "Untitled"),
+            "link": article_url,
+            "img": image_url,
+            "date": article.get("created", ""),
+            "tags": tags,
+        }
 
     async def create_news_embed(self, article: Dict[str, str]) -> discord.Embed:
         """Create a Discord embed for a news article."""
+        # Format tags
+        tags_str = " ".join([f"`{tag}`" for tag in article.get("tags", [])])
+
         embed = discord.Embed(
             title=article.get("title", "Rockstar Newswire Update"),
-            url=article.get("url"),
-            color=discord.Color(0xFF0000),  # Rockstar red color
+            url=article.get("link"),
+            description=tags_str if tags_str else None,
+            color=15258703,  # Rockstar orange color from reference
             timestamp=discord.utils.utcnow(),
         )
 
-        if article.get("description"):
-            embed.description = article["description"]
+        embed.set_author(
+            name="Newswire",
+            url="https://www.rockstargames.com/newswire",
+            icon_url="https://img.icons8.com/color/48/000000/rockstar-games.png",
+        )
 
-        if article.get("image"):
-            embed.set_image(url=article["image"])
+        if article.get("img"):
+            embed.set_image(url=article["img"])
 
-        embed.set_footer(text="Rockstar Games Newswire")
+        embed.set_footer(
+            text=article.get("date", ""),
+            icon_url="https://img.icons8.com/color/48/000000/rockstar-games.png",
+        )
 
         return embed
 
@@ -228,45 +321,37 @@ class RockstarNewswire(commands.Cog):
             return
 
         news_types = await self.config.guild(guild).news_types()
-        last_posts = await self.config.guild(guild).last_posts()
+        article_ids = await self.config.guild(guild).article_ids()
 
         for news_type in news_types:
             try:
-                articles = await self.get_newswire_articles(news_type)
-                if not articles:
+                article = await self.get_new_article(news_type)
+                if not article:
                     continue
 
-                # Get the most recent article
-                latest_article = articles[0]
+                article_id = article["id"]
+                news_type_ids = article_ids.get(news_type, [])
 
-                # Check if this is a new post
-                last_post = last_posts.get(news_type, {})
-                if last_post.get("url") == latest_article.get("url"):
-                    # Same post, skip
-                    continue
-
-                # New post found!
-                embed = await self.create_news_embed(latest_article)
-
-                # Add news type to embed if not "latest"
-                if news_type != "latest":
-                    embed.add_field(
-                        name="Category", value=news_type.upper(), inline=True
+                # Check if we've seen this article before
+                if article_id in news_type_ids:
+                    log.debug(
+                        f"Article {article_id} already posted for {news_type} in {guild.name}"
                     )
+                    continue
+
+                # New article found!
+                embed = await self.create_news_embed(article)
 
                 try:
                     await channel.send(embed=embed)
                     log.info(
-                        f"Posted new {news_type} article to {guild.name}: {latest_article.get('title')}"
+                        f"Posted new {news_type} article to {guild.name}: {article.get('title')}"
                     )
 
-                    # Update last post
-                    last_posts[news_type] = {
-                        "url": latest_article.get("url"),
-                        "title": latest_article.get("title"),
-                        "date": latest_article.get("date", ""),
-                    }
-                    await self.config.guild(guild).last_posts.set(last_posts)
+                    # Add article ID to the list
+                    news_type_ids.append(article_id)
+                    article_ids[news_type] = news_type_ids
+                    await self.config.guild(guild).article_ids.set(article_ids)
 
                 except discord.Forbidden:
                     log.error(
@@ -288,8 +373,8 @@ class RockstarNewswire(commands.Cog):
 
         while True:
             try:
-                # Wait 2 hours (7200 seconds)
-                await asyncio.sleep(7200)
+                # Wait 2 hours
+                await asyncio.sleep(REFRESH_INTERVAL)
 
                 log.info("Starting periodic newswire check")
 
@@ -335,7 +420,10 @@ class RockstarNewswire(commands.Cog):
     async def _list_types(self, ctx: commands.Context):
         """List all available news types."""
         types_list = "\n".join(
-            [f"• `{t}` - {self._get_type_description(t)}" for t in NEWS_TYPE_PATHS.keys()]
+            [
+                f"• `{t}` - {self._get_type_description(t)}"
+                for t in GENRE_IDS.keys()
+            ]
         )
         embed = discord.Embed(
             title="Available News Types",
@@ -351,7 +439,7 @@ class RockstarNewswire(commands.Cog):
         Use `[p]rockstarnewswire types` to see available types.
         """
         news_type = news_type.lower()
-        if news_type not in NEWS_TYPE_PATHS:
+        if news_type not in GENRE_IDS:
             await ctx.send(
                 f"Invalid news type. Use `{ctx.clean_prefix}rockstarnewswire types` to see available types."
             )
@@ -430,7 +518,9 @@ class RockstarNewswire(commands.Cog):
             color=await ctx.embed_color(),
         )
 
-        embed.add_field(name="Enabled", value="Yes" if settings.get("enabled") else "No", inline=True)
+        embed.add_field(
+            name="Enabled", value="Yes" if settings.get("enabled") else "No", inline=True
+        )
         embed.add_field(
             name="Channel",
             value=channel.mention if channel else "Not set",
@@ -452,7 +542,7 @@ class RockstarNewswire(commands.Cog):
     async def _test_fetch(self, ctx: commands.Context, news_type: str = "latest"):
         """Test fetching articles for a specific news type."""
         news_type = news_type.lower()
-        if news_type not in NEWS_TYPE_PATHS:
+        if news_type not in GENRE_IDS:
             await ctx.send(
                 f"Invalid news type. Use `{ctx.clean_prefix}rockstarnewswire types` to see available types."
             )
@@ -460,25 +550,32 @@ class RockstarNewswire(commands.Cog):
 
         await ctx.send(f"Fetching {news_type} articles...")
         try:
-            articles = await self.get_newswire_articles(news_type)
-            if not articles:
+            article = await self.get_new_article(news_type)
+            if not article:
                 await ctx.send(f"No articles found for type `{news_type}`.")
                 return
 
-            # Show first 3 articles
-            for i, article in enumerate(articles[:3], 1):
-                embed = await self.create_news_embed(article)
-                embed.set_footer(
-                    text=f"Test - Article {i} of {min(3, len(articles))} | {news_type}"
-                )
-                await ctx.send(embed=embed)
-
-            if len(articles) > 3:
-                await ctx.send(f"... and {len(articles) - 3} more articles found.")
+            embed = await self.create_news_embed(article)
+            embed.set_footer(
+                text=f"Test - {news_type} | Article ID: {article.get('id')}",
+                icon_url="https://img.icons8.com/color/48/000000/rockstar-games.png",
+            )
+            await ctx.send(embed=embed)
 
         except Exception as e:
             log.error(f"Error in test fetch: {e}", exc_info=True)
             await ctx.send(f"Error fetching articles: {e}")
+
+    @_rockstarnewswire.command(name="refreshhash")
+    async def _refresh_hash(self, ctx: commands.Context):
+        """Manually refresh the hash token (admin only)."""
+        await ctx.send("Refreshing hash token...")
+        try:
+            self.news_hash = await self.get_hash_token()
+            await ctx.send(f"Hash token refreshed successfully: `{self.news_hash[:20]}...`")
+        except Exception as e:
+            log.error(f"Error refreshing hash: {e}", exc_info=True)
+            await ctx.send(f"Error refreshing hash token: {e}")
 
     def _get_type_description(self, news_type: str) -> str:
         """Get a human-readable description for a news type."""
