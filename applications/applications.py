@@ -1043,9 +1043,34 @@ class Applications(commands.Cog):
 
         await ctx.send(embed=embed)
 
-    @_applications.command(name="approve")
-    async def _approve(self, ctx: commands.Context, member: discord.Member):
-        """Approve an application."""
+    @_applications.command(name="approve", aliases=["a"])
+    async def _approve(self, ctx: commands.Context, member: Optional[discord.Member] = None):
+        """Approve an application.
+        
+        If run in an application channel without specifying a member, 
+        it will approve the application for the channel owner.
+        """
+        # If no member specified, try to find from current channel
+        if member is None:
+            applications = await self.config.guild(ctx.guild).applications()
+            current_channel_id = ctx.channel.id
+            
+            # Find application by channel ID
+            found_member = None
+            for user_id, app_data in applications.items():
+                if app_data.get("channel_id") == current_channel_id:
+                    found_member = ctx.guild.get_member(int(user_id))
+                    if found_member:
+                        member = found_member
+                        break
+            
+            if not member:
+                await ctx.send(
+                    "❌ No member specified and this doesn't appear to be an application channel. "
+                    "Please specify a member: `[p]applications approve @user`"
+                )
+                return
+
         if not await self.config.guild(ctx.guild).enabled():
             await ctx.send("The application system is not enabled.")
             return
@@ -1121,11 +1146,36 @@ class Applications(commands.Cog):
 
         await ctx.send(f"✅ Approved {member.mention}'s application.")
 
-    @_applications.command(name="deny")
+    @_applications.command(name="deny", aliases=["d"])
     async def _deny(
-        self, ctx: commands.Context, member: discord.Member, *, reason: Optional[str] = None
+        self, ctx: commands.Context, member: Optional[discord.Member] = None, *, reason: Optional[str] = None
     ):
-        """Deny an application."""
+        """Deny an application.
+        
+        If run in an application channel without specifying a member, 
+        it will deny the application for the channel owner.
+        """
+        # If no member specified, try to find from current channel
+        if member is None:
+            applications = await self.config.guild(ctx.guild).applications()
+            current_channel_id = ctx.channel.id
+            
+            # Find application by channel ID
+            found_member = None
+            for user_id, app_data in applications.items():
+                if app_data.get("channel_id") == current_channel_id:
+                    found_member = ctx.guild.get_member(int(user_id))
+                    if found_member:
+                        member = found_member
+                        break
+            
+            if not member:
+                await ctx.send(
+                    "❌ No member specified and this doesn't appear to be an application channel. "
+                    "Please specify a member: `[p]applications deny @user [reason]`"
+                )
+                return
+
         if not await self.config.guild(ctx.guild).enabled():
             await ctx.send("The application system is not enabled.")
             return
@@ -1441,8 +1491,33 @@ class Applications(commands.Cog):
         await ctx.send(embed=embed)
 
     @_applications.command(name="close")
-    async def _close(self, ctx: commands.Context, member: discord.Member):
-        """Close/delete an application channel."""
+    async def _close(self, ctx: commands.Context, member: Optional[discord.Member] = None):
+        """Close/delete an application channel.
+        
+        If run in an application channel without specifying a member, 
+        it will close the current channel.
+        """
+        # If no member specified, try to find from current channel
+        if member is None:
+            applications = await self.config.guild(ctx.guild).applications()
+            current_channel_id = ctx.channel.id
+            
+            # Find application by channel ID
+            found_member = None
+            for user_id, app_data in applications.items():
+                if app_data.get("channel_id") == current_channel_id:
+                    found_member = ctx.guild.get_member(int(user_id))
+                    if found_member:
+                        member = found_member
+                        break
+            
+            if not member:
+                await ctx.send(
+                    "❌ No member specified and this doesn't appear to be an application channel. "
+                    "Please specify a member: `[p]applications close @user`"
+                )
+                return
+
         applications = await self.config.guild(ctx.guild).applications()
         if str(member.id) not in applications:
             await ctx.send(f"{member.mention} does not have an active application.")
@@ -1456,7 +1531,8 @@ class Applications(commands.Cog):
             if channel:
                 try:
                     await channel.delete(reason=f"Application closed by {ctx.author.display_name}")
-                    await ctx.send(f"✅ Closed application channel for {member.mention}.")
+                    if channel.id != ctx.channel.id:
+                        await ctx.send(f"✅ Closed application channel for {member.mention}.")
                 except discord.Forbidden:
                     await ctx.send("❌ Permission denied deleting channel.")
                 except discord.HTTPException as e:
