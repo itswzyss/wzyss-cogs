@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 
 import discord
-from discord.ui import Button, Modal, TextInput, View
+from discord.ui import Button, Modal, Select, TextInput, View
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 from redbot.core.utils.chat_formatting import box
@@ -273,6 +273,583 @@ class ApplicationReviewView(View):
         self.add_item(DenyButton(cog, member))
 
 
+class FieldAddModal(Modal):
+    """Modal for adding a new form field."""
+
+    def __init__(self, cog: "Applications"):
+        super().__init__(title="Add Form Field")
+        self.cog = cog
+
+        self.name_input = TextInput(
+            label="Field Name",
+            placeholder="e.g., age, experience, agreement",
+            required=True,
+            max_length=50,
+        )
+        self.label_input = TextInput(
+            label="Field Label",
+            placeholder="e.g., What is your age?",
+            required=True,
+            max_length=100,
+        )
+        self.type_input = TextInput(
+            label="Field Type",
+            placeholder="text, paragraph, number, select, or confirm",
+            required=True,
+            max_length=20,
+        )
+        self.required_input = TextInput(
+            label="Required (true/false)",
+            placeholder="true",
+            required=True,
+            max_length=5,
+            default="true",
+        )
+        self.extra_input = TextInput(
+            label="Options (select) or Confirm Text (confirm)",
+            placeholder="For select: Option1,Option2,Option3 | For confirm: I agree",
+            required=False,
+            max_length=500,
+        )
+
+        self.add_item(self.name_input)
+        self.add_item(self.label_input)
+        self.add_item(self.type_input)
+        self.add_item(self.required_input)
+        self.add_item(self.extra_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        """Handle field creation."""
+        name = self.name_input.value.strip().lower()
+        label = self.label_input.value.strip()
+        field_type = self.type_input.value.strip().lower()
+        required_str = self.required_input.value.strip().lower()
+        extra = self.extra_input.value.strip() if self.extra_input.value else None
+
+        # Validate field type
+        if field_type not in ["text", "paragraph", "number", "select", "confirm"]:
+            await interaction.response.send_message(
+                "❌ Invalid field type. Use `text`, `paragraph`, `number`, `select`, or `confirm`.",
+                ephemeral=True,
+            )
+            return
+
+        # Validate required
+        required = required_str in ["true", "yes", "1", "required"]
+        if required_str not in ["true", "yes", "1", "required", "false", "no", "0", "optional"]:
+            await interaction.response.send_message(
+                "❌ Invalid required value. Use `true` or `false`.",
+                ephemeral=True,
+            )
+            return
+
+        # Validate select fields
+        if field_type == "select":
+            if not extra:
+                await interaction.response.send_message(
+                    "❌ Select fields require options. Provide them separated by commas.",
+                    ephemeral=True,
+                )
+                return
+            options_list = [opt.strip() for opt in extra.split(",") if opt.strip()]
+            if len(options_list) < 2:
+                await interaction.response.send_message(
+                    "❌ Select fields require at least 2 options.",
+                    ephemeral=True,
+                )
+                return
+
+        # Validate confirm fields
+        if field_type == "confirm":
+            if not extra:
+                await interaction.response.send_message(
+                    "❌ Confirm fields require the exact text users must type.",
+                    ephemeral=True,
+                )
+                return
+
+        # Add field
+        async with self.cog.config.guild(interaction.guild).form_fields() as fields:
+            # Check if field name already exists
+            if any(f.get("name") == name for f in fields):
+                await interaction.response.send_message(
+                    f"❌ A field with name `{name}` already exists.",
+                    ephemeral=True,
+                )
+                return
+
+            field_data = {
+                "name": name,
+                "label": label,
+                "type": field_type,
+                "required": required,
+                "placeholder": "",
+            }
+
+            if field_type == "select":
+                field_data["options"] = [opt.strip() for opt in extra.split(",") if opt.strip()]
+            elif field_type == "confirm":
+                field_data["confirm_text"] = extra.strip()
+
+            fields.append(field_data)
+
+        options_text = ""
+        if field_type == "select":
+            options_text = f" with options: {extra}"
+        elif field_type == "confirm":
+            options_text = f" requiring confirmation: `{extra}`"
+
+        await interaction.response.send_message(
+            f"✅ Added field `{name}` ({field_type}){options_text} to the application form.",
+            ephemeral=True,
+        )
+
+        # Refresh the field manager view
+        if hasattr(self, "manager_view") and self.manager_view.message:
+            await self.manager_view.refresh()
+
+
+class FieldEditModal(Modal):
+    """Modal for editing an existing form field."""
+
+    def __init__(self, cog: "Applications", field: Dict):
+        super().__init__(title="Edit Form Field")
+        self.cog = cog
+        self.field = field
+        self.original_name = field.get("name")
+
+        self.name_input = TextInput(
+            label="Field Name",
+            placeholder="e.g., age, experience, agreement",
+            required=True,
+            max_length=50,
+            default=field.get("name", ""),
+        )
+        self.label_input = TextInput(
+            label="Field Label",
+            placeholder="e.g., What is your age?",
+            required=True,
+            max_length=100,
+            default=field.get("label", ""),
+        )
+        self.type_input = TextInput(
+            label="Field Type",
+            placeholder="text, paragraph, number, select, or confirm",
+            required=True,
+            max_length=20,
+            default=field.get("type", "text"),
+        )
+        self.required_input = TextInput(
+            label="Required (true/false)",
+            placeholder="true",
+            required=True,
+            max_length=5,
+            default="true" if field.get("required", True) else "false",
+        )
+        
+        # Pre-fill extra input based on field type
+        extra_default = ""
+        if field.get("type") == "select":
+            extra_default = ", ".join(field.get("options", []))
+        elif field.get("type") == "confirm":
+            extra_default = field.get("confirm_text", "")
+        
+        self.extra_input = TextInput(
+            label="Options (select) or Confirm Text (confirm)",
+            placeholder="For select: Option1,Option2,Option3 | For confirm: I agree",
+            required=False,
+            max_length=500,
+            default=extra_default,
+        )
+
+        self.add_item(self.name_input)
+        self.add_item(self.label_input)
+        self.add_item(self.type_input)
+        self.add_item(self.required_input)
+        self.add_item(self.extra_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        """Handle field update."""
+        name = self.name_input.value.strip().lower()
+        label = self.label_input.value.strip()
+        field_type = self.type_input.value.strip().lower()
+        required_str = self.required_input.value.strip().lower()
+        extra = self.extra_input.value.strip() if self.extra_input.value else None
+
+        # Validate field type
+        if field_type not in ["text", "paragraph", "number", "select", "confirm"]:
+            await interaction.response.send_message(
+                "❌ Invalid field type. Use `text`, `paragraph`, `number`, `select`, or `confirm`.",
+                ephemeral=True,
+            )
+            return
+
+        # Validate required
+        required = required_str in ["true", "yes", "1", "required"]
+        if required_str not in ["true", "yes", "1", "required", "false", "no", "0", "optional"]:
+            await interaction.response.send_message(
+                "❌ Invalid required value. Use `true` or `false`.",
+                ephemeral=True,
+            )
+            return
+
+        # Validate select fields
+        if field_type == "select":
+            if not extra:
+                await interaction.response.send_message(
+                    "❌ Select fields require options. Provide them separated by commas.",
+                    ephemeral=True,
+                )
+                return
+            options_list = [opt.strip() for opt in extra.split(",") if opt.strip()]
+            if len(options_list) < 2:
+                await interaction.response.send_message(
+                    "❌ Select fields require at least 2 options.",
+                    ephemeral=True,
+                )
+                return
+
+        # Validate confirm fields
+        if field_type == "confirm":
+            if not extra:
+                await interaction.response.send_message(
+                    "❌ Confirm fields require the exact text users must type.",
+                    ephemeral=True,
+                )
+                return
+
+        # Update field
+        async with self.cog.config.guild(interaction.guild).form_fields() as fields:
+            # Find the field to update
+            field_index = None
+            for i, f in enumerate(fields):
+                if f.get("name") == self.original_name:
+                    field_index = i
+                    break
+
+            if field_index is None:
+                await interaction.response.send_message(
+                    f"❌ Field `{self.original_name}` not found.",
+                    ephemeral=True,
+                )
+                return
+
+            # Check if renaming to an existing name (but not the same field)
+            if name != self.original_name and any(f.get("name") == name for f in fields):
+                await interaction.response.send_message(
+                    f"❌ A field with name `{name}` already exists.",
+                    ephemeral=True,
+                )
+                return
+
+            # Update field data
+            field_data = {
+                "name": name,
+                "label": label,
+                "type": field_type,
+                "required": required,
+                "placeholder": fields[field_index].get("placeholder", ""),
+            }
+
+            if field_type == "select":
+                field_data["options"] = [opt.strip() for opt in extra.split(",") if opt.strip()]
+            elif field_type == "confirm":
+                field_data["confirm_text"] = extra.strip()
+
+            fields[field_index] = field_data
+
+        options_text = ""
+        if field_type == "select":
+            options_text = f" with options: {extra}"
+        elif field_type == "confirm":
+            options_text = f" requiring confirmation: `{extra}`"
+
+        await interaction.response.send_message(
+            f"✅ Updated field `{name}` ({field_type}){options_text}.",
+            ephemeral=True,
+        )
+
+        # Refresh the field manager view
+        if hasattr(self, "manager_view") and self.manager_view.message:
+            await self.manager_view.refresh()
+
+
+class FieldSelectMenu(Select):
+    """Select menu for choosing a field to edit, delete, or move."""
+
+    def __init__(self, cog: "Applications", fields: List[Dict], action: str, manager_view: "FieldManagerView"):
+        self.cog = cog
+        self.action = action  # "edit", "delete", "move_up", or "move_down"
+        self.manager_view = manager_view
+        
+        options = []
+        for i, field in enumerate(fields):
+            field_type = field.get("type", "text")
+            label = field.get("label", field.get("name", "Unknown"))
+            
+            # Disable options that can't be moved
+            disabled = False
+            if action == "move_up" and i == 0:
+                disabled = True
+            elif action == "move_down" and i == len(fields) - 1:
+                disabled = True
+            
+            options.append(
+                discord.SelectOption(
+                    label=f"{i+1}. {label[:80]}",
+                    description=f"Type: {field_type} | Name: {field.get('name')}",
+                    value=str(i),
+                    default=False,
+                )
+            )
+
+        if not options:
+            options.append(
+                discord.SelectOption(
+                    label="No fields available",
+                    description="Add a field first",
+                    value="-1",
+                )
+            )
+
+        placeholder_text = f"Select a field to {action.replace('_', ' ')}..."
+        super().__init__(
+            placeholder=placeholder_text,
+            options=options[:25],  # Discord limit
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        """Handle field selection."""
+        if self.values[0] == "-1":
+            await interaction.response.send_message("❌ No fields available.", ephemeral=True)
+            return
+
+        field_index = int(self.values[0])
+        fields = await self.cog.config.guild(interaction.guild).form_fields()
+        
+        if field_index >= len(fields):
+            await interaction.response.send_message("❌ Field not found.", ephemeral=True)
+            return
+
+        field = fields[field_index]
+
+        if self.action == "edit":
+            modal = FieldEditModal(self.cog, field)
+            modal.manager_view = self.manager_view
+            await interaction.response.send_modal(modal)
+        elif self.action == "delete":
+            # Confirm deletion
+            embed = discord.Embed(
+                title="⚠️ Confirm Deletion",
+                description=f"Are you sure you want to delete field **{field.get('label', field.get('name'))}**?",
+                color=discord.Color.red(),
+            )
+            embed.add_field(name="Field Name", value=f"`{field.get('name')}`", inline=False)
+            embed.add_field(name="Field Type", value=field.get("type", "text"), inline=True)
+            embed.add_field(name="Required", value="Yes" if field.get("required", True) else "No", inline=True)
+
+            view = View(timeout=60)
+            confirm_button = Button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️")
+            cancel_button = Button(label="Cancel", style=discord.ButtonStyle.secondary)
+
+            async def confirm_callback(interaction: discord.Interaction):
+                async with self.cog.config.guild(interaction.guild).form_fields() as fields_list:
+                    fields_list[:] = [f for f in fields_list if f.get("name") != field.get("name")]
+
+                await interaction.response.send_message(
+                    f"✅ Deleted field `{field.get('name')}`.",
+                    ephemeral=True,
+                )
+                if self.manager_view.message:
+                    await self.manager_view.refresh()
+
+            async def cancel_callback(interaction: discord.Interaction):
+                await interaction.response.send_message("❌ Deletion cancelled.", ephemeral=True)
+
+            confirm_button.callback = confirm_callback
+            cancel_button.callback = cancel_callback
+            view.add_item(confirm_button)
+            view.add_item(cancel_button)
+
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        elif self.action == "move_up":
+            if field_index == 0:
+                await interaction.response.send_message("❌ Field is already at the top.", ephemeral=True)
+                return
+
+            async with self.cog.config.guild(interaction.guild).form_fields() as fields_list:
+                fields_list[field_index], fields_list[field_index - 1] = (
+                    fields_list[field_index - 1],
+                    fields_list[field_index],
+                )
+
+            await interaction.response.send_message(
+                f"✅ Moved field `{field.get('name')}` up.",
+                ephemeral=True,
+            )
+            if self.manager_view.message:
+                await self.manager_view.refresh()
+        elif self.action == "move_down":
+            if field_index == len(fields) - 1:
+                await interaction.response.send_message("❌ Field is already at the bottom.", ephemeral=True)
+                return
+
+            async with self.cog.config.guild(interaction.guild).form_fields() as fields_list:
+                fields_list[field_index], fields_list[field_index + 1] = (
+                    fields_list[field_index + 1],
+                    fields_list[field_index],
+                )
+
+            await interaction.response.send_message(
+                f"✅ Moved field `{field.get('name')}` down.",
+                ephemeral=True,
+            )
+            if self.manager_view.message:
+                await self.manager_view.refresh()
+
+
+class FieldManagerView(View):
+    """Main view for managing application form fields."""
+
+    def __init__(self, cog: "Applications"):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.message: Optional[discord.Message] = None
+
+    async def refresh(self, interaction: Optional[discord.Interaction] = None):
+        """Refresh the field list display."""
+        guild = None
+        if interaction:
+            guild = interaction.guild
+        elif self.message:
+            guild = self.message.guild
+        
+        if not guild:
+            return
+
+        fields = await self.cog.config.guild(guild).form_fields()
+
+        embed = discord.Embed(
+            title="📋 Application Form Fields Manager",
+            description="Use the buttons below to manage your application form fields.",
+            color=await self.cog.bot.get_embed_color(guild),
+        )
+
+        if not fields:
+            embed.add_field(
+                name="No Fields",
+                value="Add your first field using the **Add Field** button below.",
+                inline=False,
+            )
+        else:
+            for i, field in enumerate(fields, 1):
+                field_type = field.get("type", "text")
+                required = field.get("required", True)
+                options = field.get("options", [])
+                confirm_text = field.get("confirm_text", "")
+
+                value_text = f"**Type:** {field_type}\n**Required:** {'Yes' if required else 'No'}"
+                if options:
+                    value_text += f"\n**Options:** {', '.join(options)}"
+                if confirm_text:
+                    value_text += f"\n**Must type:** `{confirm_text}`"
+
+                embed.add_field(
+                    name=f"{i}. {field.get('label', field.get('name'))}",
+                    value=value_text,
+                    inline=False,
+                )
+
+        if interaction:
+            if interaction.response.is_done():
+                # Interaction already responded (e.g., from modal), edit the original message
+                if self.message:
+                    try:
+                        await self.message.edit(embed=embed, view=self)
+                    except discord.NotFound:
+                        pass
+            else:
+                await interaction.response.edit_message(embed=embed, view=self)
+        elif self.message:
+            try:
+                await self.message.edit(embed=embed, view=self)
+            except discord.NotFound:
+                # Message was deleted, can't refresh
+                pass
+
+    @discord.ui.button(label="Add Field", style=discord.ButtonStyle.success, emoji="➕")
+    async def add_field(self, interaction: discord.Interaction, button: Button):
+        """Open modal to add a new field."""
+        modal = FieldAddModal(self.cog)
+        modal.manager_view = self
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Edit Field", style=discord.ButtonStyle.primary, emoji="✏️")
+    async def edit_field(self, interaction: discord.Interaction, button: Button):
+        """Open select menu to choose a field to edit."""
+        fields = await self.cog.config.guild(interaction.guild).form_fields()
+        if not fields:
+            await interaction.response.send_message("❌ No fields to edit. Add a field first.", ephemeral=True)
+            return
+
+        view = View(timeout=60)
+        select_menu = FieldSelectMenu(self.cog, fields, "edit", self)
+        view.add_item(select_menu)
+        await interaction.response.send_message("Select a field to edit:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="Delete Field", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def delete_field(self, interaction: discord.Interaction, button: Button):
+        """Open select menu to choose a field to delete."""
+        fields = await self.cog.config.guild(interaction.guild).form_fields()
+        if not fields:
+            await interaction.response.send_message("❌ No fields to delete. Add a field first.", ephemeral=True)
+            return
+
+        view = View(timeout=60)
+        select_menu = FieldSelectMenu(self.cog, fields, "delete", self)
+        view.add_item(select_menu)
+        await interaction.response.send_message("Select a field to delete:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="Move Up", style=discord.ButtonStyle.secondary, emoji="⬆️")
+    async def move_up(self, interaction: discord.Interaction, button: Button):
+        """Move selected field up in order."""
+        fields = await self.cog.config.guild(interaction.guild).form_fields()
+        if not fields:
+            await interaction.response.send_message("❌ No fields to reorder.", ephemeral=True)
+            return
+
+        if len(fields) < 2:
+            await interaction.response.send_message("❌ Need at least 2 fields to reorder.", ephemeral=True)
+            return
+
+        view = View(timeout=60)
+        select_menu = FieldSelectMenu(self.cog, fields, "move_up", self)
+        view.add_item(select_menu)
+        await interaction.response.send_message("Select a field to move up:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="Move Down", style=discord.ButtonStyle.secondary, emoji="⬇️")
+    async def move_down(self, interaction: discord.Interaction, button: Button):
+        """Move selected field down in order."""
+        fields = await self.cog.config.guild(interaction.guild).form_fields()
+        if not fields:
+            await interaction.response.send_message("❌ No fields to reorder.", ephemeral=True)
+            return
+
+        if len(fields) < 2:
+            await interaction.response.send_message("❌ Need at least 2 fields to reorder.", ephemeral=True)
+            return
+
+        view = View(timeout=60)
+        select_menu = FieldSelectMenu(self.cog, fields, "move_down", self)
+        view.add_item(select_menu)
+        await interaction.response.send_message("Select a field to move down:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, emoji="🔄")
+    async def refresh_button(self, interaction: discord.Interaction, button: Button):
+        """Refresh the field list."""
+        await self.refresh(interaction)
+
+
 class Applications(commands.Cog):
     """Server application system for member screening."""
 
@@ -472,18 +1049,35 @@ class Applications(commands.Cog):
         # Create review view with approve/deny buttons
         view = ApplicationReviewView(self, member)
 
+        # Get notification role to ping in the application channel
+        notification_role = None
+        notification_role_id = await self.config.guild(member.guild).notification_role()
+        if notification_role_id:
+            notification_role = member.guild.get_role(notification_role_id)
+            if not notification_role:
+                # Role was deleted, clear from config
+                await self.config.guild(member.guild).notification_role.set(None)
+                log.warning(f"Notification role {notification_role_id} not found in {member.guild.name}")
+
+        # Build message content with notification role ping if configured
+        content = f"📋 **Application Submitted**\n\n"
+        if notification_role:
+            content = f"{notification_role.mention}\n\n{content}"
+        content += (
+            f"Your application has been received and is pending review. "
+            f"An admin will review it shortly."
+        )
+
         # Notify in channel
         await channel.send(
-            f"📋 **Application Submitted**\n\n"
-            f"Your application has been received and is pending review. "
-            f"An admin will review it shortly.",
+            content,
             embed=embed,
             view=view,
         )
 
         log.info(f"Application submitted by {member.display_name} in {member.guild.name}")
 
-        # Log to log channel and ping notification role
+        # Log to log channel (without notification role ping)
         await self.log_application_event(member.guild, member, "submitted", responses=responses)
 
     async def log_application_event(
@@ -507,22 +1101,10 @@ class Applications(commands.Cog):
             log.warning(f"Log channel {log_channel_id} not found in {guild.name}")
             return
 
-        # Get notification role for submissions
-        notification_role = None
-        if event_type == "submitted":
-            notification_role_id = await self.config.guild(guild).notification_role()
-            if notification_role_id:
-                notification_role = guild.get_role(notification_role_id)
-                if not notification_role:
-                    # Role was deleted, clear from config
-                    await self.config.guild(guild).notification_role.set(None)
-
         # Create embed based on event type
         if event_type == "submitted":
             embed = await self.create_log_embed(member, "submitted", responses=responses)
             content = ""
-            if notification_role:
-                content = f"{notification_role.mention} - New application submitted"
         elif event_type == "approved":
             embed = await self.create_log_embed(member, "approved", decision_maker=decision_maker)
             content = f"✅ Application approved by {decision_maker.mention if decision_maker else 'Unknown'}"
@@ -1127,6 +1709,46 @@ class Applications(commands.Cog):
 
             field["confirm_text"] = confirm_text
             await ctx.send(f"Updated confirmation text for field `{name}`: `{confirm_text}`")
+
+    @_field.command(name="manager", aliases=["ui"])
+    async def _field_manager(self, ctx: commands.Context):
+        """Open the interactive field manager UI."""
+        view = FieldManagerView(self)
+        
+        # Create initial embed
+        fields = await self.config.guild(ctx.guild).form_fields()
+        embed = discord.Embed(
+            title="📋 Application Form Fields Manager",
+            description="Use the buttons below to manage your application form fields.",
+            color=await ctx.embed_color(),
+        )
+
+        if not fields:
+            embed.add_field(
+                name="No Fields",
+                value="Add your first field using the **Add Field** button below.",
+                inline=False,
+            )
+        else:
+            for i, field in enumerate(fields, 1):
+                field_type = field.get("type", "text")
+                required = field.get("required", True)
+                options = field.get("options", [])
+                confirm_text = field.get("confirm_text", "")
+
+                value_text = f"**Type:** {field_type}\n**Required:** {'Yes' if required else 'No'}"
+                if options:
+                    value_text += f"\n**Options:** {', '.join(options)}"
+                if confirm_text:
+                    value_text += f"\n**Must type:** `{confirm_text}`"
+
+                embed.add_field(
+                    name=f"{i}. {field.get('label', field.get('name'))}",
+                    value=value_text,
+                    inline=False,
+                )
+
+        view.message = await ctx.send(embed=embed, view=view)
 
     @_applications.command(name="settings")
     async def _settings(self, ctx: commands.Context):

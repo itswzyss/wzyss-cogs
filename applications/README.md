@@ -87,6 +87,28 @@ To remove a bypass role:
 
 The cog comes with default form fields, but you can customize them:
 
+#### Interactive Field Manager (Recommended)
+
+Use the interactive UI to manage fields with buttons:
+
+```
+[p]applications field manager
+```
+
+or
+
+```
+[p]applications field ui
+```
+
+This opens an interactive interface where you can:
+- ➕ **Add Field** - Create a new field with a modal form
+- ✏️ **Edit Field** - Select and edit an existing field
+- 🗑️ **Delete Field** - Remove a field (with confirmation)
+- ⬆️ **Move Up** - Reorder fields (move selected field up)
+- ⬇️ **Move Down** - Reorder fields (move selected field down)
+- 🔄 **Refresh** - Update the field list display
+
 #### List current fields
 
 ```
