@@ -96,6 +96,113 @@ class ApplicationButton(Button):
         await interaction.response.send_modal(modal)
 
 
+class DenyModal(Modal):
+    """Modal for admins to provide a denial reason."""
+
+    def __init__(self, cog: "Applications", member: discord.Member):
+        super().__init__(title="Deny Application")
+        self.cog = cog
+        self.member = member
+
+        self.reason_input = TextInput(
+            label="Reason for Denial",
+            placeholder="Provide a reason for denying this application...",
+            required=True,
+            style=discord.TextStyle.paragraph,
+            max_length=1000,
+        )
+        self.add_item(self.reason_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        """Handle denial submission."""
+        reason = self.reason_input.value
+        await self.cog.deny_application(interaction, self.member, reason)
+
+
+class ApproveButton(Button):
+    """Button to approve an application."""
+
+    def __init__(self, cog: "Applications", member: discord.Member):
+        super().__init__(label="Approve", style=discord.ButtonStyle.success, emoji="✅")
+        self.cog = cog
+        self.member = member
+
+    async def callback(self, interaction: discord.Interaction):
+        """Approve the application."""
+        # Check permissions
+        if not await self.cog.can_manage_applications(interaction.user, interaction.guild):
+            await interaction.response.send_message(
+                "❌ You don't have permission to manage applications.", ephemeral=True
+            )
+            return
+
+        # Check if already processed
+        applications = await self.cog.config.guild(interaction.guild).applications()
+        if str(self.member.id) not in applications:
+            await interaction.response.send_message(
+                f"❌ {self.member.mention} does not have an active application.", ephemeral=True
+            )
+            return
+
+        app_data = applications[str(self.member.id)]
+        if app_data.get("status") != "pending":
+            await interaction.response.send_message(
+                f"❌ This application is already {app_data.get('status')}.", ephemeral=True
+            )
+            return
+
+        # Approve the application
+        await self.cog.approve_application_interaction(interaction, self.member)
+
+
+class DenyButton(Button):
+    """Button to deny an application."""
+
+    def __init__(self, cog: "Applications", member: discord.Member):
+        super().__init__(label="Deny", style=discord.ButtonStyle.danger, emoji="❌")
+        self.cog = cog
+        self.member = member
+
+    async def callback(self, interaction: discord.Interaction):
+        """Open denial modal."""
+        # Check permissions
+        if not await self.cog.can_manage_applications(interaction.user, interaction.guild):
+            await interaction.response.send_message(
+                "❌ You don't have permission to manage applications.", ephemeral=True
+            )
+            return
+
+        # Check if already processed
+        applications = await self.cog.config.guild(interaction.guild).applications()
+        if str(self.member.id) not in applications:
+            await interaction.response.send_message(
+                f"❌ {self.member.mention} does not have an active application.", ephemeral=True
+            )
+            return
+
+        app_data = applications[str(self.member.id)]
+        if app_data.get("status") != "pending":
+            await interaction.response.send_message(
+                f"❌ This application is already {app_data.get('status')}.", ephemeral=True
+            )
+            return
+
+        # Open denial modal
+        modal = DenyModal(self.cog, self.member)
+        await interaction.response.send_modal(modal)
+
+
+class ApplicationReviewView(View):
+    """View with approve/deny buttons for application review."""
+
+    def __init__(self, cog: "Applications", member: discord.Member):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.member = member
+        self.add_item(ApproveButton(cog, member))
+        self.add_item(DenyButton(cog, member))
+
+
 class Applications(commands.Cog):
     """Server application system for member screening."""
 
@@ -109,6 +216,7 @@ class Applications(commands.Cog):
             "enabled": False,
             "restricted_role": None,  # Role ID that blocks channel access
             "bypass_roles": [],  # List of role IDs that skip application
+            "manager_roles": [],  # List of role IDs that can manage applications
             "category_id": None,  # Category ID for application channels
             "form_fields": [
                 {
@@ -140,6 +248,20 @@ class Applications(commands.Cog):
 
         member_role_ids = [role.id for role in member.roles]
         return any(role_id in member_role_ids for role_id in bypass_roles)
+
+    async def can_manage_applications(self, user: discord.Member, guild: discord.Guild) -> bool:
+        """Check if user can manage applications (admin or manager role)."""
+        # Check if user has manage_guild permission (admin)
+        if user.guild_permissions.manage_guild:
+            return True
+
+        # Check manager roles
+        manager_roles = await self.config.guild(guild).manager_roles()
+        if not manager_roles:
+            return False
+
+        user_role_ids = [role.id for role in user.roles]
+        return any(role_id in user_role_ids for role_id in manager_roles)
 
     async def create_application_channel(
         self, guild: discord.Guild, member: discord.Member
@@ -174,6 +296,12 @@ class Applications(commands.Cog):
             if role.permissions.manage_guild or role.permissions.administrator
         ]
 
+        # Get manager roles
+        manager_role_ids = await self.config.guild(guild).manager_roles()
+        manager_roles = [
+            guild.get_role(rid) for rid in manager_role_ids if guild.get_role(rid)
+        ]
+
         # Create channel with permissions
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -184,6 +312,15 @@ class Applications(commands.Cog):
 
         # Add admin roles
         for role in admin_roles:
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                manage_messages=True,
+            )
+
+        # Add manager roles
+        for role in manager_roles:
             overwrites[role] = discord.PermissionOverwrite(
                 view_channel=True,
                 send_messages=True,
@@ -249,12 +386,16 @@ class Applications(commands.Cog):
         # Create review embed
         embed = await self.create_review_embed(member, responses, "pending")
 
+        # Create review view with approve/deny buttons
+        view = ApplicationReviewView(self, member)
+
         # Notify in channel
         await channel.send(
             f"📋 **Application Submitted**\n\n"
             f"Your application has been received and is pending review. "
             f"An admin will review it shortly.",
             embed=embed,
+            view=view,
         )
 
         log.info(f"Application submitted by {member.display_name} in {member.guild.name}")
@@ -474,6 +615,36 @@ class Applications(commands.Cog):
                 else:
                     await ctx.send(f"{role.mention} is not a bypass role.")
 
+    @_applications.command(name="managerrole")
+    async def _manager_role(
+        self, ctx: commands.Context, action: str, role: Optional[discord.Role] = None
+    ):
+        """Add or remove a manager role.
+
+        Members with manager roles can approve/deny applications.
+        """
+        if action.lower() not in ["add", "remove"]:
+            await ctx.send("Invalid action. Use `add` or `remove`.")
+            return
+
+        if role is None:
+            await ctx.send("Please specify a role.")
+            return
+
+        async with self.config.guild(ctx.guild).manager_roles() as manager_roles:
+            if action.lower() == "add":
+                if role.id not in manager_roles:
+                    manager_roles.append(role.id)
+                    await ctx.send(f"Added {role.mention} as a manager role.")
+                else:
+                    await ctx.send(f"{role.mention} is already a manager role.")
+            else:  # remove
+                if role.id in manager_roles:
+                    manager_roles.remove(role.id)
+                    await ctx.send(f"Removed {role.mention} from manager roles.")
+                else:
+                    await ctx.send(f"{role.mention} is not a manager role.")
+
     @_applications.command(name="category")
     async def _set_category(
         self, ctx: commands.Context, category: Optional[discord.CategoryChannel] = None
@@ -618,6 +789,18 @@ class Applications(commands.Cog):
                 inline=False,
             )
 
+        manager_role_ids = settings.get("manager_roles", [])
+        manager_roles = [
+            ctx.guild.get_role(rid) for rid in manager_role_ids if ctx.guild.get_role(rid)
+        ]
+        if manager_roles:
+            manager_list = ", ".join([r.mention for r in manager_roles])
+            embed.add_field(
+                name="Manager Roles",
+                value=manager_list if len(manager_list) <= 1024 else f"{len(manager_roles)} roles",
+                inline=False,
+            )
+
         embed.add_field(
             name="Form Fields",
             value=f"{len(form_fields)} field(s)",
@@ -750,6 +933,174 @@ class Applications(commands.Cog):
                     pass
 
         await ctx.send(f"❌ Denied {member.mention}'s application.")
+
+    async def approve_application_interaction(
+        self, interaction: discord.Interaction, member: discord.Member
+    ):
+        """Approve application from button interaction."""
+        applications = await self.config.guild(interaction.guild).applications()
+        if str(member.id) not in applications:
+            await interaction.response.send_message(
+                f"❌ {member.mention} does not have an active application.", ephemeral=True
+            )
+            return
+
+        app_data = applications[str(member.id)]
+        if app_data.get("status") != "pending":
+            await interaction.response.send_message(
+                f"❌ This application is already {app_data.get('status')}.", ephemeral=True
+            )
+            return
+
+        # Remove restricted role
+        restricted_role_id = await self.config.guild(interaction.guild).restricted_role()
+        if restricted_role_id:
+            restricted_role = interaction.guild.get_role(restricted_role_id)
+            if restricted_role and restricted_role in member.roles:
+                try:
+                    await member.remove_roles(restricted_role, reason="Application approved")
+                    log.info(f"Removed restricted role from {member.display_name}")
+                except discord.Forbidden:
+                    log.error(f"Permission denied removing restricted role from {member.display_name}")
+                except discord.HTTPException as e:
+                    log.error(f"Error removing restricted role: {e}")
+
+        # Update status
+        app_data["status"] = "approved"
+        app_data["approved_by"] = interaction.user.id
+        app_data["approved_at"] = datetime.utcnow().isoformat()
+        applications[str(member.id)] = app_data
+        await self.config.guild(interaction.guild).applications.set(applications)
+
+        # Update the message to remove buttons
+        embed = await self.create_review_embed(
+            member, app_data.get("responses", {}), "approved"
+        )
+        try:
+            if interaction.response.is_done():
+                # If already responded, try to edit via followup
+                await interaction.followup.edit_message(
+                    interaction.message.id,
+                    content=(
+                        f"✅ **Application Approved by {interaction.user.mention}**\n\n"
+                        f"Congratulations {member.mention}! Your application has been approved. "
+                        f"You now have full access to the server."
+                    ),
+                    embed=embed,
+                    view=None,
+                )
+            else:
+                await interaction.response.edit_message(
+                    content=(
+                        f"✅ **Application Approved by {interaction.user.mention}**\n\n"
+                        f"Congratulations {member.mention}! Your application has been approved. "
+                        f"You now have full access to the server."
+                    ),
+                    embed=embed,
+                    view=None,
+                )
+        except discord.HTTPException:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"✅ Approved {member.mention}'s application.", ephemeral=True
+                )
+
+        # Notify in channel
+        channel_id = app_data.get("channel_id")
+        if channel_id:
+            channel = interaction.guild.get_channel(channel_id)
+            if channel and channel != interaction.channel:
+                embed = await self.create_review_embed(
+                    member, app_data.get("responses", {}), "approved"
+                )
+                try:
+                    await channel.send(
+                        f"✅ **Application Approved!**\n\n"
+                        f"Congratulations {member.mention}! Your application has been approved. "
+                        f"You now have full access to the server.",
+                        embed=embed,
+                    )
+                except discord.HTTPException:
+                    pass
+
+        log.info(f"Application approved for {member.display_name} by {interaction.user.display_name}")
+
+    async def deny_application(
+        self, interaction: discord.Interaction, member: discord.Member, reason: str
+    ):
+        """Deny application from modal interaction."""
+        applications = await self.config.guild(interaction.guild).applications()
+        if str(member.id) not in applications:
+            await interaction.response.send_message(
+                f"❌ {member.mention} does not have an active application.", ephemeral=True
+            )
+            return
+
+        app_data = applications[str(member.id)]
+        if app_data.get("status") != "pending":
+            await interaction.response.send_message(
+                f"❌ This application is already {app_data.get('status')}.", ephemeral=True
+            )
+            return
+
+        # Update status
+        app_data["status"] = "denied"
+        app_data["denied_by"] = interaction.user.id
+        app_data["denied_at"] = datetime.utcnow().isoformat()
+        app_data["denial_reason"] = reason
+        applications[str(member.id)] = app_data
+        await self.config.guild(interaction.guild).applications.set(applications)
+
+        # Respond to modal
+        await interaction.response.send_message(
+            f"✅ Application denied. {member.mention} has been notified.", ephemeral=True
+        )
+
+        # Try to find and update the original message with buttons
+        channel_id = app_data.get("channel_id")
+        if channel_id:
+            channel = interaction.guild.get_channel(channel_id)
+            if channel:
+                # Try to find the submission message and update it
+                try:
+                    async for message in channel.history(limit=50):
+                        if message.author == interaction.guild.me and message.embeds:
+                            embed = message.embeds[0]
+                            if embed.title and member.display_name in embed.title and "pending" in embed.title.lower():
+                                # Found the submission message, update it
+                                new_embed = await self.create_review_embed(
+                                    member, app_data.get("responses", {}), "denied"
+                                )
+                                new_embed.add_field(name="Reason", value=reason, inline=False)
+                                await message.edit(
+                                    content=(
+                                        f"❌ **Application Denied by {interaction.user.mention}**\n\n"
+                                        f"Sorry {member.mention}, your application has been denied. "
+                                        f"You can appeal this decision by messaging an admin in this channel."
+                                    ),
+                                    embed=new_embed,
+                                    view=None,
+                                )
+                                break
+                except discord.HTTPException:
+                    pass
+
+                # Also send a notification message
+                embed = await self.create_review_embed(
+                    member, app_data.get("responses", {}), "denied"
+                )
+                embed.add_field(name="Reason", value=reason, inline=False)
+                try:
+                    await channel.send(
+                        f"❌ **Application Denied**\n\n"
+                        f"Sorry {member.mention}, your application has been denied. "
+                        f"You can appeal this decision by messaging an admin in this channel.",
+                        embed=embed,
+                    )
+                except discord.HTTPException:
+                    pass
+
+        log.info(f"Application denied for {member.display_name} by {interaction.user.display_name}")
 
     @_applications.command(name="view")
     async def _view(self, ctx: commands.Context, member: discord.Member):
