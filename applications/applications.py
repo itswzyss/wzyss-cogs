@@ -24,10 +24,18 @@ class ApplicationModal(Modal):
         # Create text inputs for each field
         for field in form_fields:
             field_type = field.get("type", "text")
-            label = field.get("label", field.get("name", "Field"))
+            label_full = field.get("label", field.get("name", "Field"))
+            # Discord hard limit: TextInput label max 45 chars.
+            # Preserve longer prompts by moving the full prompt into the placeholder when possible.
+            label = label_full[:45]
             placeholder = field.get("placeholder", "")
             required = field.get("required", True)
             default = field.get("default", "")
+
+            # If label was truncated and no explicit placeholder was provided, use the full label as placeholder.
+            # (Placeholder max is 100 chars; still better than losing the prompt entirely.)
+            if label_full and len(label_full) > 45 and not placeholder:
+                placeholder = label_full
 
             # For select fields, build placeholder from options
             if field_type == "select":
@@ -48,7 +56,7 @@ class ApplicationModal(Modal):
             # Discord text input limits
             if field_type == "paragraph":
                 text_input = TextInput(
-                    label=label[:45],  # Max 45 chars
+                    label=label,  # Max 45 chars
                     placeholder=placeholder[:100] if placeholder else None,
                     default=default[:4000] if default else None,
                     required=required,
@@ -57,7 +65,7 @@ class ApplicationModal(Modal):
                 )
             elif field_type == "number":
                 text_input = TextInput(
-                    label=label[:45],
+                    label=label,
                     placeholder=placeholder[:100] if placeholder else None,
                     default=default[:4000] if default else None,
                     required=required,
@@ -66,7 +74,7 @@ class ApplicationModal(Modal):
                 )
             else:  # text (short) or select
                 text_input = TextInput(
-                    label=label[:45],
+                    label=label,
                     placeholder=placeholder[:100] if placeholder else None,
                     default=default[:4000] if default else None,
                     required=required,
