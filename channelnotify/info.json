@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing Channel Notify! Use `[p]help channelnotify` to see available commands.",
+    "name": "ChannelNotify",
+    "short": "Automatically ping roles when messages are sent in configured channels.",
+    "description": "Automatically pings configured roles when any message is sent in specified channels. Useful for creators posting to social media - when they link an X post, etc., in a channel, roles will be pinged. Supports multiple channels and roles per channel with configurable cooldowns.",
+    "tags": ["notifications", "utility", "roles", "channels"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
