@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing Counting! Use `[p]help countingset` to see available commands.",
+    "name": "Counting",
+    "short": "Count upwards in channels with optional math expressions.",
+    "description": "Allows members to count upwards in configured channels. Members can use numbers or math expressions (e.g., '1+1' for 2). Starts at 1 and can have an optional goal. Prevents the same user from counting twice in a row.",
+    "tags": ["counting", "utility", "fun", "math"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
