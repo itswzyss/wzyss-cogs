@@ -448,11 +448,12 @@ class RoleSelectMenu(Select):
 class RoleBuilderView(View):
     """Main view for building role assignment messages."""
 
-    def __init__(self, cog: "SelfRoles", guild_id: int):
+    def __init__(self, cog: "SelfRoles", guild_id: int, edit_message_id: Optional[int] = None):
         super().__init__(timeout=None)
         self.cog = cog
         self.guild_id = guild_id
         self.message: Optional[discord.Message] = None
+        self.edit_message_id = edit_message_id  # If set, we're editing an existing message
 
     async def refresh(self, interaction: Optional[discord.Interaction] = None):
         """Refresh the builder display."""
@@ -481,9 +482,16 @@ class RoleBuilderView(View):
         assignments = state.get("assignments", [])
         groups = state.get("groups", {})
 
+        title_text = "✏️ Self-Roles Builder (Edit Mode)" if self.edit_message_id else "🔧 Self-Roles Builder"
+        description_text = (
+            f"Editing message {self.edit_message_id}. Use the buttons below to modify the configuration."
+            if self.edit_message_id
+            else "Use the buttons below to configure your role assignment message."
+        )
+        
         embed = discord.Embed(
-            title="🔧 Self-Roles Builder",
-            description="Use the buttons below to configure your role assignment message.",
+            title=title_text,
+            description=description_text,
             color=await self.cog.bot.get_embed_color(guild),
         )
 
@@ -680,9 +688,9 @@ class RoleBuilderView(View):
             embed=embed, view=view if view.children else None, ephemeral=True
         )
 
-    @discord.ui.button(label="Send Message", style=discord.ButtonStyle.success, emoji="📤")
+    @discord.ui.button(label="Update Message", style=discord.ButtonStyle.success, emoji="📤")
     async def send_message(self, interaction: discord.Interaction, button: Button):
-        """Open channel select to send the message."""
+        """Open channel select to send the message, or update if editing."""
         user_id = interaction.user.id
         if user_id not in self.cog._builder_states:
             await interaction.response.send_message(
@@ -707,6 +715,12 @@ class RoleBuilderView(View):
             )
             return
 
+        # If editing, update the existing message directly
+        if self.edit_message_id:
+            await self._update_existing_message(interaction)
+            return
+
+        # Otherwise, show channel select for new message
         # Create channel select menu
         channels = [
             ch
@@ -742,6 +756,114 @@ class RoleBuilderView(View):
             ephemeral=True,
         )
 
+    async def _update_existing_message(self, interaction: discord.Interaction):
+        """Update an existing role assignment message."""
+        user_id = interaction.user.id
+        state = self.cog._builder_states[user_id]
+        embed_data = state.get("embed_data", {})
+        assignments = state.get("assignments", [])
+        groups = state.get("groups", {})
+
+        # Get the existing message
+        messages = await self.cog.config.guild(interaction.guild).messages()
+        message_config = messages.get(str(self.edit_message_id))
+        if not message_config:
+            await interaction.response.send_message(
+                "❌ Original message configuration not found.", ephemeral=True
+            )
+            return
+
+        channel_id = message_config.get("channel_id")
+        channel = interaction.guild.get_channel(channel_id)
+        if not channel:
+            await interaction.response.send_message(
+                "❌ Original message channel not found.", ephemeral=True
+            )
+            return
+
+        try:
+            old_message = await channel.fetch_message(self.edit_message_id)
+        except (discord.NotFound, discord.Forbidden):
+            await interaction.response.send_message(
+                "❌ Original message not found. It may have been deleted.",
+                ephemeral=True,
+            )
+            return
+
+        # Create new embed
+        embed = await self.cog._create_embed(embed_data, interaction.guild)
+
+        # Create view with buttons
+        view = RoleAssignmentView(self.cog, self.edit_message_id)
+        for assignment in assignments:
+            role_id = assignment.get("role_id")
+            role = interaction.guild.get_role(role_id)
+            if not role:
+                continue
+
+            method = assignment.get("method", "button")
+            if method in ["button", "both"]:
+                button_label = assignment.get("button_label", role.name)
+                button_emoji = assignment.get("button_emoji")
+                button = RoleButton(
+                    self.cog,
+                    role_id,
+                    button_label,
+                    emoji=self.cog._parse_emoji(button_emoji) if button_emoji else None,
+                )
+                view.add_item(button)
+
+        # Update the message
+        try:
+            await old_message.edit(embed=embed, view=view if view.children else None)
+        except discord.HTTPException as e:
+            await interaction.response.send_message(
+                f"❌ Error updating message: {e}", ephemeral=True
+            )
+            return
+
+        # Clear old reactions and add new ones
+        try:
+            await old_message.clear_reactions()
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        # Add reactions if needed
+        for assignment in assignments:
+            method = assignment.get("method", "button")
+            if method in ["reaction", "both"]:
+                reaction_emoji = assignment.get("reaction_emoji")
+                if reaction_emoji:
+                    try:
+                        await old_message.add_reaction(reaction_emoji)
+                    except (discord.HTTPException, discord.InvalidArgument):
+                        log.warning(f"Could not add reaction {reaction_emoji}")
+
+        # Update configuration
+        message_config = {
+            "channel_id": channel.id,
+            "embed_data": embed_data,
+            "assignments": assignments,
+            "groups": groups,
+        }
+
+        messages[str(self.edit_message_id)] = message_config
+        await self.cog.config.guild(interaction.guild).messages.set(messages)
+
+        # Clear builder state
+        del self.cog._builder_states[user_id]
+
+        await interaction.response.send_message(
+            f"✅ Role assignment message updated!", ephemeral=True
+        )
+
+        # Delete builder message
+        if self.message:
+            try:
+                await self.message.delete()
+            except (discord.NotFound, discord.Forbidden):
+                pass
+
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="❌")
     async def cancel(self, interaction: discord.Interaction, button: Button):
         """Cancel the builder and clear state."""
@@ -769,7 +891,10 @@ class ChannelSelectMenu(Select):
         options: List[discord.SelectOption],
         builder_view: "RoleBuilderView",
     ):
-        super().__init__(placeholder="Select a channel...", options=options)
+        placeholder = "Select a channel..."
+        if builder_view.edit_message_id:
+            placeholder = "Select a channel (or message will be updated in place)..."
+        super().__init__(placeholder=placeholder, options=options)
         self.cog = cog
         self.builder_view = builder_view
 
@@ -1069,7 +1194,7 @@ class SelfRoles(commands.Cog):
             }
 
         # Create builder view
-        view = RoleBuilderView(self, ctx.guild.id)
+        view = RoleBuilderView(self, ctx.guild.id, edit_message_id=None)
         
         # Create initial embed
         state = self._builder_states[ctx.author.id]
@@ -1148,6 +1273,117 @@ class SelfRoles(commands.Cog):
 
         view.message = await ctx.send(embed=embed, view=view)
 
+    @_selfroles.command(name="edit")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def _edit(self, ctx: commands.Context, message_id: int):
+        """Edit an existing role assignment message using the builder UI."""
+        messages = await self.config.guild(ctx.guild).messages()
+        message_id_str = str(message_id)
+        
+        if message_id_str not in messages:
+            await ctx.send("❌ Message not found in configuration.")
+            return
+
+        message_config = messages[message_id_str]
+        channel_id = message_config.get("channel_id")
+        channel = ctx.guild.get_channel(channel_id) if channel_id else None
+
+        if not channel:
+            await ctx.send("❌ Original message channel not found.")
+            return
+
+        # Verify message exists
+        try:
+            old_message = await channel.fetch_message(message_id)
+        except (discord.NotFound, discord.Forbidden):
+            await ctx.send("❌ Original message not found. It may have been deleted.")
+            return
+
+        # Load existing configuration into builder state
+        embed_data = message_config.get("embed_data", {})
+        assignments = message_config.get("assignments", [])
+        groups = message_config.get("groups", {})
+
+        self._builder_states[ctx.author.id] = {
+            "embed_data": embed_data.copy(),
+            "assignments": assignments.copy(),
+            "groups": groups.copy(),
+        }
+
+        # Create builder view in edit mode
+        view = RoleBuilderView(self, ctx.guild.id, edit_message_id=message_id)
+
+        # Create initial embed showing current configuration
+        embed = discord.Embed(
+            title="✏️ Self-Roles Builder (Edit Mode)",
+            description=f"Editing message {message_id}. Use the buttons below to modify the configuration.",
+            color=await ctx.embed_color(),
+        )
+
+        # Embed configuration
+        title = embed_data.get("title", "Not set")
+        description = embed_data.get("description") or "Not set"
+        color = embed_data.get("color_hex") or "Default"
+        footer = embed_data.get("footer") or "Not set"
+        thumbnail = embed_data.get("thumbnail_url") or "Not set"
+
+        embed.add_field(
+            name="📝 Embed Configuration",
+            value=(
+                f"**Title:** {title}\n"
+                f"**Description:** {description}\n"
+                f"**Color:** {color}\n"
+                f"**Footer:** {footer}\n"
+                f"**Thumbnail:** {thumbnail}"
+            ),
+            inline=False,
+        )
+
+        # Roles list
+        if not assignments:
+            embed.add_field(
+                name="No Roles",
+                value="Add roles using the **Add Role** button below.",
+                inline=False,
+            )
+        else:
+            role_list = []
+            for i, assignment in enumerate(assignments, 1):
+                role_id = assignment.get("role_id")
+                role = ctx.guild.get_role(role_id)
+                if role:
+                    method = assignment.get("method", "button")
+                    group_id = assignment.get("group_id")
+                    group_text = f" (Group: {group_id})" if group_id else ""
+                    role_list.append(f"{i}. {role.mention} - {method}{group_text}")
+
+            if role_list:
+                embed.add_field(
+                    name=f"Roles ({len(assignments)})",
+                    value="\n".join(role_list) if len("\n".join(role_list)) < 1024 else "Too many roles to list",
+                    inline=False,
+                )
+
+        # Groups
+        if groups:
+            group_list = []
+            for group_id, role_ids in groups.items():
+                role_names = [
+                    ctx.guild.get_role(rid).name
+                    for rid in role_ids
+                    if ctx.guild.get_role(rid)
+                ]
+                if role_names:
+                    group_list.append(f"**{group_id}:** {', '.join(role_names)}")
+
+            if group_list:
+                embed.add_field(
+                    name="Exclusive Groups",
+                    value="\n".join(group_list),
+                    inline=False,
+                )
+
+        view.message = await ctx.send(embed=embed, view=view)
 
     @_selfroles.command(name="list")
     @commands.admin_or_permissions(manage_guild=True)
