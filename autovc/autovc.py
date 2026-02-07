@@ -32,6 +32,13 @@ class AutoVC(commands.Cog):
         # In-memory rate limiting: {user_id: [timestamp1, timestamp2, ...]}
         self.rate_limit: Dict[int, List[datetime]] = {}
 
+        # Track members currently being processed to prevent duplicate VC creation
+        # {user_id: timestamp} - tracks when we started processing a move
+        self.processing_members: Dict[int, datetime] = {}
+        
+        # Lock to prevent concurrent processing of the same member
+        self.processing_lock = asyncio.Lock()
+
         # Background tasks
         self.cleanup_task: Optional[asyncio.Task] = None
 
@@ -514,34 +521,69 @@ class AutoVC(commands.Cog):
             source_vc_id = str(after.channel.id)
 
             if source_vc_id in source_vcs:
-                # Check rate limit
-                if self.check_rate_limit(member.id):
-                    log.warning(
-                        f"Rate limit exceeded for {member.display_name} in {guild.name}"
-                    )
-                    try:
-                        await member.send(
-                            "You're creating VCs too quickly! Please wait a moment before creating another one."
+                # Use lock to prevent concurrent processing of the same member
+                # This ensures only one VC creation process runs at a time per member
+                async with self.processing_lock:
+                    # Check if we're currently processing this member (prevent race conditions)
+                    # This is the primary protection against duplicate VC creation
+                    now = datetime.utcnow()
+                    if member.id in self.processing_members:
+                        processing_start = self.processing_members[member.id]
+                        time_since_start = (now - processing_start).total_seconds()
+                        if time_since_start < 5.0:  # Still processing within last 5 seconds
+                            log.debug(
+                                f"Member {member.display_name} is already being processed (started {time_since_start:.2f}s ago), skipping"
+                            )
+                            return
+                        else:
+                            # Clean up old entry
+                            del self.processing_members[member.id]
+
+                    # Mark member as being processed
+                    self.processing_members[member.id] = now
+
+                    # Check rate limit
+                    if self.check_rate_limit(member.id):
+                        del self.processing_members[member.id]
+                        log.warning(
+                            f"Rate limit exceeded for {member.display_name} in {guild.name}"
                         )
-                    except discord.HTTPException:
-                        pass
-                    return
+                        try:
+                            await member.send(
+                                "You're creating VCs too quickly! Please wait a moment before creating another one."
+                            )
+                        except discord.HTTPException:
+                            pass
+                        return
 
-                # Create new VC
-                source_config = source_vcs[source_vc_id]
-                new_vc = await self._create_vc(
-                    guild, after.channel, source_config, member
-                )
+                    # Create new VC
+                    source_config = source_vcs[source_vc_id]
+                    new_vc = await self._create_vc(
+                        guild, after.channel, source_config, member
+                    )
 
-                if new_vc:
-                    # Record successful creation for rate limiting
-                    self.record_vc_creation(member.id)
-                    
-                    # Move user to new VC
-                    try:
-                        await member.move_to(new_vc, reason="AutoVC: Created new VC")
-                    except discord.HTTPException as e:
-                        log.error(f"Failed to move user to new VC: {e}")
+                    if new_vc:
+                        # Record successful creation for rate limiting
+                        self.record_vc_creation(member.id)
+                        
+                        # Move user to new VC
+                        try:
+                            await member.move_to(new_vc, reason="AutoVC: Created new VC")
+                        except discord.HTTPException as e:
+                            log.error(f"Failed to move user to new VC: {e}")
+                        finally:
+                            # Clean up processing flag after a short delay to allow move to complete
+                            # Use a task to remove the flag after move completes
+                            async def cleanup_processing():
+                                await asyncio.sleep(2.0)  # Wait 2 seconds for move to complete
+                                async with self.processing_lock:
+                                    if member.id in self.processing_members:
+                                        del self.processing_members[member.id]
+                            
+                            self.bot.loop.create_task(cleanup_processing())
+                    else:
+                        # VC creation failed, remove processing flag
+                        del self.processing_members[member.id]
 
         # Handle leaving a created VC
         if before.channel:
