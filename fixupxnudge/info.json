@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing FixupX Nudge! Use `[p]help fixupxnudge` to see available commands.",
+    "name": "FixupXNudge",
+    "short": "Gently nudge users to use fixupx.com for X/Twitter post links.",
+    "description": "Monitors messages for X/Twitter post links and suggests users use fixupx.com for better embed support. Only nudges for post links (containing /status/), not profile links.",
+    "tags": ["links", "utility", "twitter", "x"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
