@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing AutoVC! Use `[p]help autovc` to see available commands.",
+    "name": "AutoVC",
+    "short": "Automatically create voice channels when members join source VCs.",
+    "description": "Automatically creates voice channels when members join configured source voice channels. Supports three types: Public (anyone can join), Personal (owner-controlled, visible), and Private (owner-controlled, hidden). Features automatic cleanup, owner claiming, and temporary roles for channel management.",
+    "tags": ["voice", "channels", "utility", "automation"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
