@@ -53,15 +53,6 @@ Count upwards in channels with optional math expressions. Allows members to coun
 
 ---
 
-### GuildAppNotifier
-**Install:** `[p]cog install wzyss-cogs guildappnotifier`
-
-Notify when new guild applications are received. Automatically notifies configured channels and users when new guild applications are received, members join after approval, or pass verification gates.
-
-**Tags:** applications, notifications, utility, moderation
-
----
-
 ### LinkReplacer
 **Install:** `[p]cog install wzyss-cogs linkreplacer`
 
