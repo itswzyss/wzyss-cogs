@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing Mass Role! Use `[p]help massrole` to see available commands.",
+    "name": "MassRole",
+    "short": "Assign roles to all members of a role or everyone on the server.",
+    "description": "Assign a role to all members of a specific role, or assign a role to everyone on the server. Handles Discord rate limits gracefully with automatic retries.",
+    "tags": ["roles", "utility", "moderation"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}

@@ -62,6 +62,20 @@ Replace links with configured alternatives. Automatically replaces configured li
 
 ---
 
+### MassRole
+**Install:** `[p]cog install wzyss-cogs massrole`
+
+Assign roles to all members of a role or everyone on the server. Useful for migrating to access role systems or bulk role assignments. Features include:
+- Assign a role to all members who have a specific role
+- Assign a role to everyone on the server
+- Automatic rate limit handling with graceful retries
+- Real-time progress tracking
+- Detailed success/failure reporting
+
+**Tags:** roles, utility, moderation
+
+---
+
 ### RockstarNewswire
 **Install:** `[p]cog install wzyss-cogs rockstarnewswire`
 
