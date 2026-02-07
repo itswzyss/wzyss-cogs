@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing SelfRoles! Use `[p]help selfroles` to see available commands.",
+    "name": "SelfRoles",
+    "short": "Interactive builder for self-assignable roles with buttons, reactions, and commands.",
+    "description": "Create embed messages with configurable buttons and reactions for users to self-assign roles. Supports exclusive role groups where only one role in a group can be active at a time.",
+    "tags": ["roles", "utility", "self-assign", "buttons", "reactions"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
