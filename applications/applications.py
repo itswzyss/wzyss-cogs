@@ -877,6 +877,7 @@ class Applications(commands.Cog):
             "log_channel": None,  # Channel ID for application logging
             "notification_role": None,  # Role ID to ping on new submissions
             "cleanup_delay": 24,  # Hours before deleting channels after approval/denial
+            "kick_timeout_seconds": 86400,  # Time before kicking users who didn't submit (default 24 hours)
             "rejoin_invite": None,  # Invite link URL to send when kicking users who didn't submit
             "form_fields": [
                 {
@@ -927,14 +928,33 @@ class Applications(commands.Cog):
         member_role_ids = [role.id for role in member.roles]
         return any(role_id in member_role_ids for role_id in bypass_roles)
 
+    def _format_timeout(self, seconds: int) -> str:
+        """Format a duration in seconds as a human-readable string (e.g. '24 hours', '30 minutes')."""
+        if seconds < 60:
+            return f"{seconds} second{'s' if seconds != 1 else ''}"
+        if seconds < 3600:
+            return f"{seconds // 60} minute{'s' if seconds // 60 != 1 else ''}"
+        if seconds < 86400:
+            return f"{seconds // 3600} hour{'s' if seconds // 3600 != 1 else ''}"
+        days = seconds // 86400
+        return f"{days} day{'s' if days != 1 else ''}"
+
     def _start_application_timer(self, guild_id: int, user_id: int, channel_id: int):
-        """Start a 24-hour timer for a user to submit their application."""
+        """Start a timer for a user to submit their application (duration from config)."""
         async def timer_task():
             try:
-                # Wait 24 hours
-                await asyncio.sleep(86400)  # 24 hours in seconds
+                # Get guild first so we can read config
+                guild = self.bot.get_guild(guild_id)
+                if not guild:
+                    log.warning(f"Guild {guild_id} not found when starting timer")
+                    return
+                timeout_seconds = await self.config.guild(guild).kick_timeout_seconds()
+                if timeout_seconds is None:
+                    timeout_seconds = 86400
+                # Wait for the configured duration
+                await asyncio.sleep(timeout_seconds)
                 
-                # Get guild and check if still exists
+                # Re-fetch guild (may have been cached)
                 guild = self.bot.get_guild(guild_id)
                 if not guild:
                     log.warning(f"Guild {guild_id} not found when timer expired")
@@ -966,9 +986,10 @@ class Applications(commands.Cog):
                 # Try to DM user with invite link if configured
                 if rejoin_invite:
                     try:
+                        duration_text = self._format_timeout(timeout_seconds)
                         dm_message = (
                             f"You were removed from {guild.name} because you did not submit "
-                            f"an application within 24 hours of joining.\n\n"
+                            f"an application within {duration_text} of joining.\n\n"
                             f"If you'd like to try again, you can rejoin using this invite link:\n"
                             f"{rejoin_invite}"
                         )
@@ -1662,11 +1683,94 @@ class Applications(commands.Cog):
             f"Application channels will be deleted {hours} hour(s) after approval or denial."
         )
 
+    @_applications.command(name="kicktimeout")
+    async def _set_kick_timeout(
+        self, ctx: commands.Context, amount: Optional[float] = None, unit: Optional[str] = None
+    ):
+        """Set how long new members have to submit an application before being kicked.
+        
+        Use: [p]applications kicktimeout <amount> <unit>
+        Units: seconds/s, minutes/m, hours/h, days/d
+        If amount and unit are omitted, shows the current kick timeout.
+        Setting a duration below 1 hour will prompt for confirmation.
+        """
+        if amount is None or unit is None:
+            current = await self.config.guild(ctx.guild).kick_timeout_seconds()
+            if current is None:
+                current = 86400
+            await ctx.send(f"Current kick timeout: {self._format_timeout(int(current))}.")
+            return
+
+        unit_map = {
+            "s": 1, "sec": 1, "second": 1, "seconds": 1,
+            "m": 60, "min": 60, "minute": 60, "minutes": 60,
+            "h": 3600, "hour": 3600, "hours": 3600,
+            "d": 86400, "day": 86400, "days": 86400,
+        }
+        u = unit.strip().lower()
+        if u not in unit_map:
+            await ctx.send(
+                "❌ Invalid unit. Use: seconds (s), minutes (m), hours (h), or days (d)."
+            )
+            return
+        if amount <= 0:
+            await ctx.send("❌ Amount must be a positive number.")
+            return
+
+        total_seconds = int(amount * unit_map[u])
+        if total_seconds > 7776000:  # 90 days
+            await ctx.send("❌ Kick timeout cannot exceed 90 days.")
+            return
+
+        duration_text = self._format_timeout(total_seconds)
+
+        if total_seconds < 3600:
+            embed = discord.Embed(
+                title="⚠️ Confirm short kick timeout",
+                description=(
+                    f"{duration_text} is less than 1 hour. "
+                    f"New members will be kicked quickly if they don't submit. Are you sure?"
+                ),
+                color=discord.Color.orange(),
+            )
+            view = View(timeout=60)
+            confirm_btn = Button(label="Confirm", style=discord.ButtonStyle.danger, emoji="✅")
+            cancel_btn = Button(label="Cancel", style=discord.ButtonStyle.secondary)
+
+            async def confirm_cb(interaction: discord.Interaction):
+                if interaction.user.id != ctx.author.id:
+                    await interaction.response.send_message(
+                        "Only the person who ran the command can confirm.", ephemeral=True
+                    )
+                    return
+                await self.config.guild(ctx.guild).kick_timeout_seconds.set(total_seconds)
+                await interaction.response.send_message(
+                    f"Kick timeout set to {duration_text}.", ephemeral=True
+                )
+
+            async def cancel_cb(interaction: discord.Interaction):
+                if interaction.user.id != ctx.author.id:
+                    await interaction.response.send_message(
+                        "Only the person who ran the command can cancel.", ephemeral=True
+                    )
+                    return
+                await interaction.response.send_message("Cancelled.", ephemeral=True)
+
+            confirm_btn.callback = confirm_cb
+            cancel_btn.callback = cancel_cb
+            view.add_item(confirm_btn)
+            view.add_item(cancel_btn)
+            await ctx.send(embed=embed, view=view)
+            return
+
+        await self.config.guild(ctx.guild).kick_timeout_seconds.set(total_seconds)
+        await ctx.send(f"Kick timeout set to {duration_text}.")
+
     @_applications.command(name="rejoininvite")
     async def _set_rejoin_invite(
         self, ctx: commands.Context, invite_url: Optional[str] = None
     ):
-        """Set the invite link to send when kicking users who didn't submit within 24 hours.
+        """Set the invite link to send when kicking users who didn't submit within the configured time.
         
         If no invite URL is provided, clears the configured invite link.
         """
@@ -2065,6 +2169,8 @@ class Applications(commands.Cog):
         )
 
         cleanup_delay = settings.get("cleanup_delay", 24)
+        kick_timeout_seconds = settings.get("kick_timeout_seconds", 86400)
+        rejoin_invite = settings.get("rejoin_invite")
 
         form_fields = settings.get("form_fields", [])
         applications = settings.get("applications", {})
@@ -2120,6 +2226,18 @@ class Applications(commands.Cog):
         embed.add_field(
             name="Cleanup Delay",
             value=f"{cleanup_delay} hour(s)",
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Kick Timeout",
+            value=self._format_timeout(int(kick_timeout_seconds or 86400)),
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Rejoin Invite",
+            value="Set" if rejoin_invite else "Not set",
             inline=True,
         )
 
