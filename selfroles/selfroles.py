@@ -15,6 +15,8 @@ log = logging.getLogger("red.wzyss-cogs.selfroles")
 class RoleButton(Button):
     """Button for role assignment."""
 
+    CUSTOM_ID_PREFIX = "selfrole:"
+
     def __init__(
         self,
         cog: "SelfRoles",
@@ -23,7 +25,9 @@ class RoleButton(Button):
         emoji: Optional[str] = None,
         style: discord.ButtonStyle = discord.ButtonStyle.primary,
     ):
-        super().__init__(label=label, emoji=emoji, style=style)
+        # Deterministic custom_id so interactions work after bot restart without re-registering views
+        custom_id = f"{self.CUSTOM_ID_PREFIX}{role_id}"
+        super().__init__(label=label, emoji=emoji, style=style, custom_id=custom_id)
         self.cog = cog
         self.role_id = role_id
 
@@ -1594,6 +1598,22 @@ class SelfRoles(commands.Cog):
         except discord.HTTPException as e:
             log.error(f"Error managing role: {e}")
             await ctx.send("❌ An error occurred while managing the role.")
+
+    @commands.Cog.listener()
+    async def on_interaction(self, interaction: discord.Interaction):
+        """Handle role assignment button interactions when no view is registered (e.g. after bot restart)."""
+        if interaction.type != discord.InteractionType.message_component:
+            return
+        custom_id = (interaction.data or {}).get("custom_id") or ""
+        if not custom_id.startswith(RoleButton.CUSTOM_ID_PREFIX):
+            return
+        if interaction.response.is_done():
+            return
+        try:
+            role_id = int(custom_id[len(RoleButton.CUSTOM_ID_PREFIX) :].strip())
+        except ValueError:
+            return
+        await self.handle_role_button_click(interaction, role_id)
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
