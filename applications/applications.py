@@ -877,6 +877,7 @@ class Applications(commands.Cog):
             "log_channel": None,  # Channel ID for application logging
             "notification_role": None,  # Role ID to ping on new submissions
             "cleanup_delay": 24,  # Hours before deleting channels after approval/denial
+            "rejoin_invite": None,  # Invite link URL to send when kicking users who didn't submit
             "form_fields": [
                 {
                     "name": "name",
@@ -898,6 +899,7 @@ class Applications(commands.Cog):
 
         self.config.register_guild(**default_guild)
         self.cleanup_task: Optional[asyncio.Task] = None
+        self.timer_tasks: Dict[int, Dict[int, asyncio.Task]] = {}  # {guild_id: {user_id: task}}
         log.info("Applications cog initialized")
 
     async def cog_load(self):
@@ -908,6 +910,13 @@ class Applications(commands.Cog):
         """Called when the cog is unloaded."""
         if self.cleanup_task:
             self.cleanup_task.cancel()
+        
+        # Cancel all timer tasks
+        for guild_tasks in self.timer_tasks.values():
+            for task in guild_tasks.values():
+                if not task.done():
+                    task.cancel()
+        self.timer_tasks.clear()
 
     async def has_bypass_role(self, member: discord.Member) -> bool:
         """Check if member has any bypass roles."""
@@ -917,6 +926,89 @@ class Applications(commands.Cog):
 
         member_role_ids = [role.id for role in member.roles]
         return any(role_id in member_role_ids for role_id in bypass_roles)
+
+    def _start_application_timer(self, guild_id: int, user_id: int, channel_id: int):
+        """Start a 24-hour timer for a user to submit their application."""
+        async def timer_task():
+            try:
+                # Wait 24 hours
+                await asyncio.sleep(86400)  # 24 hours in seconds
+                
+                # Get guild and check if still exists
+                guild = self.bot.get_guild(guild_id)
+                if not guild:
+                    log.warning(f"Guild {guild_id} not found when timer expired")
+                    return
+                
+                # Get user
+                user = guild.get_member(user_id)
+                if not user:
+                    log.info(f"User {user_id} not found in guild {guild_id} when timer expired (may have left)")
+                    return
+                
+                # Check application status
+                applications = await self.config.guild(guild).applications()
+                app_data = applications.get(str(user_id))
+                
+                if not app_data:
+                    log.warning(f"Application data not found for user {user_id} in guild {guild_id}")
+                    return
+                
+                # Check if application was submitted
+                submitted_at = app_data.get("submitted_at")
+                if submitted_at is not None:
+                    log.info(f"User {user_id} submitted application before timer expired, skipping kick")
+                    return
+                
+                # Application not submitted - proceed with kick
+                rejoin_invite = await self.config.guild(guild).rejoin_invite()
+                
+                # Try to DM user with invite link if configured
+                if rejoin_invite:
+                    try:
+                        dm_message = (
+                            f"You were removed from {guild.name} because you did not submit "
+                            f"an application within 24 hours of joining.\n\n"
+                            f"If you'd like to try again, you can rejoin using this invite link:\n"
+                            f"{rejoin_invite}"
+                        )
+                        await user.send(dm_message)
+                    except discord.Forbidden:
+                        log.warning(f"Could not DM user {user_id} - DMs may be disabled")
+                    except discord.HTTPException as e:
+                        log.error(f"Error sending DM to user {user_id}: {e}")
+                else:
+                    log.warning(
+                        f"No rejoin invite configured for guild {guild_id}. "
+                        f"User {user_id} will be kicked without DM."
+                    )
+                
+                # Kick the user
+                try:
+                    await user.kick(reason="Failed to submit application within timeframe.")
+                    log.info(f"Kicked user {user_id} from guild {guild_id} for not submitting application")
+                except discord.Forbidden:
+                    log.error(f"Permission denied kicking user {user_id} from guild {guild_id}")
+                except discord.HTTPException as e:
+                    log.error(f"Error kicking user {user_id} from guild {guild_id}: {e}")
+                
+            except asyncio.CancelledError:
+                log.debug(f"Timer task cancelled for user {user_id} in guild {guild_id}")
+            except Exception as e:
+                log.error(f"Error in timer task for user {user_id} in guild {guild_id}: {e}", exc_info=True)
+            finally:
+                # Clean up task from tracking dict
+                if guild_id in self.timer_tasks:
+                    if user_id in self.timer_tasks[guild_id]:
+                        del self.timer_tasks[guild_id][user_id]
+                    if not self.timer_tasks[guild_id]:
+                        del self.timer_tasks[guild_id]
+        
+        # Create and track the task
+        task = self.bot.loop.create_task(timer_task())
+        if guild_id not in self.timer_tasks:
+            self.timer_tasks[guild_id] = {}
+        self.timer_tasks[guild_id][user_id] = task
 
     async def can_manage_applications(self, user: discord.Member, guild: discord.Guild) -> bool:
         """Check if user can manage applications (admin or manager role)."""
@@ -1029,7 +1121,12 @@ class Applications(commands.Cog):
         view.add_item(ApplicationButton(self))
 
         try:
-            await channel.send(embed=embed, view=view)
+            await channel.send(
+                content=f"{member.mention}\n\n",
+                embed=embed,
+                view=view,
+                allowed_mentions=discord.AllowedMentions(users=[member]),
+            )
         except discord.HTTPException as e:
             log.error(f"Error sending welcome message: {e}")
 
@@ -1051,6 +1148,17 @@ class Applications(commands.Cog):
         )
 
         await self.config.guild(member.guild).applications.set(applications)
+
+        # Cancel timer task if it exists
+        guild_id = member.guild.id
+        user_id = member.id
+        if guild_id in self.timer_tasks and user_id in self.timer_tasks[guild_id]:
+            task = self.timer_tasks[guild_id][user_id]
+            if not task.done():
+                task.cancel()
+            del self.timer_tasks[guild_id][user_id]
+            if not self.timer_tasks[guild_id]:
+                del self.timer_tasks[guild_id]
 
         # Create review embed
         embed = await self.create_review_embed(member, responses, "pending")
@@ -1337,11 +1445,15 @@ class Applications(commands.Cog):
             "status": "pending",
             "submitted_at": None,
             "responses": {},
+            "joined_at": datetime.utcnow().isoformat(),
         }
         await self.config.guild(member.guild).applications.set(applications)
 
         # Send welcome message
         await self.send_welcome_message(channel, member)
+
+        # Start 24-hour timer
+        self._start_application_timer(member.guild.id, member.id, channel.id)
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
@@ -1549,6 +1661,38 @@ class Applications(commands.Cog):
             f"Cleanup delay set to {hours} hour(s). "
             f"Application channels will be deleted {hours} hour(s) after approval or denial."
         )
+
+    @_applications.command(name="rejoininvite")
+    async def _set_rejoin_invite(
+        self, ctx: commands.Context, invite_url: Optional[str] = None
+    ):
+        """Set the invite link to send when kicking users who didn't submit within 24 hours.
+        
+        If no invite URL is provided, clears the configured invite link.
+        """
+        import re
+        
+        if invite_url is None:
+            await self.config.guild(ctx.guild).rejoin_invite.set(None)
+            await ctx.send("Rejoin invite link cleared.")
+            return
+        
+        # Validate Discord invite format
+        # Discord invites can be discord.gg/CODE, discord.com/invite/CODE, or discord.li/CODE
+        invite_pattern = r'^(https?://)?(discord\.(gg|com/invite|li)/[a-zA-Z0-9]+)$'
+        if not re.match(invite_pattern, invite_url):
+            # Also check if it's just the code part
+            if re.match(r'^[a-zA-Z0-9]+$', invite_url):
+                invite_url = f"https://discord.gg/{invite_url}"
+            else:
+                await ctx.send(
+                    "❌ Invalid invite format. Please provide a valid Discord invite link "
+                    "(e.g., https://discord.gg/CODE or just the invite code)."
+                )
+                return
+        
+        await self.config.guild(ctx.guild).rejoin_invite.set(invite_url)
+        await ctx.send(f"Rejoin invite link set to: {invite_url}")
 
     @_applications.command(name="cleanup")
     async def _cleanup(self, ctx: commands.Context):
@@ -2293,50 +2437,23 @@ class Applications(commands.Cog):
             interaction.guild, member, "approved", decision_maker=decision_maker
         )
 
-        # Update the message to remove buttons
-        embed = await self.create_review_embed(
-            member, app_data.get("responses", {}), "approved"
-        )
-        try:
-            if interaction.response.is_done():
-                # If already responded, try to edit via followup
-                await interaction.followup.edit_message(
-                    interaction.message.id,
-                    content=(
-                        f"✅ **Application Approved by {interaction.user.mention}**\n\n"
-                        f"Congratulations {member.mention}! Your application has been approved. "
-                        f"You now have full access to the server."
-                    ),
-                    embed=embed,
-                    view=None,
-                )
-            else:
-                await interaction.response.edit_message(
-                    content=(
-                        f"✅ **Application Approved by {interaction.user.mention}**\n\n"
-                        f"Congratulations {member.mention}! Your application has been approved. "
-                        f"You now have full access to the server."
-                    ),
-                    embed=embed,
-                    view=None,
-                )
-        except discord.HTTPException:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    f"✅ Approved {member.mention}'s application.", ephemeral=True
-                )
+        # Respond to interaction
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"✅ Approved {member.mention}'s application.", ephemeral=True
+            )
 
-        # Notify in channel
+        # Send new message in application channel
         channel_id = app_data.get("channel_id")
         if channel_id:
             channel = interaction.guild.get_channel(channel_id)
-            if channel and channel != interaction.channel:
+            if channel:
                 embed = await self.create_review_embed(
                     member, app_data.get("responses", {}), "approved"
                 )
                 try:
                     await channel.send(
-                        f"✅ **Application Approved!**\n\n"
+                        f"✅ **Application Approved by {interaction.user.mention}**\n\n"
                         f"Congratulations {member.mention}! Your application has been approved. "
                         f"You now have full access to the server.",
                         embed=embed,
