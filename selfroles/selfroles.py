@@ -1602,7 +1602,8 @@ class SelfRoles(commands.Cog):
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
         """Handle role assignment button interactions when no view is registered (e.g. after bot restart)."""
-        if interaction.type != discord.InteractionType.message_component:
+        # MESSAGE_COMPONENT = 3 (Discord API); attribute name varies by discord.py version
+        if getattr(interaction.type, "value", interaction.type) != 3:
             return
         custom_id = (interaction.data or {}).get("custom_id") or ""
         if not custom_id.startswith(RoleButton.CUSTOM_ID_PREFIX):
