@@ -89,8 +89,7 @@ class AutoVC(commands.Cog):
     @commands.guild_only()
     async def _autovc(self, ctx: commands.Context):
         """AutoVC management commands."""
-        if ctx.invoked_subcommand is None:
-            await ctx.send_help()
+        pass
 
     @_autovc.command(name="add")
     @commands.admin_or_permissions(manage_guild=True)
