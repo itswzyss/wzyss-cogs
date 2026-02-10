@@ -432,8 +432,8 @@ class AutoVC(commands.Cog):
                 log.warning(f"No category found for source VC {source_vc.id}")
                 return None
 
-        # Generate VC name
-        username = member.display_name.replace(" ", "-").lower()[:20]
+        # Generate VC name (preserve spaces and special characters from display name)
+        username = member.display_name[:20]
         vc_name = f"{username}'s VC"
 
         # Get member role for permissions
