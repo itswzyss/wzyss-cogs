@@ -1,0 +1,13 @@
+{
+  "author": ["Wzyss"],
+  "install_msg": "Thank you for installing Giveaway. Use `[p]help giveaway` to see available commands.",
+  "name": "Giveaway",
+  "short": "Reaction-based giveaways with optional claim system.",
+  "description": "Run giveaways with reaction-based entry, interactive or command-based setup, and management (reroll, end, edit, cancel). Optional configurable claim window with automatic reroll if not claimed.",
+  "tags": ["giveaway", "utility", "reactions"],
+  "requirements": [],
+  "min_bot_version": "3.4.0",
+  "hidden": false,
+  "disabled": false,
+  "type": "COG"
+}
