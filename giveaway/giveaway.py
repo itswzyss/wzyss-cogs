@@ -1051,16 +1051,15 @@ class Giveaway(commands.Cog):
             for mid, data in list(giveaways.items()):
                 if data.get("status") == "active":
                     end_ts = data.get("end_ts") or 0
-                    if end_ts > now:
-                        delay = end_ts - now
-                        self._schedule_end_task(guild.id, int(mid), delay)
+                    delay = max(0.0, end_ts - now)
+                    self._schedule_end_task(guild.id, int(mid), delay)
                 elif data.get("status") == "ended" and not data.get("claimed"):
                     if data.get("claim_enabled") and data.get("claim_deadline_ts"):
                         dl = data["claim_deadline_ts"]
-                        if dl > now:
-                            view = ClaimView(self, int(mid))
-                            self.bot.add_view(view, message_id=int(mid))
-                            self._schedule_claim_task_impl(guild.id, int(mid), dl - now)
+                        view = ClaimView(self, int(mid))
+                        self.bot.add_view(view, message_id=int(mid))
+                        delay = max(0.0, dl - now)
+                        self._schedule_claim_task_impl(guild.id, int(mid), delay)
 
     async def cog_unload(self):
         for task in self._end_tasks.values():
