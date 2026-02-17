@@ -6,7 +6,7 @@ from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import discord
-from discord.ui import Button, Modal, TextInput, View
+from discord.ui import Button, Modal, Select, TextInput, View
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 from redbot.core.commands.converter import get_timedelta_converter, parse_timedelta
@@ -246,59 +246,95 @@ class SetClaimModal(Modal, title="Set Claim"):
             await self.builder_view.refresh(interaction)
 
 
-class SetChannelModal(Modal, title="Set Channel"):
-    channel_input = TextInput(
-        label="Channel ID or mention",
-        placeholder="#channel or 123456789",
-        required=False,
-        max_length=100,
-    )
+class ChannelSelectDropdown(Select["ChannelSelectView"]):
+    """Dropdown to choose the giveaway channel (text channels + current channel)."""
 
-    def __init__(self, cog: "Giveaway", guild_id: int, user_id: int):
-        super().__init__()
-        self.cog = cog
-        self.guild_id = guild_id
-        self.user_id = user_id
+    def __init__(self, cog: "Giveaway", guild: discord.Guild, user_id: int, builder_view: "GiveawayBuilderView"):
+        self._cog = cog
+        self._guild_id = guild.id
+        self._user_id = user_id
+        self._builder_view = builder_view
+        options: List[discord.SelectOption] = [
+            discord.SelectOption(label="Current channel", value="0", description="Post in the channel where you run the command"),
+        ]
+        text_channels = [c for c in guild.text_channels if c.id is not None][:24]
+        for ch in text_channels:
+            options.append(
+                discord.SelectOption(
+                    label=ch.name[:100],
+                    value=str(ch.id),
+                    description=f"#{ch.name}"[:100],
+                )
+            )
+        super().__init__(
+            placeholder="Select a channel...",
+            options=options,
+            row=0,
+        )
 
-    async def on_submit(self, interaction: discord.Interaction):
-        raw = (self.channel_input.value or "").strip()
-        if not raw:
-            await self.cog._set_draft_field(self.guild_id, self.user_id, "channel_id", None)
-            await interaction.response.defer(ephemeral=True)
-            if getattr(self, "builder_view", None):
-                await self.builder_view.refresh(interaction)
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self._user_id:
+            await interaction.response.send_message("Only the user who started the builder can do this.", ephemeral=True)
             return
-        channel = None
-        if raw.startswith("<#") and raw.endswith(">"):
-            cid = raw[2:-1]
-            try:
-                channel = interaction.guild.get_channel(int(cid))
-            except ValueError:
-                pass
-        if not channel:
-            try:
-                cid = int(raw)
-                channel = interaction.guild.get_channel(cid)
-            except ValueError:
-                pass
-        if not channel or not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("Channel not found or not a text channel.", ephemeral=True)
-            return
-        await self.cog._set_draft_field(self.guild_id, self.user_id, "channel_id", channel.id)
+        value = self.values[0] if self.values else "0"
+        if value == "0":
+            await self._cog._set_draft_field(self._guild_id, self._user_id, "channel_id", None)
+            channel_str = "Current channel"
+        else:
+            channel_id = int(value)
+            await self._cog._set_draft_field(self._guild_id, self._user_id, "channel_id", channel_id)
+            ch = interaction.guild.get_channel(channel_id)
+            channel_str = ch.mention if ch else str(channel_id)
         await interaction.response.defer(ephemeral=True)
-        if getattr(self, "builder_view", None):
-            await self.builder_view.refresh(interaction)
+        await self._builder_view.refresh()
+        await interaction.followup.send(f"Channel set to {channel_str}.", ephemeral=True)
+
+
+class ChannelSelectView(View):
+    """Temporary view holding the channel dropdown (ephemeral)."""
+
+    def __init__(self, cog: "Giveaway", guild: discord.Guild, user_id: int, builder_view: "GiveawayBuilderView"):
+        super().__init__(timeout=60)
+        self.add_item(ChannelSelectDropdown(cog, guild, user_id, builder_view))
 
 
 class GiveawayBuilderView(View):
     """Interactive builder: buttons open modals; refresh updates the message like selfroles."""
 
-    def __init__(self, cog: "Giveaway", guild: discord.Guild, user_id: int):
+    def __init__(self, cog: "Giveaway", guild: discord.Guild, user_id: int, edit_message_id: Optional[int] = None):
         super().__init__(timeout=None)
         self.cog = cog
         self.guild = guild
         self.user_id = user_id
+        self.edit_message_id = edit_message_id
         self.message: Optional[discord.Message] = None
+        if edit_message_id is not None:
+            for child in list(self.children):
+                if getattr(child, "label", None) == "Launch":
+                    self.remove_item(child)
+                    break
+            save_btn = Button(label="Save", style=discord.ButtonStyle.success, emoji="\u2705", row=2)
+
+            async def _save_callback(interaction: discord.Interaction):
+                await self._save_edit(interaction)
+
+            save_btn.callback = _save_callback
+            self.add_item(save_btn)
+
+    async def _save_edit(self, interaction: discord.Interaction):
+        """Save draft to the existing giveaway (edit mode)."""
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Only the user who started the builder can do this.", ephemeral=True)
+            return
+        if not self.edit_message_id or not interaction.guild:
+            await interaction.response.send_message("Edit session is invalid.", ephemeral=True)
+            return
+        draft = await self.cog._get_draft(interaction.guild.id, self.user_id)
+        success = await self.cog._save_giveaway_from_draft(
+            interaction, interaction.guild, self.user_id, self.edit_message_id, draft, builder_message=self.message
+        )
+        if success:
+            self.stop()
 
     async def refresh(self, interaction: Optional[discord.Interaction] = None):
         """Refresh the builder display from draft (like selfroles RoleBuilderView.refresh)."""
@@ -321,9 +357,10 @@ class GiveawayBuilderView(View):
         ch_id = draft.get("channel_id")
         channel_str = guild.get_channel(ch_id).mention if ch_id else "Current channel"
 
+        is_editing = self.edit_message_id is not None
         embed = discord.Embed(
-            title="\U0001f3aa Giveaway Builder",
-            description="Use the buttons below to configure your giveaway.",
+            title="\U0001f3aa Giveaway Builder (Editing)" if is_editing else "\U0001f3aa Giveaway Builder",
+            description="Use the buttons below to update the giveaway." if is_editing else "Use the buttons below to configure your giveaway.",
             color=await self.cog.bot.get_embed_color(guild),
         )
         embed.add_field(
@@ -402,9 +439,15 @@ class GiveawayBuilderView(View):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("Only the user who started the builder can do this.", ephemeral=True)
             return
-        modal = SetChannelModal(self.cog, self.guild.id, self.user_id)
-        modal.builder_view = self
-        await interaction.response.send_modal(modal)
+        if not interaction.guild:
+            await interaction.response.send_message("Could not resolve the server.", ephemeral=True)
+            return
+        view = ChannelSelectView(self.cog, interaction.guild, self.user_id, self)
+        await interaction.response.send_message(
+            "Select a channel for the giveaway:",
+            view=view,
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="Preview", style=discord.ButtonStyle.secondary, emoji="\U0001f441\ufe0f", row=1)
     async def preview(self, interaction: discord.Interaction, button: Button):
@@ -527,6 +570,34 @@ class Giveaway(commands.Cog):
         drafts = await self.config.guild(guild).giveaway_drafts()
         drafts.pop(str(user_id), None)
         await self.config.guild(guild).giveaway_drafts.set(drafts)
+
+    async def _load_giveaway_into_draft(self, guild_id: int, user_id: int, message_id: int) -> bool:
+        """Load an active giveaway's data into the user's draft. Returns True on success."""
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            return False
+        giveaways = await self.config.guild(guild).giveaways()
+        data = giveaways.get(str(message_id))
+        if not data or data.get("status") != "active":
+            return False
+        end_ts = data.get("end_ts") or 0
+        duration_seconds = max(60, int(end_ts - time.time()))
+        prizes = self._prizes_list(data)
+        draft = {
+            "prizes": prizes,
+            "prize": prizes[0] if prizes else "",
+            "winner_count": self._winner_count(data),
+            "duration_seconds": duration_seconds,
+            "emoji": data.get("emoji") or "\U0001f389",
+            "claim_enabled": bool(data.get("claim_enabled")),
+            "claim_seconds": int(data.get("claim_seconds") or 0),
+            "channel_id": data.get("channel_id"),
+            "description": data.get("description"),
+        }
+        drafts = await self.config.guild(guild).giveaway_drafts()
+        drafts[str(user_id)] = draft
+        await self.config.guild(guild).giveaway_drafts.set(drafts)
+        return True
 
     async def _can_manage(self, user: discord.Member, host_id: int) -> bool:
         if user.id == host_id:
@@ -996,6 +1067,118 @@ class Giveaway(commands.Cog):
             except (discord.NotFound, discord.Forbidden):
                 pass
 
+    async def _save_giveaway_from_draft(
+        self,
+        interaction: discord.Interaction,
+        guild: discord.Guild,
+        user_id: int,
+        message_id: int,
+        draft: Dict[str, Any],
+        builder_message: Optional[discord.Message] = None,
+    ) -> bool:
+        """Apply draft to an existing active giveaway. Returns True on success."""
+        prizes = self._prizes_list(draft)
+        if not prizes:
+            await interaction.response.send_message("At least one prize is required.", ephemeral=True)
+            return False
+        duration_seconds = int(draft.get("duration_seconds") or 0)
+        if duration_seconds < 60:
+            await interaction.response.send_message("Duration must be at least 1 minute.", ephemeral=True)
+            return False
+        giveaways = await self.config.guild(guild).giveaways()
+        data = giveaways.get(str(message_id))
+        if not data or data.get("status") != "active":
+            await interaction.response.send_message("That giveaway is no longer active.", ephemeral=True)
+            return False
+        description = (draft.get("description") or "").strip() or None
+        emoji = draft.get("emoji") or "\U0001f389"
+        winner_count = self._winner_count(draft)
+        claim_enabled = bool(draft.get("claim_enabled"))
+        claim_seconds = int(draft.get("claim_seconds") or 0)
+        end_ts = time.time() + duration_seconds
+        entries = data.get("entries") or []
+        channel_id = draft.get("channel_id")
+        target_channel = guild.get_channel(channel_id) if channel_id else interaction.channel
+        if not target_channel or not isinstance(target_channel, discord.TextChannel):
+            await interaction.response.send_message("Invalid channel; use current or set a valid channel.", ephemeral=True)
+            return False
+        current_channel_id = data.get("channel_id")
+        embed = await self._make_giveaway_embed(
+            guild, prizes, description, end_ts, emoji, len(entries), data["host_id"], "active",
+            winner_count=winner_count, claim_seconds=claim_seconds,
+        )
+        if target_channel.id == current_channel_id:
+            async with self.config.guild(guild).giveaways() as gws:
+                g = gws.get(str(message_id))
+                if not g or g.get("status") != "active":
+                    await interaction.response.send_message("Giveaway was modified or ended.", ephemeral=True)
+                    return False
+                g["prize"] = prizes[0]
+                g["prizes"] = prizes
+                g["description"] = description
+                g["end_ts"] = end_ts
+                g["emoji"] = emoji
+                g["winner_count"] = winner_count
+                g["claim_enabled"] = claim_enabled
+                g["claim_seconds"] = claim_seconds
+            self._cancel_tasks_for(guild.id, message_id)
+            self._schedule_end_task(guild.id, message_id, max(0.0, end_ts - time.time()))
+            try:
+                msg = await target_channel.fetch_message(message_id)
+                await msg.edit(embed=embed)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+        else:
+            try:
+                old_ch = guild.get_channel(current_channel_id)
+                if old_ch:
+                    old_msg = await old_ch.fetch_message(message_id)
+                    await old_msg.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+            try:
+                new_msg = await target_channel.send(embed=embed)
+            except discord.HTTPException as e:
+                await interaction.response.send_message(f"Failed to post giveaway in new channel: {e}", ephemeral=True)
+                return False
+            await self._add_reaction_safe(new_msg, emoji)
+            async with self.config.guild(guild).giveaways() as gws:
+                gws.pop(str(message_id), None)
+                gws[str(new_msg.id)] = {
+                    "channel_id": target_channel.id,
+                    "message_id": new_msg.id,
+                    "host_id": data["host_id"],
+                    "prize": prizes[0],
+                    "prizes": prizes,
+                    "description": description,
+                    "end_ts": end_ts,
+                    "emoji": emoji,
+                    "entries": entries,
+                    "winner_id": None,
+                    "winner_ids": [],
+                    "winner_count": winner_count,
+                    "claimed_winner_ids": [],
+                    "status": "active",
+                    "claim_enabled": claim_enabled,
+                    "claim_seconds": claim_seconds,
+                    "claim_deadline_ts": None,
+                    "claimed": False,
+                }
+            self._cancel_tasks_for(guild.id, message_id)
+            delay = max(0.0, end_ts - time.time())
+            self._schedule_end_task(guild.id, new_msg.id, delay)
+        await self._clear_draft(guild.id, user_id)
+        if interaction.response.is_done():
+            await interaction.followup.send("Giveaway updated.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Giveaway updated.", ephemeral=True)
+        if builder_message:
+            try:
+                await builder_message.delete()
+            except (discord.NotFound, discord.Forbidden):
+                pass
+        return True
+
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         if not payload.guild_id or payload.user_id == self.bot.user.id:
@@ -1392,7 +1575,7 @@ class Giveaway(commands.Cog):
         *,
         description: Optional[str] = None,
     ):
-        """Edit an active giveaway. [p]giveaway edit <message_id> [prize] [duration] [description]"""
+        """Edit an active giveaway. Reply to the message or pass message_id. With only message_id, opens the interactive builder to edit."""
         mid = self._resolve_message_id(ctx, message_id)
         if mid is None:
             await ctx.send("Provide a message ID or reply to the giveaway message.")
@@ -1421,7 +1604,43 @@ class Giveaway(commands.Cog):
             self._cancel_tasks_for(ctx.guild.id, mid)
             self._schedule_end_task(ctx.guild.id, mid, duration.total_seconds())
         if not updates:
-            await ctx.send("Provide at least one of: prize, duration, description.")
+            loaded = await self._load_giveaway_into_draft(ctx.guild.id, ctx.author.id, mid)
+            if not loaded:
+                await ctx.send("That giveaway is no longer active or could not be loaded.")
+                return
+            view = GiveawayBuilderView(self, ctx.guild, ctx.author.id, edit_message_id=mid)
+            draft = await self._get_draft(ctx.guild.id, ctx.author.id)
+            prizes = self._prizes_list(draft)
+            prizes_str = ", ".join(p[:40] for p in prizes[:5]) if prizes else "Not set"
+            if len(prizes) > 5:
+                prizes_str += f" (+{len(prizes) - 5} more)"
+            winner_count = self._winner_count(draft)
+            duration_seconds = draft.get("duration_seconds") or 0
+            duration_str = humanize_timedelta(seconds=duration_seconds) if duration_seconds else "Not set"
+            emoji = draft.get("emoji") or "\U0001f389"
+            claim_enabled = draft.get("claim_enabled", False)
+            claim_seconds = draft.get("claim_seconds") or 0
+            claim_str = humanize_timedelta(seconds=claim_seconds) if claim_seconds else "N/A"
+            ch_id = draft.get("channel_id")
+            channel_str = ctx.guild.get_channel(ch_id).mention if ch_id else "Current channel"
+            embed = discord.Embed(
+                title="\U0001f3aa Giveaway Builder (Editing)",
+                description="Use the buttons below to update the giveaway.",
+                color=await self.bot.get_embed_color(ctx.guild),
+            )
+            embed.add_field(
+                name="\U0001f4dd Giveaway Configuration",
+                value=(
+                    f"**Prizes:** {prizes_str[:500]}\n"
+                    f"**Winners:** {winner_count}\n"
+                    f"**Duration:** {duration_str}\n"
+                    f"**Emoji:** {emoji}\n"
+                    f"**Claim:** {'Yes' if claim_enabled else 'No'} ({claim_str})\n"
+                    f"**Channel:** {channel_str}"
+                ),
+                inline=False,
+            )
+            view.message = await ctx.send(embed=embed, view=view)
             return
         async with self.config.guild(ctx.guild).giveaways() as gws:
             g = gws.get(str(mid))
