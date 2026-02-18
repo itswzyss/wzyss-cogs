@@ -1,0 +1,13 @@
+{
+  "author": ["Wzyss"],
+  "install_msg": "Thank you for installing Remindme. Use `[p]help remindme` to see available commands.",
+  "name": "Remindme",
+  "short": "Set timers and get pinged or DMed when they complete.",
+  "description": "Set reminders via command (e.g. [p]remindme 5m or [p]remindme 5m dm) or interactive embed with buttons for popular times and a custom duration modal. Supports user presets and guild-published presets. Timers persist across bot restarts.",
+  "tags": ["reminder", "utility", "timer"],
+  "requirements": [],
+  "min_bot_version": "3.4.0",
+  "hidden": false,
+  "disabled": false,
+  "type": "COG"
+}
