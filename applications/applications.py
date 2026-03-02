@@ -879,6 +879,13 @@ class Applications(commands.Cog):
             "cleanup_delay": 24,  # Hours before deleting channels after approval/denial
             "kick_timeout_seconds": 86400,  # Time before kicking users who didn't submit (default 24 hours)
             "rejoin_invite": None,  # Invite link URL to send when kicking users who didn't submit
+            "denial_action": "notify",  # notify | kick | tempban | ban
+            "denial_send_dm": False,
+            "denial_tempban_duration_seconds": 86400,
+            "early_close_action": "notify",
+            "early_close_send_dm": False,
+            "early_close_tempban_duration_seconds": 86400,
+            "pending_unbans": [],  # [{"user_id": int, "unban_at": str (iso)}, ...]
             "form_fields": [
                 {
                     "name": "name",
@@ -938,6 +945,89 @@ class Applications(commands.Cog):
             return f"{seconds // 3600} hour{'s' if seconds // 3600 != 1 else ''}"
         days = seconds // 86400
         return f"{days} day{'s' if days != 1 else ''}"
+
+    # Tempban duration limits (seconds)
+    TEMPBAN_MIN_SECONDS = 60
+    TEMPBAN_MAX_SECONDS = 2592000  # 30 days
+
+    async def _execute_member_action(
+        self,
+        guild: discord.Guild,
+        member: Optional[discord.Member],
+        action: str,
+        reason: str,
+        send_dm: bool,
+        tempban_seconds: Optional[int] = None,
+        context: str = "denial",
+    ) -> None:
+        """Execute configured member action (notify/kick/tempban/ban). DM is sent before removal."""
+        if action == "notify":
+            return
+        if member is None:
+            log.warning("_execute_member_action: member is None, skipping action")
+            return
+
+        if context == "denial":
+            dm_preface = "Your application was denied."
+        else:
+            dm_preface = "Your application was closed before you submitted."
+
+        if send_dm:
+            dm_message = f"{dm_preface}\n\nReason: {reason}" if reason else dm_preface
+            try:
+                await member.send(dm_message)
+            except discord.Forbidden:
+                log.warning(f"Could not DM user {member.id} for {context} - DMs may be disabled")
+            except discord.HTTPException as e:
+                log.error(f"Error sending DM to user {member.id} for {context}: {e}")
+
+        if action == "kick":
+            if not guild.me.guild_permissions.kick_members:
+                log.error(f"Bot lacks kick_members in {guild.name}, skipping kick")
+                return
+            try:
+                await member.kick(reason=reason)
+                log.info(f"Kicked {member.display_name} ({member.id}) from {guild.name} ({context})")
+            except discord.Forbidden:
+                log.error(f"Permission denied kicking {member.id} from {guild.name}")
+            except discord.HTTPException as e:
+                log.error(f"Error kicking {member.id} from {guild.name}: {e}")
+            return
+
+        if action == "ban":
+            if not guild.me.guild_permissions.ban_members:
+                log.error(f"Bot lacks ban_members in {guild.name}, skipping ban")
+                return
+            try:
+                await guild.ban(member, reason=reason)
+                log.info(f"Banned {member.display_name} ({member.id}) from {guild.name} ({context})")
+            except discord.Forbidden:
+                log.error(f"Permission denied banning {member.id} in {guild.name}")
+            except discord.HTTPException as e:
+                log.error(f"Error banning {member.id} in {guild.name}: {e}")
+            return
+
+        if action == "tempban":
+            if not guild.me.guild_permissions.ban_members:
+                log.error(f"Bot lacks ban_members in {guild.name}, skipping tempban")
+                return
+            duration = tempban_seconds
+            if duration is None or duration < self.TEMPBAN_MIN_SECONDS:
+                duration = self.TEMPBAN_MIN_SECONDS
+            if duration > self.TEMPBAN_MAX_SECONDS:
+                duration = self.TEMPBAN_MAX_SECONDS
+            try:
+                await guild.ban(member, reason=reason)
+                unban_at = datetime.utcnow() + timedelta(seconds=duration)
+                async with self.config.guild(guild).pending_unbans() as pending:
+                    pending.append({"user_id": member.id, "unban_at": unban_at.isoformat()})
+                log.info(
+                    f"Tempbanned {member.display_name} ({member.id}) from {guild.name} for {duration}s ({context})"
+                )
+            except discord.Forbidden:
+                log.error(f"Permission denied tempbanning {member.id} in {guild.name}")
+            except discord.HTTPException as e:
+                log.error(f"Error tempbanning {member.id} in {guild.name}: {e}")
 
     def _start_application_timer(self, guild_id: int, user_id: int, channel_id: int):
         """Start a timer for a user to submit their application (duration from config)."""
@@ -1257,6 +1347,11 @@ class Applications(commands.Cog):
                 member, "denied", decision_maker=decision_maker, reason=reason
             )
             content = f"❌ Application denied by {decision_maker.mention if decision_maker else 'Unknown'}"
+        elif event_type == "early_closed":
+            embed = await self.create_log_embed(
+                member, "early_closed", decision_maker=decision_maker, reason="Application closed before submission."
+            )
+            content = f"📋 Application closed (no submission) by {decision_maker.mention if decision_maker else 'Unknown'}"
         else:
             return
 
@@ -1280,12 +1375,14 @@ class Applications(commands.Cog):
             "submitted": discord.Color.orange(),
             "approved": discord.Color.green(),
             "denied": discord.Color.red(),
+            "early_closed": discord.Color.orange(),
         }
 
         titles = {
             "submitted": "Application Submitted",
             "approved": "Application Approved",
             "denied": "Application Denied",
+            "early_closed": "Application Closed (No Submission)",
         }
 
         embed = discord.Embed(
@@ -1332,8 +1429,8 @@ class Applications(commands.Cog):
             if responses_text:
                 embed.add_field(name="Application Responses", value=responses_text, inline=False)
 
-        # Add decision maker for approvals/denials
-        if event_type in ["approved", "denied"] and decision_maker:
+        # Add decision maker for approvals/denials/early_closed
+        if event_type in ["approved", "denied", "early_closed"] and decision_maker:
             embed.add_field(
                 name="Decision By",
                 value=f"{decision_maker.mention} ({decision_maker.display_name})",
@@ -1798,6 +1895,158 @@ class Applications(commands.Cog):
         await self.config.guild(ctx.guild).rejoin_invite.set(invite_url)
         await ctx.send(f"Rejoin invite link set to: {invite_url}")
 
+    _ACTION_CHOICES = ("notify", "kick", "tempban", "ban")
+
+    @_applications.command(name="denialaction")
+    async def _denial_action(
+        self, ctx: commands.Context, action: Optional[str] = None
+    ):
+        """Set what happens when an application is denied: notify, kick, tempban, or ban.
+        
+        If no action is given, shows the current setting.
+        """
+        if action is None:
+            current = await self.config.guild(ctx.guild).denial_action()
+            await ctx.send(f"Denial action is set to: **{current}**.")
+            return
+        a = action.strip().lower()
+        if a not in self._ACTION_CHOICES:
+            await ctx.send(
+                f"❌ Invalid action. Use one of: {', '.join(self._ACTION_CHOICES)}."
+            )
+            return
+        await self.config.guild(ctx.guild).denial_action.set(a)
+        await ctx.send(f"Denial action set to: **{a}**.")
+
+    @_applications.command(name="denialdm")
+    async def _denial_dm(
+        self, ctx: commands.Context, on_off: Optional[bool] = None
+    ):
+        """Set whether to DM the user before kick/tempban/ban on denial.
+        
+        If not set, shows current value.
+        """
+        if on_off is None:
+            current = await self.config.guild(ctx.guild).denial_send_dm()
+            await ctx.send(f"Send DM before denial removal: **{'Yes' if current else 'No'}**.")
+            return
+        await self.config.guild(ctx.guild).denial_send_dm.set(on_off)
+        await ctx.send(f"Send DM before denial removal: **{'Yes' if on_off else 'No'}**.")
+
+    @_applications.command(name="denialtempbanduration")
+    async def _denial_tempban_duration(
+        self,
+        ctx: commands.Context,
+        amount: Optional[float] = None,
+        unit: Optional[str] = None,
+    ):
+        """Set tempban duration when denial action is tempban.
+        
+        Use: [p]applications denialtempbanduration <amount> <unit>
+        Units: seconds/s, minutes/m, hours/h, days/d.
+        If omitted, shows current duration.
+        """
+        if amount is None or unit is None:
+            current = await self.config.guild(ctx.guild).denial_tempban_duration_seconds()
+            if current is None:
+                current = 86400
+            await ctx.send(f"Denial tempban duration: {self._format_timeout(int(current))}.")
+            return
+        unit_map = {
+            "s": 1, "sec": 1, "second": 1, "seconds": 1,
+            "m": 60, "min": 60, "minute": 60, "minutes": 60,
+            "h": 3600, "hour": 3600, "hours": 3600,
+            "d": 86400, "day": 86400, "days": 86400,
+        }
+        u = unit.strip().lower()
+        if u not in unit_map:
+            await ctx.send(
+                "❌ Invalid unit. Use: seconds (s), minutes (m), hours (h), or days (d)."
+            )
+            return
+        if amount <= 0:
+            await ctx.send("❌ Amount must be a positive number.")
+            return
+        total_seconds = int(amount * unit_map[u])
+        total_seconds = max(self.TEMPBAN_MIN_SECONDS, min(self.TEMPBAN_MAX_SECONDS, total_seconds))
+        await self.config.guild(ctx.guild).denial_tempban_duration_seconds.set(total_seconds)
+        await ctx.send(f"Denial tempban duration set to: {self._format_timeout(total_seconds)}.")
+
+    @_applications.command(name="earlycloseaction")
+    async def _early_close_action(
+        self, ctx: commands.Context, action: Optional[str] = None
+    ):
+        """Set what happens when an application is closed before the user submitted: notify, kick, tempban, or ban.
+        
+        If no action is given, shows the current setting.
+        """
+        if action is None:
+            current = await self.config.guild(ctx.guild).early_close_action()
+            await ctx.send(f"Early close action is set to: **{current}**.")
+            return
+        a = action.strip().lower()
+        if a not in self._ACTION_CHOICES:
+            await ctx.send(
+                f"❌ Invalid action. Use one of: {', '.join(self._ACTION_CHOICES)}."
+            )
+            return
+        await self.config.guild(ctx.guild).early_close_action.set(a)
+        await ctx.send(f"Early close action set to: **{a}**.")
+
+    @_applications.command(name="earlyclosedm")
+    async def _early_close_dm(
+        self, ctx: commands.Context, on_off: Optional[bool] = None
+    ):
+        """Set whether to DM the user before kick/tempban/ban when closing before submission.
+        
+        If not set, shows current value.
+        """
+        if on_off is None:
+            current = await self.config.guild(ctx.guild).early_close_send_dm()
+            await ctx.send(f"Send DM before early-close removal: **{'Yes' if current else 'No'}**.")
+            return
+        await self.config.guild(ctx.guild).early_close_send_dm.set(on_off)
+        await ctx.send(f"Send DM before early-close removal: **{'Yes' if on_off else 'No'}**.")
+
+    @_applications.command(name="earlyclosetempbanduration")
+    async def _early_close_tempban_duration(
+        self,
+        ctx: commands.Context,
+        amount: Optional[float] = None,
+        unit: Optional[str] = None,
+    ):
+        """Set tempban duration when early-close action is tempban.
+        
+        Use: [p]applications earlyclosetempbanduration <amount> <unit>
+        Units: seconds/s, minutes/m, hours/h, days/d.
+        If omitted, shows current duration.
+        """
+        if amount is None or unit is None:
+            current = await self.config.guild(ctx.guild).early_close_tempban_duration_seconds()
+            if current is None:
+                current = 86400
+            await ctx.send(f"Early close tempban duration: {self._format_timeout(int(current))}.")
+            return
+        unit_map = {
+            "s": 1, "sec": 1, "second": 1, "seconds": 1,
+            "m": 60, "min": 60, "minute": 60, "minutes": 60,
+            "h": 3600, "hour": 3600, "hours": 3600,
+            "d": 86400, "day": 86400, "days": 86400,
+        }
+        u = unit.strip().lower()
+        if u not in unit_map:
+            await ctx.send(
+                "❌ Invalid unit. Use: seconds (s), minutes (m), hours (h), or days (d)."
+            )
+            return
+        if amount <= 0:
+            await ctx.send("❌ Amount must be a positive number.")
+            return
+        total_seconds = int(amount * unit_map[u])
+        total_seconds = max(self.TEMPBAN_MIN_SECONDS, min(self.TEMPBAN_MAX_SECONDS, total_seconds))
+        await self.config.guild(ctx.guild).early_close_tempban_duration_seconds.set(total_seconds)
+        await ctx.send(f"Early close tempban duration set to: {self._format_timeout(total_seconds)}.")
+
     @_applications.command(name="cleanup")
     async def _cleanup(self, ctx: commands.Context):
         """Manually trigger cleanup of expired application channels."""
@@ -2171,6 +2420,13 @@ class Applications(commands.Cog):
         cleanup_delay = settings.get("cleanup_delay", 24)
         kick_timeout_seconds = settings.get("kick_timeout_seconds", 86400)
         rejoin_invite = settings.get("rejoin_invite")
+        denial_action = settings.get("denial_action", "notify")
+        denial_send_dm = settings.get("denial_send_dm", False)
+        denial_tempban_seconds = settings.get("denial_tempban_duration_seconds", 86400)
+        early_close_action = settings.get("early_close_action", "notify")
+        early_close_send_dm = settings.get("early_close_send_dm", False)
+        early_close_tempban_seconds = settings.get("early_close_tempban_duration_seconds", 86400)
+        pending_unbans = settings.get("pending_unbans", [])
 
         form_fields = settings.get("form_fields", [])
         applications = settings.get("applications", {})
@@ -2238,6 +2494,42 @@ class Applications(commands.Cog):
         embed.add_field(
             name="Rejoin Invite",
             value="Set" if rejoin_invite else "Not set",
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Denial Action",
+            value=denial_action,
+            inline=True,
+        )
+        embed.add_field(
+            name="Denial DM",
+            value="Yes" if denial_send_dm else "No",
+            inline=True,
+        )
+        embed.add_field(
+            name="Denial Tempban",
+            value=self._format_timeout(int(denial_tempban_seconds or 86400)) if denial_action == "tempban" else "N/A",
+            inline=True,
+        )
+        embed.add_field(
+            name="Early Close Action",
+            value=early_close_action,
+            inline=True,
+        )
+        embed.add_field(
+            name="Early Close DM",
+            value="Yes" if early_close_send_dm else "No",
+            inline=True,
+        )
+        embed.add_field(
+            name="Early Close Tempban",
+            value=self._format_timeout(int(early_close_tempban_seconds or 86400)) if early_close_action == "tempban" else "N/A",
+            inline=True,
+        )
+        embed.add_field(
+            name="Pending Tempbans",
+            value=str(len(pending_unbans)),
             inline=True,
         )
 
@@ -2467,6 +2759,25 @@ class Applications(commands.Cog):
             ctx.guild, member, "denied", decision_maker=decision_maker, reason=reason
         )
 
+        # Execute configured denial action (DM before removal)
+        denial_action = await self.config.guild(ctx.guild).denial_action()
+        denial_send_dm = await self.config.guild(ctx.guild).denial_send_dm()
+        denial_tempban_seconds = (
+            await self.config.guild(ctx.guild).denial_tempban_duration_seconds()
+            if denial_action == "tempban"
+            else None
+        )
+        action_reason = f"Application denied.{f' Reason: {reason}' if reason else ''}"
+        await self._execute_member_action(
+            ctx.guild,
+            member,
+            denial_action,
+            action_reason,
+            denial_send_dm,
+            tempban_seconds=denial_tempban_seconds,
+            context="denial",
+        )
+
         # Notify in channel
         channel_id = app_data.get("channel_id")
         if channel_id:
@@ -2619,6 +2930,25 @@ class Applications(commands.Cog):
             interaction.guild, member, "denied", decision_maker=decision_maker, reason=reason
         )
 
+        # Execute configured denial action (DM before removal)
+        denial_action = await self.config.guild(interaction.guild).denial_action()
+        denial_send_dm = await self.config.guild(interaction.guild).denial_send_dm()
+        denial_tempban_seconds = (
+            await self.config.guild(interaction.guild).denial_tempban_duration_seconds()
+            if denial_action == "tempban"
+            else None
+        )
+        action_reason = f"Application denied.{f' Reason: {reason}' if reason else ''}"
+        await self._execute_member_action(
+            interaction.guild,
+            member,
+            denial_action,
+            action_reason,
+            denial_send_dm,
+            tempban_seconds=denial_tempban_seconds,
+            context="denial",
+        )
+
         # Respond to modal
         await interaction.response.send_message(
             f"✅ Application denied. {member.mention} has been notified.", ephemeral=True
@@ -2767,6 +3097,35 @@ class Applications(commands.Cog):
 
         app_data = applications[str(member.id)]
         channel_id = app_data.get("channel_id")
+        submitted = app_data.get("submitted_at") or app_data.get("responses")
+
+        if not submitted:
+            # Early close: user has not submitted. Execute configured action (DM before removal).
+            early_action = await self.config.guild(ctx.guild).early_close_action()
+            early_send_dm = await self.config.guild(ctx.guild).early_close_send_dm()
+            early_tempban_seconds = (
+                await self.config.guild(ctx.guild).early_close_tempban_duration_seconds()
+                if early_action == "tempban"
+                else None
+            )
+            action_reason = "Application closed before submission."
+            # Re-fetch member in case they left
+            member_to_action = ctx.guild.get_member(member.id)
+            await self._execute_member_action(
+                ctx.guild,
+                member_to_action,
+                early_action,
+                action_reason,
+                early_send_dm,
+                tempban_seconds=early_tempban_seconds,
+                context="early_close",
+            )
+            await self.log_application_event(
+                ctx.guild,
+                member,
+                "early_closed",
+                decision_maker=ctx.guild.get_member(ctx.author.id),
+            )
 
         if channel_id:
             channel = ctx.guild.get_channel(channel_id)
@@ -2849,6 +3208,29 @@ class Applications(commands.Cog):
                                     if user_id in apps:
                                         del apps[user_id]
                             log.info(f"Removed {len(to_remove)} cleaned up applications from {guild.name}")
+
+                        # Process pending tempban unbans
+                        pending_unbans = await self.config.guild(guild).pending_unbans()
+                        to_unban = [
+                            entry
+                            for entry in pending_unbans
+                            if datetime.fromisoformat(entry["unban_at"]) <= current_time
+                        ]
+                        if to_unban:
+                            async with self.config.guild(guild).pending_unbans() as pending:
+                                for entry in to_unban:
+                                    uid = entry["user_id"]
+                                    try:
+                                        await guild.unban(
+                                            discord.Object(id=uid),
+                                            reason="Tempban expired (applications).",
+                                        )
+                                        log.info(f"Unbanned user {uid} from {guild.name} (tempban expired)")
+                                    except discord.Forbidden:
+                                        log.warning(f"Permission denied unbanning {uid} in {guild.name}")
+                                    except discord.HTTPException as e:
+                                        log.debug(f"Error unbanning {uid} in {guild.name}: {e} (may already be unbanned)")
+                                    pending.remove(entry)
 
                     except Exception as e:
                         log.error(f"Error in cleanup loop for guild {guild.name}: {e}", exc_info=True)
