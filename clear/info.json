@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing Clear. Use `[p]help clear` for commands. Requires Manage Messages (or mod) permission.",
+    "name": "Clear",
+    "short": "Clear/purge messages in a channel (by count, after message, between messages, or by user).",
+    "description": "Allows mods and admins to manage messages in a channel: clear a number of messages, clear all messages after a given message, clear messages between two messages, or clear messages from a specific user. Supports both slash and prefix commands.",
+    "tags": ["moderation", "utility", "messages"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
