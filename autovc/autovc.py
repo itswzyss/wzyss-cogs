@@ -1,14 +1,145 @@
 import asyncio
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 
 import discord
+from discord.ui import Button, Modal, TextInput, View
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 from redbot.core.utils.chat_formatting import box, pagify
 
 log = logging.getLogger("red.wzyss-cogs.autovc")
+
+PANEL_CUSTOM_ID_PREFIX = "autovc:panel:"
+
+
+class SetLimitModal(Modal, title="Set user limit"):
+    """Modal for setting VC user limit from the panel."""
+
+    limit_input = TextInput(
+        label="User limit",
+        placeholder="0 = no limit (1-99)",
+        required=True,
+        min_length=1,
+        max_length=2,
+    )
+
+    def __init__(self, cog: "AutoVC"):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.limit_input.value.strip()
+        try:
+            limit = int(raw)
+        except ValueError:
+            await interaction.response.send_message(
+                "Please enter a number between 0 and 99.",
+                ephemeral=True,
+            )
+            return
+        if limit < 0 or limit > 99:
+            await interaction.response.send_message(
+                "Limit must be between 0 and 99 (0 = no limit).",
+                ephemeral=True,
+            )
+            return
+        await self.cog._panel_set_limit(interaction, limit)
+
+
+class RenameVCModal(Modal, title="Rename VC"):
+    """Modal for renaming the current owned VC from the panel."""
+
+    name_input = TextInput(
+        label="New VC name",
+        placeholder="Leave blank to reset to default (e.g. Chill VC)",
+        required=False,
+        min_length=0,
+        max_length=100,
+    )
+
+    def __init__(self, cog: "AutoVC"):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = self.name_input.value.strip()
+        await self.cog._panel_rename_vc(interaction, name[:100] if name else None)
+
+
+class VCPanelView(View):
+    """Panel view with buttons for VC control. Persistent (timeout=None)."""
+
+    def __init__(self, cog: "AutoVC"):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return True
+
+    async def _dispatch(self, interaction: discord.Interaction, action: str):
+        if action == "limit":
+            await interaction.response.send_modal(SetLimitModal(self.cog))
+            return
+        if action == "rename":
+            await interaction.response.send_modal(RenameVCModal(self.cog))
+            return
+        await self.cog._panel_action(interaction, action)
+
+    @discord.ui.button(
+        label="Lock VC",
+        style=discord.ButtonStyle.primary,
+        custom_id=f"{PANEL_CUSTOM_ID_PREFIX}lock",
+        row=0,
+    )
+    async def lock_btn(self, interaction: discord.Interaction, button: Button):
+        await self._dispatch(interaction, "lock")
+
+    @discord.ui.button(
+        label="Unlock VC",
+        style=discord.ButtonStyle.primary,
+        custom_id=f"{PANEL_CUSTOM_ID_PREFIX}unlock",
+        row=0,
+    )
+    async def unlock_btn(self, interaction: discord.Interaction, button: Button):
+        await self._dispatch(interaction, "unlock")
+
+    @discord.ui.button(
+        label="Hide VC",
+        style=discord.ButtonStyle.secondary,
+        custom_id=f"{PANEL_CUSTOM_ID_PREFIX}hide",
+        row=0,
+    )
+    async def hide_btn(self, interaction: discord.Interaction, button: Button):
+        await self._dispatch(interaction, "hide")
+
+    @discord.ui.button(
+        label="Show VC",
+        style=discord.ButtonStyle.secondary,
+        custom_id=f"{PANEL_CUSTOM_ID_PREFIX}show",
+        row=0,
+    )
+    async def show_btn(self, interaction: discord.Interaction, button: Button):
+        await self._dispatch(interaction, "show")
+
+    @discord.ui.button(
+        label="Set user limit",
+        style=discord.ButtonStyle.secondary,
+        custom_id=f"{PANEL_CUSTOM_ID_PREFIX}limit",
+        row=1,
+    )
+    async def limit_btn(self, interaction: discord.Interaction, button: Button):
+        await self._dispatch(interaction, "limit")
+
+    @discord.ui.button(
+        label="Rename VC",
+        style=discord.ButtonStyle.secondary,
+        custom_id=f"{PANEL_CUSTOM_ID_PREFIX}rename",
+        row=1,
+    )
+    async def rename_btn(self, interaction: discord.Interaction, button: Button):
+        await self._dispatch(interaction, "rename")
 
 
 class AutoVC(commands.Cog):
@@ -25,6 +156,9 @@ class AutoVC(commands.Cog):
             "created_vcs": {},  # {vc_id: {"source_vc_id": int, "owner_id": int|None, "role_id": int|None, "type": str, "created_at": timestamp}}
             "claimable_vcs": {},  # {vc_id: {"owner_left_at": timestamp, "original_owner": int}}
             "member_role_id": None,  # Optional: role that grants member access (for @Member scenarios)
+            "panel_enabled": False,
+            "panel_channel_ids": [],
+            "panel_message_ids": {},  # {channel_id: message_id}
         }
 
         self.config.register_guild(**default_guild)
@@ -44,9 +178,79 @@ class AutoVC(commands.Cog):
 
         log.info("AutoVC cog initialized")
 
+    async def _ctx_send(
+        self,
+        ctx: commands.Context,
+        content: Optional[str] = None,
+        *,
+        embed: Optional[discord.Embed] = None,
+        ephemeral: bool = False,
+        **kwargs,
+    ):
+        """Send a message; ephemeral only when invoked as a slash command."""
+        if getattr(ctx, "interaction", None) and ephemeral:
+            return await ctx.send(content, embed=embed, ephemeral=True, **kwargs)
+        return await ctx.send(content, embed=embed, **kwargs)
+
+    async def _get_panel_embed(self, guild: discord.Guild) -> discord.Embed:
+        """Build the VC panel embed."""
+        embed = discord.Embed(
+            title="VC controls",
+            description=(
+                "Use the buttons below to control your AutoVC voice channel. "
+                "You must be in your owned personal or private VC for the buttons to work."
+            ),
+            color=await self.bot.get_embed_color(guild),
+        )
+        return embed
+
+    async def _send_panel_to_channel(
+        self, guild: discord.Guild, channel: discord.TextChannel
+    ) -> Optional[discord.Message]:
+        """Send panel embed + view to channel. Store message_id. Return the message or None."""
+        try:
+            view = VCPanelView(self)
+            embed = await self._get_panel_embed(guild)
+            msg = await channel.send(embed=embed, view=view)
+            self.bot.add_view(view, message_id=msg.id)
+            ids = await self.config.guild(guild).panel_message_ids()
+            ids[str(channel.id)] = msg.id
+            await self.config.guild(guild).panel_message_ids.set(ids)
+            return msg
+        except discord.HTTPException as e:
+            log.warning(f"Failed to send panel to {channel.id}: {e}")
+            return None
+
+    async def _remove_panel_from_channel(
+        self, guild: discord.Guild, channel_id: int
+    ) -> None:
+        """Delete panel message from channel and clear stored message_id."""
+        ids = await self.config.guild(guild).panel_message_ids()
+        mid = ids.pop(str(channel_id), None)
+        await self.config.guild(guild).panel_message_ids.set(ids)
+        if mid and isinstance(mid, int):
+            ch = guild.get_channel(channel_id)
+            if isinstance(ch, discord.TextChannel):
+                try:
+                    msg = await ch.fetch_message(mid)
+                    await msg.delete()
+                except (discord.HTTPException, discord.NotFound):
+                    pass
+
     async def cog_load(self):
         """Called when the cog is loaded."""
         self.cleanup_task = self.bot.loop.create_task(self.cleanup_loop())
+        # Re-add panel views for persistence across restarts
+        for guild in self.bot.guilds:
+            try:
+                ids = await self.config.guild(guild).panel_message_ids()
+                for cid_str, mid in ids.items():
+                    try:
+                        self.bot.add_view(VCPanelView(self), message_id=int(mid))
+                    except (ValueError, TypeError):
+                        pass
+            except Exception as e:
+                log.debug(f"AutoVC panel view restore for {guild.id}: {e}")
 
     async def cog_unload(self):
         """Called when the cog is unloaded."""
@@ -85,13 +289,14 @@ class AutoVC(commands.Cog):
             self.rate_limit[user_id] = []
         self.rate_limit[user_id].append(now)
 
-    @commands.group(name="autovc", aliases=["avc"])
+    @commands.hybrid_group(name="autovcset")
     @commands.guild_only()
-    async def _autovc(self, ctx: commands.Context):
-        """AutoVC management commands."""
+    @commands.admin_or_permissions(manage_guild=True)
+    async def _autovcset(self, ctx: commands.Context):
+        """AutoVC admin: source VCs, settings, member role, panel."""
         pass
 
-    @_autovc.command(name="add")
+    @_autovcset.command(name="add")
     @commands.admin_or_permissions(manage_guild=True)
     async def _add_source_vc(
         self,
@@ -105,9 +310,9 @@ class AutoVC(commands.Cog):
         Types: public, personal, private
         
         Examples:
-        - [p]autovc add #Create Public public
-        - [p]autovc add #Create Personal personal
-        - [p]autovc add #Create Private private #Private-VCs
+        - [p]autovcset add #Create Public public
+        - [p]autovcset add #Create Personal personal
+        - [p]autovcset add #Create Private private #Private-VCs
         """
         vc_type = vc_type.lower()
         if vc_type not in ["public", "personal", "private"]:
@@ -144,7 +349,7 @@ class AutoVC(commands.Cog):
             f"Created VCs will be placed in {category.mention if category else 'the same category'}."
         )
 
-    @_autovc.command(name="remove", aliases=["delete", "del"])
+    @_autovcset.command(name="remove", aliases=["delete", "del"])
     @commands.admin_or_permissions(manage_guild=True)
     async def _remove_source_vc(
         self, ctx: commands.Context, source_vc: discord.VoiceChannel
@@ -163,7 +368,7 @@ class AutoVC(commands.Cog):
 
         await ctx.send(f"Removed {source_vc.mention} from source VCs.")
 
-    @_autovc.command(name="list")
+    @_autovcset.command(name="list")
     @commands.admin_or_permissions(manage_guild=True)
     async def _list_source_vcs(self, ctx: commands.Context):
         """List all configured source VCs and their types."""
@@ -197,7 +402,7 @@ class AutoVC(commands.Cog):
 
         await ctx.send(message)
 
-    @_autovc.command(name="settings")
+    @_autovcset.command(name="settings")
     @commands.admin_or_permissions(manage_guild=True)
     async def _settings(self, ctx: commands.Context):
         """Show current AutoVC configuration."""
@@ -249,7 +454,124 @@ class AutoVC(commands.Cog):
 
         await ctx.send(embed=embed)
 
-    @_autovc.command(name="memberrole")
+    @_autovcset.group(name="panel")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def _autovcset_panel(self, ctx: commands.Context):
+        """VC panel: embed with buttons for owners to control their VC."""
+        pass
+
+    @_autovcset_panel.command(name="toggle")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def _panel_toggle(self, ctx: commands.Context):
+        """Enable or disable the VC panel in designated channels."""
+        guild = ctx.guild
+        enabled = await self.config.guild(guild).panel_enabled()
+        new_enabled = not enabled
+        await self.config.guild(guild).panel_enabled.set(new_enabled)
+
+        if new_enabled:
+            channel_ids = await self.config.guild(guild).panel_channel_ids()
+            ids = await self.config.guild(guild).panel_message_ids()
+            for cid in channel_ids or []:
+                ch = guild.get_channel(cid)
+                if not isinstance(ch, discord.TextChannel):
+                    continue
+                # Send only if no message or message was deleted; otherwise refresh to latest view
+                mid = ids.get(str(cid)) if ids else None
+                if mid:
+                    try:
+                        msg = await ch.fetch_message(int(mid))
+                        view = VCPanelView(self)
+                        embed = await self._get_panel_embed(guild)
+                        await msg.edit(embed=embed, view=view)
+                        self.bot.add_view(view, message_id=msg.id)
+                        continue
+                    except (discord.NotFound, ValueError, TypeError):
+                        pass
+                await self._send_panel_to_channel(guild, ch)
+            await ctx.send(
+                "VC panel is now **enabled**. Panel message(s) have been sent to the designated channel(s)."
+            )
+        else:
+            ids = await self.config.guild(guild).panel_message_ids()
+            for cid_str in list(ids.keys()):
+                await self._remove_panel_from_channel(guild, int(cid_str))
+            await ctx.send(
+                "VC panel is now **disabled**. Panel message(s) have been removed."
+            )
+
+    @_autovcset_panel.command(name="add")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def _panel_channel_add(
+        self, ctx: commands.Context, channel: discord.TextChannel
+    ):
+        """Add a channel for the VC panel."""
+        guild = ctx.guild
+        channel_ids = await self.config.guild(guild).panel_channel_ids()
+        if channel_ids is None:
+            channel_ids = []
+        if channel.id in channel_ids:
+            await ctx.send(f"{channel.mention} is already a panel channel.")
+            return
+        channel_ids.append(channel.id)
+        await self.config.guild(guild).panel_channel_ids.set(channel_ids)
+        if await self.config.guild(guild).panel_enabled():
+            msg = await self._send_panel_to_channel(guild, channel)
+            if msg:
+                await ctx.send(
+                    f"Added {channel.mention} as a panel channel and sent the panel."
+                )
+            else:
+                await ctx.send(
+                    f"Added {channel.mention} as a panel channel but failed to send the panel. Check bot permissions."
+                )
+        else:
+            await ctx.send(
+                f"Added {channel.mention} as a panel channel. Use `{ctx.clean_prefix}autovcset panel toggle` to enable the panel."
+            )
+
+    @_autovcset_panel.command(name="remove")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def _panel_channel_remove(
+        self, ctx: commands.Context, channel: discord.TextChannel
+    ):
+        """Remove a channel from the VC panel."""
+        guild = ctx.guild
+        channel_ids = await self.config.guild(guild).panel_channel_ids()
+        if channel_ids is None or channel.id not in channel_ids:
+            await ctx.send(f"{channel.mention} is not a panel channel.")
+            return
+        channel_ids = [x for x in channel_ids if x != channel.id]
+        await self.config.guild(guild).panel_channel_ids.set(channel_ids)
+        await self._remove_panel_from_channel(guild, channel.id)
+        await ctx.send(f"Removed {channel.mention} from panel channels.")
+
+    @_autovcset_panel.command(name="list")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def _panel_channel_list(self, ctx: commands.Context):
+        """List channels designated for the VC panel."""
+        guild = ctx.guild
+        channel_ids = await self.config.guild(guild).panel_channel_ids()
+        enabled = await self.config.guild(guild).panel_enabled()
+        if not channel_ids:
+            await ctx.send(
+                "No panel channels are set. Use `autovcset panel add <channel>` to add one."
+            )
+            return
+        lines = [
+            f"Panel is **{'enabled' if enabled else 'disabled'}**.",
+            "",
+            "**Panel channels:**",
+        ]
+        for cid in channel_ids:
+            ch = guild.get_channel(cid)
+            if ch:
+                lines.append(f"- {ch.mention}")
+            else:
+                lines.append(f"- Channel ID `{cid}` (not found)")
+        await ctx.send("\n".join(lines))
+
+    @_autovcset.command(name="memberrole")
     @commands.admin_or_permissions(manage_guild=True)
     async def _set_member_role(
         self, ctx: commands.Context, role: Optional[discord.Role] = None
@@ -257,7 +579,7 @@ class AutoVC(commands.Cog):
         """Set the @Member role for permission handling.
         
         Use without a role to clear and use @everyone instead.
-        Example: [p]autovc memberrole @Member
+        Example: [p]autovcset memberrole @Member
         """
         guild = ctx.guild
 
@@ -270,6 +592,199 @@ class AutoVC(commands.Cog):
             await self.config.guild(guild).member_role_id.set(role.id)
             await ctx.send(
                 f"Member role set to {role.mention}. This role will be used for base permissions."
+            )
+
+    @commands.hybrid_group(name="autovc", aliases=["avc"])
+    @commands.guild_only()
+    async def _autovc(self, ctx: commands.Context):
+        """AutoVC user commands: lock, unlock, hide, show, limit, name, claim."""
+        pass
+
+    async def _vc_lock(
+        self, ctx: commands.Context, vc: Optional[discord.VoiceChannel] = None
+    ):
+        """Lock your VC so others cannot connect."""
+        vc, vc_data, err = await self._get_owned_vc_for_member(
+            ctx.guild, ctx.author, vc
+        )
+        if err:
+            await self._ctx_send(ctx, err, ephemeral=True)
+            return
+        member_role_id = await self.config.guild(ctx.guild).member_role_id()
+        base_role = (
+            ctx.guild.get_role(member_role_id)
+            if member_role_id
+            else ctx.guild.default_role
+        )
+        overwrite = vc.overwrites_for(base_role)
+        overwrite.connect = False
+        await vc.set_permissions(base_role, overwrite=overwrite)
+        await self._ctx_send(ctx, f"{vc.mention} is now locked.", ephemeral=True)
+
+    async def _vc_unlock(
+        self, ctx: commands.Context, vc: Optional[discord.VoiceChannel] = None
+    ):
+        """Unlock your VC so others can connect."""
+        vc, vc_data, err = await self._get_owned_vc_for_member(
+            ctx.guild, ctx.author, vc
+        )
+        if err:
+            await self._ctx_send(ctx, err, ephemeral=True)
+            return
+        member_role_id = await self.config.guild(ctx.guild).member_role_id()
+        base_role = (
+            ctx.guild.get_role(member_role_id)
+            if member_role_id
+            else ctx.guild.default_role
+        )
+        overwrite = vc.overwrites_for(base_role)
+        overwrite.connect = True
+        await vc.set_permissions(base_role, overwrite=overwrite)
+        await self._ctx_send(ctx, f"{vc.mention} is now unlocked.", ephemeral=True)
+
+    async def _vc_hide(
+        self, ctx: commands.Context, vc: Optional[discord.VoiceChannel] = None
+    ):
+        """Hide your VC from the channel list."""
+        vc, vc_data, err = await self._get_owned_vc_for_member(
+            ctx.guild, ctx.author, vc
+        )
+        if err:
+            await self._ctx_send(ctx, err, ephemeral=True)
+            return
+        member_role_id = await self.config.guild(ctx.guild).member_role_id()
+        roles_to_update = [ctx.guild.default_role]
+        if member_role_id:
+            r = ctx.guild.get_role(member_role_id)
+            if r:
+                roles_to_update.append(r)
+        for role in roles_to_update:
+            overwrite = vc.overwrites_for(role)
+            overwrite.view_channel = False
+            await vc.set_permissions(role, overwrite=overwrite)
+        await self._ctx_send(ctx, f"{vc.mention} is now hidden.", ephemeral=True)
+
+    async def _vc_show(
+        self, ctx: commands.Context, vc: Optional[discord.VoiceChannel] = None
+    ):
+        """Show your VC in the channel list."""
+        vc, vc_data, err = await self._get_owned_vc_for_member(
+            ctx.guild, ctx.author, vc
+        )
+        if err:
+            await self._ctx_send(ctx, err, ephemeral=True)
+            return
+        member_role_id = await self.config.guild(ctx.guild).member_role_id()
+        roles_to_update = [ctx.guild.default_role]
+        if member_role_id:
+            r = ctx.guild.get_role(member_role_id)
+            if r:
+                roles_to_update.append(r)
+        for role in roles_to_update:
+            overwrite = vc.overwrites_for(role)
+            overwrite.view_channel = True
+            await vc.set_permissions(role, overwrite=overwrite)
+        await self._ctx_send(ctx, f"{vc.mention} is now visible.", ephemeral=True)
+
+    async def _vc_limit(
+        self,
+        ctx: commands.Context,
+        limit: int,
+        vc: Optional[discord.VoiceChannel] = None,
+    ):
+        """Set the user limit for your VC (0 = no limit)."""
+        if limit < 0 or limit > 99:
+            await self._ctx_send(
+                ctx, "Limit must be between 0 and 99 (0 = no limit).", ephemeral=True
+            )
+            return
+        vc, vc_data, err = await self._get_owned_vc_for_member(
+            ctx.guild, ctx.author, vc
+        )
+        if err:
+            await self._ctx_send(ctx, err, ephemeral=True)
+            return
+        await vc.edit(user_limit=limit)
+        msg = "User limit removed." if limit == 0 else f"User limit set to {limit}."
+        await self._ctx_send(ctx, msg, ephemeral=True)
+
+    @_autovc.command(name="lock")
+    @commands.guild_only()
+    async def _autovc_lock(
+        self, ctx: commands.Context, vc: Optional[discord.VoiceChannel] = None
+    ):
+        """Lock your VC so others cannot connect."""
+        await self._vc_lock(ctx, vc)
+
+    @_autovc.command(name="unlock")
+    @commands.guild_only()
+    async def _autovc_unlock(
+        self, ctx: commands.Context, vc: Optional[discord.VoiceChannel] = None
+    ):
+        """Unlock your VC so others can connect."""
+        await self._vc_unlock(ctx, vc)
+
+    @_autovc.command(name="hide")
+    @commands.guild_only()
+    async def _autovc_hide(
+        self, ctx: commands.Context, vc: Optional[discord.VoiceChannel] = None
+    ):
+        """Hide your VC from the channel list."""
+        await self._vc_hide(ctx, vc)
+
+    @_autovc.command(name="show")
+    @commands.guild_only()
+    async def _autovc_show(
+        self, ctx: commands.Context, vc: Optional[discord.VoiceChannel] = None
+    ):
+        """Show your VC in the channel list."""
+        await self._vc_show(ctx, vc)
+
+    @_autovc.command(name="limit")
+    @commands.guild_only()
+    async def _autovc_limit(
+        self,
+        ctx: commands.Context,
+        limit: int,
+        vc: Optional[discord.VoiceChannel] = None,
+    ):
+        """Set the user limit for your VC (0 = no limit)."""
+        await self._vc_limit(ctx, limit, vc)
+
+    @_autovc.command(name="name")
+    @commands.guild_only()
+    async def _autovc_name(
+        self,
+        ctx: commands.Context,
+        new_name: Optional[str] = None,
+        vc: Optional[discord.VoiceChannel] = None,
+    ):
+        """Rename your VC. Leave name blank to reset to default (e.g. YourName's VC)."""
+        vc_resolved, vc_data, err = await self._get_owned_vc_for_member(
+            ctx.guild, ctx.author, vc
+        )
+        if err:
+            await self._ctx_send(ctx, err, ephemeral=True)
+            return
+        assert vc_resolved is not None
+        if not new_name or not new_name.strip():
+            username = ctx.author.display_name[:20]
+            name_to_set = f"{username}'s VC"
+        else:
+            name_to_set = new_name.strip()[:100]
+        try:
+            await vc_resolved.edit(name=name_to_set)
+            await self._ctx_send(
+                ctx,
+                f"VC renamed to **{discord.utils.escape_markdown(name_to_set)}**.",
+                ephemeral=True,
+            )
+        except discord.HTTPException as e:
+            log.warning(f"autovc name failed: {e}")
+            await self._ctx_send(
+                ctx,
+                "Failed to rename the VC. Check bot permissions.",
+                ephemeral=True,
             )
 
     @_autovc.command(name="claim")
@@ -289,8 +804,10 @@ class AutoVC(commands.Cog):
             if member.voice and member.voice.channel:
                 vc = member.voice.channel
             else:
-                await ctx.send(
-                    "You must be in a voice channel or specify one to claim."
+                await self._ctx_send(
+                    ctx,
+                    "You must be in a voice channel or specify one to claim.",
+                    ephemeral=True,
                 )
                 return
 
@@ -299,7 +816,7 @@ class AutoVC(commands.Cog):
         vc_data = created_vcs.get(str(vc.id))
 
         if not vc_data:
-            await ctx.send("This VC is not managed by AutoVC.")
+            await self._ctx_send(ctx, "This VC is not managed by AutoVC.", ephemeral=True)
             return
 
         # Check if VC is claimable
@@ -311,13 +828,17 @@ class AutoVC(commands.Cog):
             if owner_id:
                 owner = guild.get_member(owner_id)
                 if owner and owner.voice and owner.voice.channel == vc:
-                    await ctx.send(
-                        "This VC already has an owner who is still in the channel."
+                    await self._ctx_send(
+                        ctx,
+                        "This VC already has an owner who is still in the channel.",
+                        ephemeral=True,
                     )
                     return
-            await ctx.send(
+            await self._ctx_send(
+                ctx,
                 "This VC is not available for claiming. The owner may still be present, "
-                "or the 5-minute waiting period hasn't passed yet."
+                "or the 5-minute waiting period hasn't passed yet.",
+                ephemeral=True,
             )
             return
 
@@ -328,8 +849,10 @@ class AutoVC(commands.Cog):
 
         if time_passed < 300:  # 5 minutes
             remaining = int(300 - time_passed)
-            await ctx.send(
-                f"You must wait {remaining} more seconds before claiming this VC."
+            await self._ctx_send(
+                ctx,
+                f"You must wait {remaining} more seconds before claiming this VC.",
+                ephemeral=True,
             )
             return
 
@@ -340,9 +863,188 @@ class AutoVC(commands.Cog):
         del claimable_vcs[str(vc.id)]
         await self.config.guild(guild).claimable_vcs.set(claimable_vcs)
 
-        await ctx.send(
-            f"You have successfully claimed ownership of {vc.mention}!"
+        await self._ctx_send(
+            ctx,
+            f"You have successfully claimed ownership of {vc.mention}!",
+            ephemeral=True,
         )
+
+    async def _get_owned_vc_for_member(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        vc: Optional[discord.VoiceChannel] = None,
+    ) -> Tuple[Optional[discord.VoiceChannel], Optional[dict], Optional[str]]:
+        """Resolve VC from optional channel or member's current channel. Check ownership.
+        Returns (vc, vc_data, error_message). If error_message is set, vc and vc_data are None.
+        """
+        if vc is None:
+            vc = member.voice.channel if member.voice else None
+        if not vc:
+            return (None, None, "You must be in a voice channel or specify one.")
+        created_vcs = await self.config.guild(guild).created_vcs()
+        vc_data = created_vcs.get(str(vc.id))
+        if not vc_data:
+            return (None, None, "This VC is not managed by AutoVC.")
+        if vc_data.get("owner_id") != member.id:
+            return (None, None, "You are not the owner of this VC.")
+        if vc_data.get("type") not in ("personal", "private"):
+            return (None, None, "This VC has no owner.")
+        return (vc, vc_data, None)
+
+    async def _panel_action(
+        self, interaction: discord.Interaction, action: str
+    ) -> None:
+        """Handle panel button click: lock, unlock, hide, show."""
+        if not interaction.guild:
+            return
+        await interaction.response.defer(ephemeral=True)
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.followup.send(
+                "Could not resolve your membership.", ephemeral=True
+            )
+            return
+        vc = member.voice.channel if member.voice else None
+        vc, vc_data, err = await self._get_owned_vc_for_member(
+            interaction.guild, member, vc
+        )
+        if err:
+            await interaction.followup.send(err, ephemeral=True)
+            return
+        assert vc is not None and vc_data is not None
+        member_role_id = await self.config.guild(interaction.guild).member_role_id()
+        base_role = (
+            interaction.guild.get_role(member_role_id)
+            if member_role_id
+            else interaction.guild.default_role
+        )
+        try:
+            if action == "lock":
+                overwrite = vc.overwrites_for(base_role)
+                overwrite.connect = False
+                await vc.set_permissions(base_role, overwrite=overwrite)
+                await interaction.followup.send(
+                    f"{vc.mention} is now locked.", ephemeral=True
+                )
+            elif action == "unlock":
+                overwrite = vc.overwrites_for(base_role)
+                overwrite.connect = True
+                await vc.set_permissions(base_role, overwrite=overwrite)
+                await interaction.followup.send(
+                    f"{vc.mention} is now unlocked.", ephemeral=True
+                )
+            elif action == "hide":
+                roles_to_update = [interaction.guild.default_role]
+                if member_role_id:
+                    r = interaction.guild.get_role(member_role_id)
+                    if r:
+                        roles_to_update.append(r)
+                for role in roles_to_update:
+                    overwrite = vc.overwrites_for(role)
+                    overwrite.view_channel = False
+                    await vc.set_permissions(role, overwrite=overwrite)
+                await interaction.followup.send(
+                    f"{vc.mention} is now hidden.", ephemeral=True
+                )
+            elif action == "show":
+                roles_to_update = [interaction.guild.default_role]
+                if member_role_id:
+                    r = interaction.guild.get_role(member_role_id)
+                    if r:
+                        roles_to_update.append(r)
+                for role in roles_to_update:
+                    overwrite = vc.overwrites_for(role)
+                    overwrite.view_channel = True
+                    await vc.set_permissions(role, overwrite=overwrite)
+                await interaction.followup.send(
+                    f"{vc.mention} is now visible.", ephemeral=True
+                )
+        except discord.HTTPException as e:
+            log.warning(f"Panel action {action} failed: {e}")
+            await interaction.followup.send(
+                "Failed to update the channel. Check bot permissions.",
+                ephemeral=True,
+            )
+
+    async def _panel_set_limit(
+        self, interaction: discord.Interaction, limit: int
+    ) -> None:
+        """Handle panel modal submit for user limit."""
+        if not interaction.guild:
+            return
+        await interaction.response.defer(ephemeral=True)
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.followup.send(
+                "Could not resolve your membership.", ephemeral=True
+            )
+            return
+        vc = member.voice.channel if member.voice else None
+        vc, vc_data, err = await self._get_owned_vc_for_member(
+            interaction.guild, member, vc
+        )
+        if err:
+            await interaction.followup.send(err, ephemeral=True)
+            return
+        assert vc is not None
+        try:
+            await vc.edit(user_limit=limit)
+            msg = (
+                "User limit removed."
+                if limit == 0
+                else f"User limit set to {limit}."
+            )
+            await interaction.followup.send(msg, ephemeral=True)
+        except discord.HTTPException as e:
+            log.warning(f"Panel set limit failed: {e}")
+            await interaction.followup.send(
+                "Failed to set user limit. Check bot permissions.",
+                ephemeral=True,
+            )
+
+    async def _panel_rename_vc(
+        self, interaction: discord.Interaction, name: Optional[str]
+    ) -> None:
+        """Handle panel modal submit for VC rename."""
+        if not interaction.guild:
+            return
+        await interaction.response.defer(ephemeral=True)
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.followup.send(
+                "Could not resolve your membership.", ephemeral=True
+            )
+            return
+        vc = member.voice.channel if member.voice else None
+        vc, vc_data, err = await self._get_owned_vc_for_member(
+            interaction.guild, member, vc
+        )
+        if err:
+            await interaction.followup.send(err, ephemeral=True)
+            return
+        assert vc is not None
+        if name is None:
+            # Match initial VC naming behavior
+            username = member.display_name[:20]
+            new_name = f"{username}'s VC"
+        else:
+            new_name = name.strip()[:100]
+            if not new_name:
+                username = member.display_name[:20]
+                new_name = f"{username}'s VC"
+        try:
+            await vc.edit(name=new_name)
+            await interaction.followup.send(
+                f"VC renamed to **{discord.utils.escape_markdown(new_name)}**.",
+                ephemeral=True,
+            )
+        except discord.HTTPException as e:
+            log.warning(f"Panel rename VC failed: {e}")
+            await interaction.followup.send(
+                "Failed to rename the VC. Check bot permissions.",
+                ephemeral=True,
+            )
 
     async def _transfer_ownership(
         self,
@@ -351,11 +1053,10 @@ class AutoVC(commands.Cog):
         new_owner: discord.Member,
         vc_data: dict,
     ):
-        """Transfer ownership of a VC to a new owner."""
+        """Transfer ownership of a VC to a new owner. No new role is created."""
         old_role_id = vc_data.get("role_id")
-        vc_type = vc_data.get("type")
 
-        # Delete old owner role if it exists
+        # Delete old owner role if it exists (migrate existing VCs off roles)
         if old_role_id:
             old_role = guild.get_role(old_role_id)
             if old_role:
@@ -364,17 +1065,12 @@ class AutoVC(commands.Cog):
                 except discord.HTTPException:
                     log.warning(f"Failed to delete old owner role {old_role_id}")
 
-        # Create new owner role
-        if vc_type in ["personal", "private"]:
-            role = await self._create_owner_role(guild, new_owner, vc)
-            if role:
-                vc_data["role_id"] = role.id
-                vc_data["owner_id"] = new_owner.id
+        vc_data["owner_id"] = new_owner.id
+        vc_data["role_id"] = None
 
-                # Update config
-                created_vcs = await self.config.guild(guild).created_vcs()
-                created_vcs[str(vc.id)] = vc_data
-                await self.config.guild(guild).created_vcs.set(created_vcs)
+        created_vcs = await self.config.guild(guild).created_vcs()
+        created_vcs[str(vc.id)] = vc_data
+        await self.config.guild(guild).created_vcs.set(created_vcs)
 
     async def _create_owner_role(
         self, guild: discord.Guild, owner: discord.Member, vc: discord.VoiceChannel
@@ -475,17 +1171,14 @@ class AutoVC(commands.Cog):
                 reason=f"AutoVC: {vc_type} VC for {member.display_name}",
             )
 
-            # Create owner role for personal/private VCs
-            owner_role = None
-            if vc_type in ["personal", "private"]:
-                owner_role = await self._create_owner_role(guild, member, vc)
+            # No owner role: control is via bot commands and panel only (avoids 2FA-for-mods)
 
             # Track the VC
             created_vcs = await self.config.guild(guild).created_vcs()
             created_vcs[str(vc.id)] = {
                 "source_vc_id": source_vc.id,
                 "owner_id": member.id if vc_type in ["personal", "private"] else None,
-                "role_id": owner_role.id if owner_role else None,
+                "role_id": None,
                 "type": vc_type,
                 "created_at": datetime.utcnow().isoformat(),
             }
