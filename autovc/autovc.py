@@ -240,17 +240,8 @@ class AutoVC(commands.Cog):
     async def cog_load(self):
         """Called when the cog is loaded."""
         self.cleanup_task = self.bot.loop.create_task(self.cleanup_loop())
-        # Re-add panel views for persistence across restarts
-        for guild in self.bot.guilds:
-            try:
-                ids = await self.config.guild(guild).panel_message_ids()
-                for cid_str, mid in ids.items():
-                    try:
-                        self.bot.add_view(VCPanelView(self), message_id=int(mid))
-                    except (ValueError, TypeError):
-                        pass
-            except Exception as e:
-                log.debug(f"AutoVC panel view restore for {guild.id}: {e}")
+        # Register one global persistent view so panel buttons work after cog reload / bot restart
+        self.bot.add_view(VCPanelView(self))
 
     async def cog_unload(self):
         """Called when the cog is unloaded."""
