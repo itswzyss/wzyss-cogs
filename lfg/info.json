@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing LFG. Use `[p]help lfg` for commands. Users can set availability per game, see who's available, request games, and opt in to DM notifications when someone notifies for a game.",
+    "name": "LFG",
+    "short": "Looking for Group: register availability per game, see who's available, notify via DM, request games.",
+    "description": "Guild-scoped LFG: masterlist of games, per-user available/unavailable per game, view who is available, notify (DM) opted-in users, and request new games for admin approval.",
+    "tags": ["utility", "games", "lfg"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
