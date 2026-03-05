@@ -237,15 +237,25 @@ This will delete old welcome messages and send a fresh one with working buttons.
 [p]applications settings
 ```
 
+#### Preview application form
+
+Open the application form as applicants see it (the real modal). Submitting does not save anything:
+
+```
+[p]applications preview
+```
+
+A button is sent; clicking it opens the form. Use this to verify labels, placeholders, and field order.
+
 #### Manual cleanup
 
-Manually trigger cleanup of expired application channels:
+Manually trigger cleanup of expired application channels and orphaned entries:
 
 ```
 [p]applications cleanup
 ```
 
-This will immediately delete any channels that have passed their cleanup time.
+This will immediately delete any channels that have passed their cleanup time and remove application entries whose channel is missing or already deleted.
 
 #### View Applications
 
@@ -283,6 +293,24 @@ Close/delete an application channel:
 [p]applications close @user
 ```
 
+If run in an application channel without specifying a user, it closes the current channel.
+
+To remove an application when the member has left or the channel is gone, use either:
+
+- **Clear all orphaned entries** (no channel or channel deleted):
+
+```
+[p]applications clearorphaned
+```
+
+- **Remove one application by user ID**:
+
+```
+[p]applications removeuser <user_id>
+```
+
+Example: `[p]applications removeuser 123456789012345678`
+
 ## Permissions Required
 
 The bot needs the following permissions:
@@ -311,6 +339,7 @@ Application channels are automatically deleted after approval or denial:
 - Cleanup runs automatically every hour
 - Channels scheduled for cleanup are tracked until deletion
 - Manual cleanup can be triggered at any time
+- Orphaned entries (no channel or channel already deleted) are removed during each cleanup run and when you run `[p]applications cleanup`
 
 ## Important Notes
 
@@ -343,7 +372,8 @@ Application data is retained until:
 - The user leaves the server (automatic cleanup)
 - An admin manually closes the application channel
 - The channel is automatically deleted after cleanup delay
-- The application is deleted via commands
+- An admin runs `[p]applications close`, `[p]applications removeuser`, or `[p]applications clearorphaned`
+- The hourly cleanup or manual cleanup removes orphaned entries (missing or deleted channel)
 
 ## Troubleshooting
 
@@ -371,6 +401,15 @@ Application data is retained until:
 1. Ensure you have "Manage Guild" permission
 2. Check if the application exists: `[p]applications view @user`
 3. Verify the application status is "pending"
+
+### Stuck or orphaned applications (no channel, cannot close)
+
+If you have a pending application that cannot be closed (channel was deleted, or no channel is associated):
+
+1. **Remove all such entries in one go:** `[p]applications clearorphaned`
+2. **Remove one by user ID:** `[p]applications removeuser <user_id>` (use the Discord user ID of the applicant)
+
+The hourly cleanup and `[p]applications cleanup` also remove orphaned entries automatically.
 
 ## Support
 
