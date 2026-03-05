@@ -3086,6 +3086,62 @@ class Applications(commands.Cog):
         del applications[str(member.id)]
         await self.config.guild(ctx.guild).applications.set(applications)
 
+    @_applications.command(name="clearorphaned")
+    async def _clear_orphaned(self, ctx: commands.Context):
+        """Remove application entries whose channel is missing or deleted.
+        
+        Use this when you have pending applications that cannot be closed normally
+        (e.g. the channel was deleted or the application is stuck with no channel).
+        """
+        applications = await self.config.guild(ctx.guild).applications()
+        to_remove = []
+        for user_id, app_data in applications.items():
+            channel_id = app_data.get("channel_id")
+            if not channel_id:
+                to_remove.append(user_id)
+                continue
+            channel = ctx.guild.get_channel(channel_id)
+            if channel is None:
+                to_remove.append(user_id)
+
+        if not to_remove:
+            await ctx.send("No orphaned application entries found.")
+            return
+
+        async with self.config.guild(ctx.guild).applications() as apps:
+            for user_id in to_remove:
+                if user_id in apps:
+                    del apps[user_id]
+
+        await ctx.send(f"Removed {len(to_remove)} orphaned application entry(ies): user IDs `{', '.join(to_remove)}`.")
+
+    @_applications.command(name="removeuser")
+    async def _remove_user(self, ctx: commands.Context, user_id: int):
+        """Remove an application by user ID (e.g. when the member left or the channel is gone).
+        
+        Use when you cannot use `applications close @member` because the member is no longer
+        in the server or the application channel no longer exists.
+        """
+        applications = await self.config.guild(ctx.guild).applications()
+        user_id_str = str(user_id)
+        if user_id_str not in applications:
+            await ctx.send(f"No application found for user ID `{user_id}`.")
+            return
+
+        app_data = applications[user_id_str]
+        channel_id = app_data.get("channel_id")
+        if channel_id:
+            channel = ctx.guild.get_channel(channel_id)
+            if channel:
+                try:
+                    await channel.delete(reason=f"Application removed by {ctx.author.display_name}")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass  # Channel may already be gone or no permission
+
+        del applications[user_id_str]
+        await self.config.guild(ctx.guild).applications.set(applications)
+        await ctx.send(f"Removed application record for user ID `{user_id}`.")
+
     async def cleanup_loop(self):
         """Background task to periodically clean up expired application channels."""
         await self.bot.wait_until_ready()
@@ -3106,7 +3162,18 @@ class Applications(commands.Cog):
                         current_time = datetime.utcnow()
 
                         to_remove = []
+                        # Orphaned entries: no channel or channel was deleted
                         for user_id, app_data in applications.items():
+                            channel_id = app_data.get("channel_id")
+                            if not channel_id:
+                                to_remove.append(user_id)
+                                continue
+                            if guild.get_channel(channel_id) is None:
+                                to_remove.append(user_id)
+
+                        for user_id, app_data in applications.items():
+                            if user_id in to_remove:
+                                continue
                             cleanup_time_str = app_data.get("cleanup_scheduled_at")
                             if not cleanup_time_str:
                                 continue
@@ -3192,7 +3259,15 @@ class Applications(commands.Cog):
         cleaned = 0
 
         to_remove = []
+        # Orphaned entries: no channel or channel was deleted
         for user_id, app_data in applications.items():
+            channel_id = app_data.get("channel_id")
+            if not channel_id or guild.get_channel(channel_id) is None:
+                to_remove.append(user_id)
+
+        for user_id, app_data in applications.items():
+            if user_id in to_remove:
+                continue
             cleanup_time_str = app_data.get("cleanup_scheduled_at")
             if not cleanup_time_str:
                 continue
