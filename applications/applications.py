@@ -18,10 +18,11 @@ MAX_FORM_FIELDS = 5
 class ApplicationModal(Modal):
     """Dynamic modal for application forms."""
 
-    def __init__(self, cog: "Applications", form_fields: List[Dict]):
-        super().__init__(title="Server Application")
+    def __init__(self, cog: "Applications", form_fields: List[Dict], preview: bool = False):
+        super().__init__(title="Server Application" + (" (Preview)" if preview else ""))
         self.cog = cog
         self.form_fields = form_fields
+        self.preview = preview
         self.inputs = {}
 
         # Create text inputs for each field
@@ -118,6 +119,13 @@ class ApplicationModal(Modal):
             await interaction.response.send_message(error_msg, ephemeral=True)
             return
 
+        if self.preview:
+            await interaction.response.send_message(
+                "This was a preview. No application was submitted.",
+                ephemeral=True,
+            )
+            return
+
         # Store responses
         await self.cog.submit_application(interaction.user, interaction.channel, responses)
 
@@ -148,6 +156,35 @@ class ApplicationButton(Button):
         await interaction.response.send_modal(modal)
 
 
+class PreviewFormButton(Button):
+    """Button to open the application form in preview mode (submit does nothing)."""
+
+    def __init__(self, cog: "Applications"):
+        super().__init__(label="Open form preview", style=discord.ButtonStyle.secondary)
+        self.cog = cog
+
+    async def callback(self, interaction: discord.Interaction):
+        """Open the application modal in preview mode."""
+        form_fields = await self.cog.config.guild(interaction.guild).form_fields()
+        if not form_fields:
+            await interaction.response.send_message(
+                "No application form has been configured.",
+                ephemeral=True,
+            )
+            return
+
+        modal = ApplicationModal(self.cog, form_fields, preview=True)
+        await interaction.response.send_modal(modal)
+
+
+class PreviewFormView(View):
+    """View containing a single button to open the form preview modal."""
+
+    def __init__(self, cog: "Applications"):
+        super().__init__(timeout=120)
+        self.add_item(PreviewFormButton(cog))
+
+
 class DenyModal(Modal):
     """Modal for admins to provide a denial reason."""
 
@@ -175,7 +212,7 @@ class ApproveButton(Button):
     """Button to approve an application."""
 
     def __init__(self, cog: "Applications", member: discord.Member):
-        super().__init__(label="Approve", style=discord.ButtonStyle.success, emoji="✅")
+        super().__init__(label="Approve", style=discord.ButtonStyle.success)
         self.cog = cog
         self.member = member
 
@@ -211,7 +248,7 @@ class DenyButton(Button):
     """Button to deny an application."""
 
     def __init__(self, cog: "Applications", member: discord.Member):
-        super().__init__(label="Deny", style=discord.ButtonStyle.danger, emoji="❌")
+        super().__init__(label="Deny", style=discord.ButtonStyle.danger)
         self.cog = cog
         self.member = member
 
@@ -2451,6 +2488,23 @@ class Applications(commands.Cog):
         )
 
         await ctx.send(embed=embed)
+
+    @_applications.command(name="preview")
+    async def _preview(self, ctx: commands.Context):
+        """Preview the current server application form (opens the real form; submitting does nothing)."""
+        fields = await self.config.guild(ctx.guild).form_fields()
+        if not fields:
+            await ctx.send(
+                "No application form configured. Add fields with `{0}applications field add` or use the field manager: `{0}applications field manager`.".format(
+                    ctx.clean_prefix
+                )
+            )
+            return
+
+        await ctx.send(
+            "Click the button below to open the application form as applicants see it. Submitting the form will not save anything.",
+            view=PreviewFormView(self),
+        )
 
     @_applications.command(name="approve", aliases=["a"])
     async def _approve(self, ctx: commands.Context, member: Optional[discord.Member] = None):
