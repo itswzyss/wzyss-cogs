@@ -18,7 +18,6 @@ Full documentation for each cog in the Wzyss-Cogs repository for Red-DiscordBot.
 | [LinkReplacer](linkreplacer.md) | Replace links with configured alternatives. |
 | [MassRole](massrole.md) | Assign roles to all members of a role or everyone on the server. |
 | [Remindme](remindme.md) | Set timers and get pinged or DMed when they complete. |
-| [RockstarNewswire](rockstarnewswire.md) | Track and post Rockstar Games newswire updates. |
 | [SelfRoles](selfroles.md) | Interactive builder for self-assignable roles with buttons, reactions, and commands. |
 | [TextReplace](textreplace.md) | Replace text using Regex. |
 | [Tickets](tickets.md) | Button-based support tickets with embeds and management controls. |
