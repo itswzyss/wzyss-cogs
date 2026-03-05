@@ -168,6 +168,15 @@ Replace text using Regex. Automatically replaces text using Regex. This cog can 
 
 ---
 
+### Tickets
+**Install:** `[p]cog install wzyss-cogs tickets`
+
+Button-based support tickets. Configure a channel with a customizable embed and "Create ticket" button; users open tickets by clicking. Each ticket gets a dedicated channel with manager buttons (claim, close), optional auto-assign and inactivity auto-close, and transcript logging. No user-facing commands.
+
+**Tags:** tickets, support, utility, moderation
+
+---
+
 ## Documentation
 
 Full documentation for each cog is in the [docs](docs/) folder. See [docs/README.md](docs/README.md) for an index of all cogs.
