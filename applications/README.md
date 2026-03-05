@@ -115,7 +115,7 @@ To remove a bypass role:
 
 ### 4. Customize the Application Form
 
-The cog comes with default form fields, but you can customize them:
+The cog comes with default form fields, but you can customize them. **Forms may contain at most 5 fields** (Discord modal limit).
 
 #### Interactive Field Manager (Recommended)
 
@@ -148,37 +148,22 @@ This opens an interactive interface where you can:
 #### Add a new field
 
 ```
-[p]applications field add <name> <label> <type> [required] [options_or_confirm_text]
+[p]applications field add <name> <label> <type> [required] [confirm_text_or_placeholder] [placeholder]
 
-Types: text (short), paragraph (long), number, select (multiple choice), confirm (text confirmation)
+Types: text (short), paragraph (long), number, confirm (text confirmation)
 ```
 
-For select fields, provide options separated by commas.
-For confirm fields, provide the exact text users must type.
+For confirm fields, the 5th argument is the exact text users must type (optional 6th is placeholder).
+For other types, the 5th argument can be placeholder text shown inside the field.
 
 Examples:
 
 ```
 [p]applications field add age "What is your age?" text True
+[p]applications field add age "What is your age?" text True "e.g. 25"
 [p]applications field add experience "Tell us about your experience" paragraph True
 [p]applications field add discord "How long have you used Discord?" number False
-[p]applications field add agreement "Do you agree to the rules?" select True "Yes,No"
-[p]applications field add experience_level "Experience Level" select True "Beginner,Intermediate,Advanced,Expert"
 [p]applications field add rules_confirm "I agree to the server rules" confirm True "I agree"
-```
-
-#### Set options for a select field
-
-```
-[p]applications field options <name> <options>
-
-Options should be separated by commas.
-```
-
-Example:
-
-```
-[p]applications field options agreement "Yes,No,Maybe"
 ```
 
 #### Set confirmation text for a confirm field

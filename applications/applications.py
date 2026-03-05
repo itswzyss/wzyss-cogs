@@ -11,6 +11,9 @@ from redbot.core.utils.chat_formatting import box
 
 log = logging.getLogger("red.wzyss-cogs.applications")
 
+# Discord modals support at most 5 TextInput components per modal.
+MAX_FORM_FIELDS = 5
+
 
 class ApplicationModal(Modal):
     """Dynamic modal for application forms."""
@@ -37,14 +40,6 @@ class ApplicationModal(Modal):
             if label_full and len(label_full) > 45 and not placeholder:
                 placeholder = label_full
 
-            # For select fields, build placeholder from options
-            if field_type == "select":
-                options = field.get("options", [])
-                if options and not placeholder:
-                    placeholder = f"Options: {', '.join(options)}"
-                elif not placeholder:
-                    placeholder = "Enter one of the options"
-            
             # For confirm fields, build placeholder from required text
             if field_type == "confirm":
                 confirm_text = field.get("confirm_text", "")
@@ -72,7 +67,7 @@ class ApplicationModal(Modal):
                     style=discord.TextStyle.short,
                     max_length=20,
                 )
-            else:  # text (short) or select
+            else:  # text (short)
                 text_input = TextInput(
                     label=label,
                     placeholder=placeholder[:100] if placeholder else None,
@@ -100,27 +95,6 @@ class ApplicationModal(Modal):
                 continue
 
             value = text_input.value.strip() if text_input.value else ""
-
-            # Validate select fields
-            if field_type == "select":
-                options = field.get("options", [])
-                if options:
-                    # Case-insensitive comparison
-                    value_lower = value.lower()
-                    matched_option = None
-                    for option in options:
-                        if option.lower() == value_lower:
-                            matched_option = option
-                            break
-
-                    if not matched_option:
-                        validation_errors.append(
-                            f"**{field_label}**: Must be one of: {', '.join(options)}"
-                        )
-                        continue
-                    else:
-                        # Use the original option value (preserve case)
-                        value = matched_option
 
             # Validate confirm fields
             if field_type == "confirm":
@@ -302,7 +276,7 @@ class FieldAddModal(Modal):
         )
         self.type_input = TextInput(
             label="Field Type",
-            placeholder="text, paragraph, number, select, or confirm",
+            placeholder="text, paragraph, number, or confirm",
             required=True,
             max_length=20,
         )
@@ -314,8 +288,8 @@ class FieldAddModal(Modal):
             default="true",
         )
         self.extra_input = TextInput(
-            label="Options (select) or Confirm Text (confirm)",
-            placeholder="For select: Option1,Option2,Option3 | For confirm: I agree",
+            label="Placeholder or Confirm text",
+            placeholder="Confirm: exact text | Others: hint text",
             required=False,
             max_length=500,
         )
@@ -333,11 +307,12 @@ class FieldAddModal(Modal):
         field_type = self.type_input.value.strip().lower()
         required_str = self.required_input.value.strip().lower()
         extra = self.extra_input.value.strip() if self.extra_input.value else None
+        placeholder = (extra or "").strip()[:100] if field_type != "confirm" else ""
 
         # Validate field type
-        if field_type not in ["text", "paragraph", "number", "select", "confirm"]:
+        if field_type not in ["text", "paragraph", "number", "confirm"]:
             await interaction.response.send_message(
-                "❌ Invalid field type. Use `text`, `paragraph`, `number`, `select`, or `confirm`.",
+                "❌ Invalid field type. Use `text`, `paragraph`, `number`, or `confirm`.",
                 ephemeral=True,
             )
             return
@@ -351,22 +326,6 @@ class FieldAddModal(Modal):
             )
             return
 
-        # Validate select fields
-        if field_type == "select":
-            if not extra:
-                await interaction.response.send_message(
-                    "❌ Select fields require options. Provide them separated by commas.",
-                    ephemeral=True,
-                )
-                return
-            options_list = [opt.strip() for opt in extra.split(",") if opt.strip()]
-            if len(options_list) < 2:
-                await interaction.response.send_message(
-                    "❌ Select fields require at least 2 options.",
-                    ephemeral=True,
-                )
-                return
-
         # Validate confirm fields
         if field_type == "confirm":
             if not extra:
@@ -378,6 +337,12 @@ class FieldAddModal(Modal):
 
         # Add field
         async with self.cog.config.guild(interaction.guild).form_fields() as fields:
+            if len(fields) >= MAX_FORM_FIELDS:
+                await interaction.response.send_message(
+                    f"Forms may contain at most {MAX_FORM_FIELDS} fields (Discord limit).",
+                    ephemeral=True,
+                )
+                return
             # Check if field name already exists
             if any(f.get("name") == name for f in fields):
                 await interaction.response.send_message(
@@ -391,24 +356,17 @@ class FieldAddModal(Modal):
                 "label": label,
                 "type": field_type,
                 "required": required,
-                "placeholder": "",
+                "placeholder": placeholder,
             }
 
-            if field_type == "select":
-                field_data["options"] = [opt.strip() for opt in extra.split(",") if opt.strip()]
-            elif field_type == "confirm":
+            if field_type == "confirm":
                 field_data["confirm_text"] = extra.strip()
 
             fields.append(field_data)
 
-        options_text = ""
-        if field_type == "select":
-            options_text = f" with options: {extra}"
-        elif field_type == "confirm":
-            options_text = f" requiring confirmation: `{extra}`"
-
+        confirm_text = f" requiring confirmation: `{extra}`" if field_type == "confirm" else ""
         await interaction.response.send_message(
-            f"✅ Added field `{name}` ({field_type}){options_text} to the application form.",
+            f"✅ Added field `{name}` ({field_type}){confirm_text} to the application form.",
             ephemeral=True,
         )
 
@@ -442,7 +400,7 @@ class FieldEditModal(Modal):
         )
         self.type_input = TextInput(
             label="Field Type",
-            placeholder="text, paragraph, number, select, or confirm",
+            placeholder="text, paragraph, number, or confirm",
             required=True,
             max_length=20,
             default=field.get("type", "text"),
@@ -454,20 +412,15 @@ class FieldEditModal(Modal):
             max_length=5,
             default="true" if field.get("required", True) else "false",
         )
-        
-        # Pre-fill extra input based on field type
-        extra_default = ""
-        if field.get("type") == "select":
-            extra_default = ", ".join(field.get("options", []))
-        elif field.get("type") == "confirm":
-            extra_default = field.get("confirm_text", "")
-        
+        # Single extra input: placeholder for non-confirm, confirm text for confirm (Discord modal max 5 inputs)
+        _is_confirm = field.get("type") == "confirm"
+        _extra_default = field.get("confirm_text", "") if _is_confirm else field.get("placeholder", "")
         self.extra_input = TextInput(
-            label="Options (select) or Confirm Text (confirm)",
-            placeholder="For select: Option1,Option2,Option3 | For confirm: I agree",
+            label="Placeholder or Confirm text",
+            placeholder="Confirm: exact text | Others: hint text",
             required=False,
             max_length=500,
-            default=extra_default,
+            default=_extra_default[:500] if _extra_default else "",
         )
 
         self.add_item(self.name_input)
@@ -483,11 +436,15 @@ class FieldEditModal(Modal):
         field_type = self.type_input.value.strip().lower()
         required_str = self.required_input.value.strip().lower()
         extra = self.extra_input.value.strip() if self.extra_input.value else None
+        # Extra is confirm_text for confirm type, placeholder for others (single input for Discord 5-input limit)
+        placeholder = extra[:100] if field_type != "confirm" and extra else ""
+        if field_type == "confirm":
+            extra = extra or None
 
         # Validate field type
-        if field_type not in ["text", "paragraph", "number", "select", "confirm"]:
+        if field_type not in ["text", "paragraph", "number", "confirm"]:
             await interaction.response.send_message(
-                "❌ Invalid field type. Use `text`, `paragraph`, `number`, `select`, or `confirm`.",
+                "❌ Invalid field type. Use `text`, `paragraph`, `number`, or `confirm`.",
                 ephemeral=True,
             )
             return
@@ -500,22 +457,6 @@ class FieldEditModal(Modal):
                 ephemeral=True,
             )
             return
-
-        # Validate select fields
-        if field_type == "select":
-            if not extra:
-                await interaction.response.send_message(
-                    "❌ Select fields require options. Provide them separated by commas.",
-                    ephemeral=True,
-                )
-                return
-            options_list = [opt.strip() for opt in extra.split(",") if opt.strip()]
-            if len(options_list) < 2:
-                await interaction.response.send_message(
-                    "❌ Select fields require at least 2 options.",
-                    ephemeral=True,
-                )
-                return
 
         # Validate confirm fields
         if field_type == "confirm":
@@ -550,30 +491,21 @@ class FieldEditModal(Modal):
                 )
                 return
 
-            # Update field data
+            # Build updated field (only allowed keys; drop legacy "options")
             field_data = {
                 "name": name,
                 "label": label,
                 "type": field_type,
                 "required": required,
-                "placeholder": fields[field_index].get("placeholder", ""),
+                "placeholder": placeholder,
             }
-
-            if field_type == "select":
-                field_data["options"] = [opt.strip() for opt in extra.split(",") if opt.strip()]
-            elif field_type == "confirm":
+            if field_type == "confirm":
                 field_data["confirm_text"] = extra.strip()
-
             fields[field_index] = field_data
 
-        options_text = ""
-        if field_type == "select":
-            options_text = f" with options: {extra}"
-        elif field_type == "confirm":
-            options_text = f" requiring confirmation: `{extra}`"
-
+        confirm_text = f" requiring confirmation: `{extra}`" if field_type == "confirm" else ""
         await interaction.response.send_message(
-            f"✅ Updated field `{name}` ({field_type}){options_text}.",
+            f"✅ Updated field `{name}` ({field_type}){confirm_text}.",
             ephemeral=True,
         )
 
@@ -739,7 +671,7 @@ class FieldManagerView(View):
 
         embed = discord.Embed(
             title="📋 Application Form Fields Manager",
-            description="Use the buttons below to manage your application form fields.",
+            description="Use the buttons below to manage your application form fields. **Forms may contain at most 5 fields** (Discord limit).",
             color=await self.cog.bot.get_embed_color(guild),
         )
 
@@ -753,12 +685,12 @@ class FieldManagerView(View):
             for i, field in enumerate(fields, 1):
                 field_type = field.get("type", "text")
                 required = field.get("required", True)
-                options = field.get("options", [])
+                placeholder = field.get("placeholder", "")
                 confirm_text = field.get("confirm_text", "")
 
                 value_text = f"**Type:** {field_type}\n**Required:** {'Yes' if required else 'No'}"
-                if options:
-                    value_text += f"\n**Options:** {', '.join(options)}"
+                if placeholder:
+                    value_text += f"\n**Placeholder:** {placeholder}"
                 if confirm_text:
                     value_text += f"\n**Must type:** `{confirm_text}`"
 
@@ -788,6 +720,13 @@ class FieldManagerView(View):
     @discord.ui.button(label="Add Field", style=discord.ButtonStyle.success, emoji="➕")
     async def add_field(self, interaction: discord.Interaction, button: Button):
         """Open modal to add a new field."""
+        fields = await self.cog.config.guild(interaction.guild).form_fields()
+        if len(fields) >= MAX_FORM_FIELDS:
+            await interaction.response.send_message(
+                f"Forms may contain at most {MAX_FORM_FIELDS} fields (Discord limit). Delete a field to add another.",
+                ephemeral=True,
+            )
+            return
         modal = FieldAddModal(self.cog)
         modal.manager_view = self
         await interaction.response.send_modal(modal)
@@ -2157,60 +2096,47 @@ class Applications(commands.Cog):
         label: str,
         field_type: str,
         required: bool = True,
-        confirm_or_options: Optional[str] = None,
+        confirm_or_placeholder: Optional[str] = None,
+        placeholder: Optional[str] = None,
     ):
         """Add a form field.
 
-        Types: text (short), paragraph (long), number, select (multiple choice), confirm (text confirmation)
-        
-        For select fields, provide options separated by commas.
-        Example: [p]applications field add experience "Experience Level" select True "Beginner,Intermediate,Advanced"
-        
-        For confirm fields, provide the exact text users must type.
+        Types: text (short), paragraph (long), number, confirm (text confirmation)
+
+        For confirm fields, the 5th argument is the exact text users must type (optional 6th is placeholder).
+        For other types, the 5th argument can be placeholder text.
         Example: [p]applications field add agreement "I agree to the rules" confirm True "I agree"
+        Example: [p]applications field add age "What is your age?" text True "e.g. 25"
         """
         field_type_lower = field_type.lower()
-        if field_type_lower not in ["text", "paragraph", "number", "select", "confirm"]:
-            await ctx.send("Invalid field type. Use `text`, `paragraph`, `number`, `select`, or `confirm`.")
+        if field_type_lower not in ["text", "paragraph", "number", "confirm"]:
+            await ctx.send("Invalid field type. Use `text`, `paragraph`, `number`, or `confirm`.")
             return
 
-        # Parse options for select fields
-        options_list = []
-        if field_type_lower == "select":
-            if not confirm_or_options:
-                await ctx.send(
-                    "Select fields require options. Provide them separated by commas.\n"
-                    "Example: `[p]applications field add experience \"Experience Level\" select True \"Beginner,Intermediate,Advanced\"`"
-                )
-                return
-            
-            # Split by comma
-            options_list = [opt.strip() for opt in confirm_or_options.split(",") if opt.strip()]
-            
-            if not options_list:
-                await ctx.send("At least one option is required for select fields.")
-                return
-            if len(options_list) < 2:
-                await ctx.send("Select fields require at least 2 options.")
-                return
-
-        # Parse confirmation text for confirm fields
+        # Confirm type: 5th arg is confirm text. Otherwise 5th can be placeholder, 6th is placeholder when 5th is confirm text.
         confirm_text = ""
         if field_type_lower == "confirm":
-            if not confirm_or_options:
+            if not confirm_or_placeholder:
                 await ctx.send(
                     "Confirm fields require the exact text users must type.\n"
                     "Example: `[p]applications field add agreement \"I agree to the rules\" confirm True \"I agree\"`"
                 )
                 return
-            
-            confirm_text = confirm_or_options.strip()
+            confirm_text = confirm_or_placeholder.strip()
             if not confirm_text:
                 await ctx.send("Confirmation text cannot be empty.")
                 return
+            placeholder_val = (placeholder or "").strip()[:100]
+        else:
+            # For non-confirm, 5th arg is placeholder if provided
+            placeholder_val = (confirm_or_placeholder or placeholder or "").strip()[:100]
 
         async with self.config.guild(ctx.guild).form_fields() as fields:
-            # Check if field name already exists
+            if len(fields) >= MAX_FORM_FIELDS:
+                await ctx.send(
+                    f"Forms may contain at most {MAX_FORM_FIELDS} fields (Discord limit). Remove a field first."
+                )
+                return
             if any(f.get("name") == name for f in fields):
                 await ctx.send(f"A field with name `{name}` already exists.")
                 return
@@ -2220,23 +2146,15 @@ class Applications(commands.Cog):
                 "label": label,
                 "type": field_type_lower,
                 "required": required,
-                "placeholder": "",
+                "placeholder": placeholder_val,
             }
-
-            if field_type_lower == "select":
-                field_data["options"] = options_list
-            elif field_type_lower == "confirm":
+            if field_type_lower == "confirm":
                 field_data["confirm_text"] = confirm_text
 
             fields.append(field_data)
 
-        if options_list:
-            options_text = f" with options: {', '.join(options_list)}"
-        elif confirm_text:
-            options_text = f" requiring confirmation: `{confirm_text}`"
-        else:
-            options_text = ""
-        await ctx.send(f"Added field `{name}` ({field_type_lower}){options_text} to the application form.")
+        confirm_msg = f" requiring confirmation: `{confirm_text}`" if confirm_text else ""
+        await ctx.send(f"Added field `{name}` ({field_type_lower}){confirm_msg} to the application form.")
 
     @_field.command(name="remove")
     async def _field_remove(self, ctx: commands.Context, name: str):
@@ -2267,15 +2185,15 @@ class Applications(commands.Cog):
         for i, field in enumerate(fields, 1):
             field_type = field.get("type", "text")
             required = field.get("required", True)
-            options = field.get("options", [])
+            placeholder = field.get("placeholder", "")
             confirm_text = field.get("confirm_text", "")
-            
+
             value_text = f"**Name:** `{field.get('name')}`\n**Type:** {field_type}\n**Required:** {required}"
-            if options:
-                value_text += f"\n**Options:** {', '.join(options)}"
+            if placeholder:
+                value_text += f"\n**Placeholder:** {placeholder}"
             if confirm_text:
                 value_text += f"\n**Must type:** `{confirm_text}`"
-            
+
             embed.add_field(
                 name=f"{i}. {field.get('label', field.get('name'))}",
                 value=value_text,
@@ -2283,39 +2201,6 @@ class Applications(commands.Cog):
             )
 
         await ctx.send(embed=embed)
-
-    @_field.command(name="options")
-    async def _field_options(self, ctx: commands.Context, name: str, *, options: str):
-        """Set options for a select field.
-        
-        Options should be separated by commas.
-        Example: [p]applications field options experience "Beginner,Intermediate,Advanced"
-        """
-        async with self.config.guild(ctx.guild).form_fields() as fields:
-            field = None
-            for f in fields:
-                if f.get("name") == name:
-                    field = f
-                    break
-
-            if not field:
-                await ctx.send(f"Field `{name}` not found.")
-                return
-
-            if field.get("type") != "select":
-                await ctx.send(f"Field `{name}` is not a select field. Only select fields can have options.")
-                return
-
-            options_list = [opt.strip() for opt in options.split(",") if opt.strip()]
-            if not options_list:
-                await ctx.send("At least one option is required.")
-                return
-            if len(options_list) < 2:
-                await ctx.send("Select fields require at least 2 options.")
-                return
-
-            field["options"] = options_list
-            await ctx.send(f"Updated options for field `{name}`: {', '.join(options_list)}")
 
     @_field.command(name="confirmtext")
     async def _field_confirm_text(self, ctx: commands.Context, name: str, *, confirm_text: str):
@@ -2355,7 +2240,7 @@ class Applications(commands.Cog):
         fields = await self.config.guild(ctx.guild).form_fields()
         embed = discord.Embed(
             title="📋 Application Form Fields Manager",
-            description="Use the buttons below to manage your application form fields.",
+            description="Use the buttons below to manage your application form fields. **Forms may contain at most 5 fields** (Discord limit).",
             color=await ctx.embed_color(),
         )
 
@@ -2369,12 +2254,12 @@ class Applications(commands.Cog):
             for i, field in enumerate(fields, 1):
                 field_type = field.get("type", "text")
                 required = field.get("required", True)
-                options = field.get("options", [])
+                placeholder = field.get("placeholder", "")
                 confirm_text = field.get("confirm_text", "")
 
                 value_text = f"**Type:** {field_type}\n**Required:** {'Yes' if required else 'No'}"
-                if options:
-                    value_text += f"\n**Options:** {', '.join(options)}"
+                if placeholder:
+                    value_text += f"\n**Placeholder:** {placeholder}"
                 if confirm_text:
                     value_text += f"\n**Must type:** `{confirm_text}`"
 
