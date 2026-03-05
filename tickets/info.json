@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing Tickets! Set the panel channel and category with [p]ticketset, then use [p]ticketset panelembed to build the panel and [p]ticketset panel to send it.",
+    "name": "Tickets",
+    "short": "Button-based support tickets with embeds and management controls.",
+    "description": "Ticket system with a customizable embed and button to create tickets. Dedicated channels per ticket, manager buttons (claim, close), auto-assign and inactivity auto-close, and transcript logging. No user-facing commands; creation is via the panel button only.",
+    "tags": ["tickets", "support", "utility", "moderation"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}

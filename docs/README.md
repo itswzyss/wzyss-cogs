@@ -21,3 +21,4 @@ Full documentation for each cog in the Wzyss-Cogs repository for Red-DiscordBot.
 | [RockstarNewswire](rockstarnewswire.md) | Track and post Rockstar Games newswire updates. |
 | [SelfRoles](selfroles.md) | Interactive builder for self-assignable roles with buttons, reactions, and commands. |
 | [TextReplace](textreplace.md) | Replace text using Regex. |
+| [Tickets](tickets.md) | Button-based support tickets with embeds and management controls. |
