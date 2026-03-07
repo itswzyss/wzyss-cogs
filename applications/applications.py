@@ -449,8 +449,9 @@ class InterviewButton(Button):
                 ephemeral=True,
             )
             return
-        app_data["interview_channel_id"] = new_channel.id
-        await self.cog.config.guild(guild).applications.set(applications)
+        async with self.cog.config.guild(guild).applications() as apps:
+            if str(member.id) in apps:
+                apps[str(member.id)]["interview_channel_id"] = new_channel.id
         try:
             await new_channel.send(
                 f"Interview channel for {member.mention}. "
@@ -1815,12 +1816,13 @@ class Applications(commands.Cog):
             "cleanup_delay": 24,  # Hours before deleting channels/messages after approval/denial
             "kick_timeout_seconds": 86400,  # Time before kicking users who didn't submit (default 24 hours)
             "rejoin_invite": None,  # Invite link URL to send when kicking users who didn't submit
-            "denial_action": "notify",  # notify | kick | tempban | ban
+            "denial_action": "kick",  # kick | tempban | ban
             "denial_send_dm": False,
             "denial_tempban_duration_seconds": 86400,
-            "early_close_action": "notify",
+            "early_close_action": "kick",
             "early_close_send_dm": False,
             "early_close_tempban_duration_seconds": 86400,
+            "approval_send_dm": False,
             "pending_unbans": [],  # [{"user_id": int, "unban_at": str (iso)}, ...]
             "form_fields": [
                 {
@@ -2087,6 +2089,23 @@ class Applications(commands.Cog):
     TEMPBAN_MIN_SECONDS = 60
     TEMPBAN_MAX_SECONDS = 2592000  # 30 days
 
+    def _normalize_member_action(self, action: Optional[str]) -> str:
+        """Normalize action values and migrate legacy options."""
+        a = (action or "").strip().lower()
+        return a if a in self._ACTION_CHOICES else "kick"
+
+    async def _send_approval_dm(self, guild: discord.Guild, member: discord.Member) -> None:
+        """Optionally DM a user when their application is approved."""
+        try:
+            await member.send(
+                f"Your application was approved in **{guild.name}**. "
+                "You should now have access based on the server's configured roles."
+            )
+        except discord.Forbidden:
+            log.warning("Could not DM user %s for approval - DMs may be disabled", member.id)
+        except discord.HTTPException as e:
+            log.error("Error sending approval DM to user %s: %s", member.id, e)
+
     async def _execute_member_action(
         self,
         guild: discord.Guild,
@@ -2097,9 +2116,7 @@ class Applications(commands.Cog):
         tempban_seconds: Optional[int] = None,
         context: str = "denial",
     ) -> None:
-        """Execute configured member action (notify/kick/tempban/ban). DM is sent before removal."""
-        if action == "notify":
-            return
+        """Execute configured member action (kick/tempban/ban). DM is sent before removal."""
         if member is None:
             log.warning("_execute_member_action: member is None, skipping action")
             return
@@ -2165,6 +2182,9 @@ class Applications(commands.Cog):
                 log.error(f"Permission denied tempbanning {member.id} in {guild.name}")
             except discord.HTTPException as e:
                 log.error(f"Error tempbanning {member.id} in {guild.name}: {e}")
+            return
+
+        log.warning("Unknown member action '%s' in %s; no moderation action executed", action, context)
 
     def _start_application_timer(self, guild_id: int, user_id: int, channel_id: int):
         """Start a timer for a user to submit their application (duration from config)."""
@@ -2382,10 +2402,6 @@ class Applications(commands.Cog):
         self, member: discord.Member, channel: discord.TextChannel, responses: Dict[str, str]
     ):
         """Store application and notify admins. If review_channel_id is set, post to review channel; else legacy (post to given channel)."""
-        applications = await self.config.guild(member.guild).applications()
-        if str(member.id) not in applications:
-            applications[str(member.id)] = {}
-
         review_channel_id = await self.config.guild(member.guild).review_channel_id()
         app_record = {
             "status": "pending",
@@ -2397,9 +2413,10 @@ class Applications(commands.Cog):
             app_record["interview_channel_id"] = None
         else:
             app_record["channel_id"] = channel.id
-        applications[str(member.id)].update(app_record)
-
-        await self.config.guild(member.guild).applications.set(applications)
+        async with self.config.guild(member.guild).applications() as applications:
+            if str(member.id) not in applications:
+                applications[str(member.id)] = {}
+            applications[str(member.id)].update(app_record)
 
         # Cancel timer task if it exists
         guild_id = member.guild.id
@@ -2445,10 +2462,9 @@ class Applications(commands.Cog):
                         allowed_mentions=allowed_mentions,
                     )
                     self.bot.add_view(view, message_id=msg.id)
-                    applications = await self.config.guild(member.guild).applications()
-                    if str(member.id) in applications:
-                        applications[str(member.id)]["review_message_id"] = msg.id
-                        await self.config.guild(member.guild).applications.set(applications)
+                    async with self.config.guild(member.guild).applications() as applications:
+                        if str(member.id) in applications:
+                            applications[str(member.id)]["review_message_id"] = msg.id
                 except (discord.Forbidden, discord.HTTPException) as e:
                     log.error("Failed to post application to review channel: %s", e)
             else:
@@ -2727,9 +2743,9 @@ class Applications(commands.Cog):
                         log.info(f"Recreating deleted application channel for {member.display_name}")
                         channel = await self.create_application_channel(member.guild, member)
                         if channel:
-                            app_data["channel_id"] = channel.id
-                            applications[str(member.id)] = app_data
-                            await self.config.guild(member.guild).applications.set(applications)
+                            async with self.config.guild(member.guild).applications() as apps:
+                                if str(member.id) in apps:
+                                    apps[str(member.id)]["channel_id"] = channel.id
                             await self.send_welcome_message(channel, member)
                 return
 
@@ -2751,14 +2767,13 @@ class Applications(commands.Cog):
         if use_new_flow:
             # New flow: no per-user channel; ensure lobby panel exists; create app record; start timer
             await self.ensure_lobby_panel(member.guild)
-            applications = await self.config.guild(member.guild).applications()
-            applications[str(member.id)] = {
-                "status": "pending",
-                "submitted_at": None,
-                "responses": {},
-                "joined_at": datetime.utcnow().isoformat(),
-            }
-            await self.config.guild(member.guild).applications.set(applications)
+            async with self.config.guild(member.guild).applications() as applications:
+                applications[str(member.id)] = {
+                    "status": "pending",
+                    "submitted_at": None,
+                    "responses": {},
+                    "joined_at": datetime.utcnow().isoformat(),
+                }
             self._start_application_timer(member.guild.id, member.id, 0)
             return
 
@@ -2768,14 +2783,14 @@ class Applications(commands.Cog):
             log.error(f"Failed to create application channel for {member.display_name}")
             return
 
-        applications[str(member.id)] = {
-            "channel_id": channel.id,
-            "status": "pending",
-            "submitted_at": None,
-            "responses": {},
-            "joined_at": datetime.utcnow().isoformat(),
-        }
-        await self.config.guild(member.guild).applications.set(applications)
+        async with self.config.guild(member.guild).applications() as applications:
+            applications[str(member.id)] = {
+                "channel_id": channel.id,
+                "status": "pending",
+                "submitted_at": None,
+                "responses": {},
+                "joined_at": datetime.utcnow().isoformat(),
+            }
         await self.send_welcome_message(channel, member)
         self._start_application_timer(member.guild.id, member.id, channel.id)
 
@@ -2801,8 +2816,9 @@ class Applications(commands.Cog):
                     log.error(f"Error deleting channel: {e}")
 
         # Remove from applications
-        del applications[str(member.id)]
-        await self.config.guild(member.guild).applications.set(applications)
+        async with self.config.guild(member.guild).applications() as apps:
+            if str(member.id) in apps:
+                del apps[str(member.id)]
 
     @commands.group(name="applications", aliases=["app"])
     @commands.admin_or_permissions(manage_guild=True)
@@ -3181,18 +3197,21 @@ class Applications(commands.Cog):
         await self.config.guild(ctx.guild).rejoin_invite.set(invite_url)
         await ctx.send(f"Rejoin invite link set to: {invite_url}")
 
-    _ACTION_CHOICES = ("notify", "kick", "tempban", "ban")
+    _ACTION_CHOICES = ("kick", "tempban", "ban")
 
     @_applications.command(name="denialaction")
     async def _denial_action(
         self, ctx: commands.Context, action: Optional[str] = None
     ):
-        """Set what happens when an application is denied: notify, kick, tempban, or ban.
+        """Set what happens when an application is denied: kick, tempban, or ban.
         
         If no action is given, shows the current setting.
         """
         if action is None:
-            current = await self.config.guild(ctx.guild).denial_action()
+            current_raw = await self.config.guild(ctx.guild).denial_action()
+            current = self._normalize_member_action(current_raw)
+            if current_raw != current:
+                await self.config.guild(ctx.guild).denial_action.set(current)
             await ctx.send(f"Denial action is set to: **{current}**.")
             return
         a = action.strip().lower()
@@ -3218,6 +3237,21 @@ class Applications(commands.Cog):
             return
         await self.config.guild(ctx.guild).denial_send_dm.set(on_off)
         await ctx.send(f"Send DM before denial removal: **{'Yes' if on_off else 'No'}**.")
+
+    @_applications.command(name="approvaldm")
+    async def _approval_dm(
+        self, ctx: commands.Context, on_off: Optional[bool] = None
+    ):
+        """Set whether to DM the user when an application is approved.
+
+        If not set, shows current value.
+        """
+        if on_off is None:
+            current = await self.config.guild(ctx.guild).approval_send_dm()
+            await ctx.send(f"Send DM on approval: **{'Yes' if current else 'No'}**.")
+            return
+        await self.config.guild(ctx.guild).approval_send_dm.set(on_off)
+        await ctx.send(f"Send DM on approval: **{'Yes' if on_off else 'No'}**.")
 
     @_applications.command(name="denialtempbanduration")
     async def _denial_tempban_duration(
@@ -3262,12 +3296,15 @@ class Applications(commands.Cog):
     async def _early_close_action(
         self, ctx: commands.Context, action: Optional[str] = None
     ):
-        """Set what happens when an application is closed before the user submitted: notify, kick, tempban, or ban.
+        """Set what happens when an application is closed before the user submitted: kick, tempban, or ban.
         
         If no action is given, shows the current setting.
         """
         if action is None:
-            current = await self.config.guild(ctx.guild).early_close_action()
+            current_raw = await self.config.guild(ctx.guild).early_close_action()
+            current = self._normalize_member_action(current_raw)
+            if current_raw != current:
+                await self.config.guild(ctx.guild).early_close_action.set(current)
             await ctx.send(f"Early close action is set to: **{current}**.")
             return
         a = action.strip().lower()
@@ -3418,7 +3455,7 @@ class Applications(commands.Cog):
 
             view = CheckFixView(self, ctx.guild, fixable, embed)
 
-        await ctx.send(embed=embed, view=view, ephemeral=True)
+        await ctx.send(embed=embed, view=view)
 
     @_applications.command(name="cleanup")
     async def _cleanup(self, ctx: commands.Context):
@@ -3738,12 +3775,13 @@ class Applications(commands.Cog):
         cleanup_delay = await g.cleanup_delay() or 24
         kick_timeout_seconds = await g.kick_timeout_seconds() or 86400
         rejoin_invite = await g.rejoin_invite()
-        denial_action = await g.denial_action() or "notify"
+        denial_action = self._normalize_member_action(await g.denial_action())
         denial_send_dm = await g.denial_send_dm()
         denial_tempban_seconds = await g.denial_tempban_duration_seconds() or 86400
-        early_close_action = await g.early_close_action() or "notify"
+        early_close_action = self._normalize_member_action(await g.early_close_action())
         early_close_send_dm = await g.early_close_send_dm()
         early_close_tempban_seconds = await g.early_close_tempban_duration_seconds() or 86400
+        approval_send_dm = await g.approval_send_dm()
         pending_unbans = await g.pending_unbans() or []
 
         form_fields = await g.form_fields() or []
@@ -3842,6 +3880,11 @@ class Applications(commands.Cog):
         embed.add_field(
             name="Denial DM",
             value="Yes" if denial_send_dm else "No",
+            inline=True,
+        )
+        embed.add_field(
+            name="Approval DM",
+            value="Yes" if approval_send_dm else "No",
             inline=True,
         )
         embed.add_field(
@@ -4016,14 +4059,18 @@ class Applications(commands.Cog):
         cleanup_time = datetime.utcnow() + timedelta(hours=cleanup_delay)
         app_data["cleanup_scheduled_at"] = cleanup_time.isoformat()
         
-        applications[str(member.id)] = app_data
-        await self.config.guild(ctx.guild).applications.set(applications)
+        async with self.config.guild(ctx.guild).applications() as apps:
+            if str(member.id) in apps:
+                apps[str(member.id)].update(app_data)
 
         # Log to log channel
         decision_maker = ctx.guild.get_member(ctx.author.id)
         await self.log_application_event(
             ctx.guild, member, "approved", decision_maker=decision_maker
         )
+
+        if await self.config.guild(ctx.guild).approval_send_dm():
+            await self._send_approval_dm(ctx.guild, member)
 
         # Notify in channel (legacy per-user channel)
         channel_id = app_data.get("channel_id")
@@ -4106,8 +4153,9 @@ class Applications(commands.Cog):
         cleanup_time = datetime.utcnow() + timedelta(hours=cleanup_delay)
         app_data["cleanup_scheduled_at"] = cleanup_time.isoformat()
         
-        applications[str(member.id)] = app_data
-        await self.config.guild(ctx.guild).applications.set(applications)
+        async with self.config.guild(ctx.guild).applications() as apps:
+            if str(member.id) in apps:
+                apps[str(member.id)].update(app_data)
 
         # Log to log channel
         decision_maker = ctx.guild.get_member(ctx.author.id)
@@ -4116,7 +4164,7 @@ class Applications(commands.Cog):
         )
 
         # Execute configured denial action (DM before removal)
-        denial_action = await self.config.guild(ctx.guild).denial_action()
+        denial_action = self._normalize_member_action(await self.config.guild(ctx.guild).denial_action())
         denial_send_dm = await self.config.guild(ctx.guild).denial_send_dm()
         denial_tempban_seconds = (
             await self.config.guild(ctx.guild).denial_tempban_duration_seconds()
@@ -4216,14 +4264,18 @@ class Applications(commands.Cog):
         cleanup_time = datetime.utcnow() + timedelta(hours=cleanup_delay)
         app_data["cleanup_scheduled_at"] = cleanup_time.isoformat()
         
-        applications[str(member.id)] = app_data
-        await self.config.guild(interaction.guild).applications.set(applications)
+        async with self.config.guild(interaction.guild).applications() as apps:
+            if str(member.id) in apps:
+                apps[str(member.id)].update(app_data)
 
         # Log to log channel
         decision_maker = interaction.guild.get_member(interaction.user.id)
         await self.log_application_event(
             interaction.guild, member, "approved", decision_maker=decision_maker
         )
+
+        if await self.config.guild(interaction.guild).approval_send_dm():
+            await self._send_approval_dm(interaction.guild, member)
 
         # Respond to interaction
         if not interaction.response.is_done():
@@ -4286,8 +4338,9 @@ class Applications(commands.Cog):
         cleanup_time = datetime.utcnow() + timedelta(hours=cleanup_delay)
         app_data["cleanup_scheduled_at"] = cleanup_time.isoformat()
         
-        applications[str(member.id)] = app_data
-        await self.config.guild(interaction.guild).applications.set(applications)
+        async with self.config.guild(interaction.guild).applications() as apps:
+            if str(member.id) in apps:
+                apps[str(member.id)].update(app_data)
 
         # Log to log channel
         decision_maker = interaction.guild.get_member(interaction.user.id)
@@ -4296,7 +4349,7 @@ class Applications(commands.Cog):
         )
 
         # Execute configured denial action (DM before removal)
-        denial_action = await self.config.guild(interaction.guild).denial_action()
+        denial_action = self._normalize_member_action(await self.config.guild(interaction.guild).denial_action())
         denial_send_dm = await self.config.guild(interaction.guild).denial_send_dm()
         denial_tempban_seconds = (
             await self.config.guild(interaction.guild).denial_tempban_duration_seconds()
@@ -4476,7 +4529,7 @@ class Applications(commands.Cog):
         run_early_close = not submitted and app_data.get("status") != "approved"
         if run_early_close:
             # Early close: user has not submitted. Execute configured action (DM before removal).
-            early_action = await self.config.guild(ctx.guild).early_close_action()
+            early_action = self._normalize_member_action(await self.config.guild(ctx.guild).early_close_action())
             early_send_dm = await self.config.guild(ctx.guild).early_close_send_dm()
             early_tempban_seconds = (
                 await self.config.guild(ctx.guild).early_close_tempban_duration_seconds()
@@ -4541,8 +4594,9 @@ class Applications(commands.Cog):
                 await ctx.send("No channel associated with this application.")
 
         # Remove from applications
-        del applications[str(member.id)]
-        await self.config.guild(ctx.guild).applications.set(applications)
+        async with self.config.guild(ctx.guild).applications() as apps:
+            if str(member.id) in apps:
+                del apps[str(member.id)]
 
     @_applications.command(name="clearorphaned")
     async def _clear_orphaned(self, ctx: commands.Context):
@@ -4613,8 +4667,9 @@ class Applications(commands.Cog):
                     except (discord.Forbidden, discord.HTTPException):
                         pass
 
-        del applications[user_id_str]
-        await self.config.guild(ctx.guild).applications.set(applications)
+        async with self.config.guild(ctx.guild).applications() as apps:
+            if user_id_str in apps:
+                del apps[user_id_str]
         await ctx.send(f"Removed application record for user ID `{user_id}`.")
 
     async def cleanup_loop(self):
