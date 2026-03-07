@@ -3037,8 +3037,9 @@ class Applications(commands.Cog):
         app_data = applications[str(member.id)]
         channel_id = app_data.get("channel_id")
         submitted = app_data.get("submitted_at") or app_data.get("responses")
-
-        if not submitted:
+        # Skip early_close action for users who were already approved (e.g. approved without submitting).
+        run_early_close = not submitted and app_data.get("status") != "approved"
+        if run_early_close:
             # Early close: user has not submitted. Execute configured action (DM before removal).
             early_action = await self.config.guild(ctx.guild).early_close_action()
             early_send_dm = await self.config.guild(ctx.guild).early_close_send_dm()
