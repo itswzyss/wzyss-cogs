@@ -506,11 +506,17 @@ class ApplicationReviewView(View):
 class LobbyEmbedConfigModal(Modal):
     """Modal for configuring the lobby panel embed."""
 
-    def __init__(self, cog: "Applications", existing_data: Optional[Dict] = None):
+    def __init__(
+        self,
+        cog: "Applications",
+        existing_data: Optional[Dict] = None,
+        builder_view: Optional["LobbyEmbedBuilderView"] = None,
+    ):
         title = "Edit Lobby Embed" if existing_data else "Configure Lobby Embed"
         super().__init__(title=title)
         self.cog = cog
         self.existing_data = existing_data or {}
+        self.builder_view = builder_view
 
         self.title_input = TextInput(
             label="Title",
@@ -585,14 +591,17 @@ class LobbyEmbedConfigModal(Modal):
             "Embed configuration saved. Use Preview or Save.",
             ephemeral=True,
         )
+        if self.builder_view:
+            await self.builder_view._refresh_embed(user_id=interaction.user.id)
 
 
 class LobbyEmbedBuilderView(View):
     """Interactive embed builder for the lobby panel: Configure Embed, Preview, Save, Cancel."""
 
-    def __init__(self, cog: "Applications"):
+    def __init__(self, cog: "Applications", owner_user_id: Optional[int] = None):
         super().__init__(timeout=300)
         self.cog = cog
+        self.owner_user_id = owner_user_id
         self.message: Optional[discord.Message] = None
 
     def _get_state(self, user_id: int) -> Dict:
@@ -600,8 +609,13 @@ class LobbyEmbedBuilderView(View):
             self.cog._lobby_embed_builder_states[user_id] = {"embed_data": {}}
         return self.cog._lobby_embed_builder_states[user_id]
 
-    async def _refresh_embed(self, interaction: Optional[discord.Interaction] = None):
-        user_id = interaction.user.id if interaction else (self.message.author.id if self.message else None)
+    async def _refresh_embed(
+        self,
+        interaction: Optional[discord.Interaction] = None,
+        *,
+        user_id: Optional[int] = None,
+    ):
+        user_id = user_id or (interaction.user.id if interaction else self.owner_user_id)
         if not user_id:
             return
         guild = interaction.guild if interaction else (self.message.guild if self.message else None)
@@ -636,7 +650,7 @@ class LobbyEmbedBuilderView(View):
     async def configure_embed(self, interaction: discord.Interaction, button: Button):
         state = self._get_state(interaction.user.id)
         existing = state.get("embed_data", {})
-        modal = LobbyEmbedConfigModal(self.cog, existing)
+        modal = LobbyEmbedConfigModal(self.cog, existing, builder_view=self)
         await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="Preview", style=discord.ButtonStyle.secondary, emoji="\U0001f441\ufe0f", row=0)
@@ -2404,12 +2418,8 @@ class Applications(commands.Cog):
         review_channel = member.guild.get_channel(review_channel_id)
         if review_channel and isinstance(review_channel, discord.TextChannel):
             try:
-                # Defensive: ensure only notification ping is sent as content (no applicant-facing text)
-                send_content = review_content
-                if send_content and ("Application Submitted" in send_content or "received" in send_content.lower() or "pending review" in send_content.lower()):
-                    send_content = (f"{notification_role.mention}\n" if notification_role else None)
                 msg = await review_channel.send(
-                    content=send_content,
+                    content=review_content,
                     embed=embed,
                     view=view,
                     allowed_mentions=allowed_mentions,
@@ -2963,7 +2973,7 @@ class Applications(commands.Cog):
         if existing is None:
             existing = {}
         self._lobby_embed_builder_states[ctx.author.id] = {"embed_data": existing}
-        view = LobbyEmbedBuilderView(self)
+        view = LobbyEmbedBuilderView(self, owner_user_id=ctx.author.id)
         embed = discord.Embed(
             title="Lobby Panel Embed Builder",
             description="Use the buttons below to configure, preview, or save the embed shown in the lobby.",
@@ -2972,6 +2982,7 @@ class Applications(commands.Cog):
         if existing and existing.get("title"):
             embed.add_field(name="Current title", value=existing.get("title", "Not set")[:1024], inline=False)
         view.message = await ctx.send(embed=embed, view=view)
+        await view._refresh_embed(user_id=ctx.author.id)
 
     @_lobby.command(name="send")
     async def _send_panel(self, ctx: commands.Context):
