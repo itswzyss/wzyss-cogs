@@ -133,7 +133,13 @@ class ApplicationModal(Modal):
             return
 
         # Store responses
-        await self.cog.submit_application(interaction.user, interaction.channel, responses)
+        submitted = await self.cog.submit_application(interaction.user, interaction.channel, responses)
+        if not submitted:
+            await interaction.response.send_message(
+                "❌ You already have a submitted application on file.",
+                ephemeral=True,
+            )
+            return
 
         await interaction.response.send_message(
             "✅ Your application has been submitted! An admin will review it shortly.",
@@ -154,6 +160,23 @@ class ApplicationButton(Button):
         if not form_fields:
             await interaction.response.send_message(
                 "❌ No application form has been configured. Please contact an administrator.",
+                ephemeral=True,
+            )
+            return
+
+        applications = await self.cog.config.guild(interaction.guild).applications()
+        existing = applications.get(str(interaction.user.id), {})
+        already_submitted = bool(
+            isinstance(existing, dict)
+            and (
+                existing.get("submitted_at") is not None
+                or bool(existing.get("responses"))
+                or existing.get("status") in {"approved", "denied"}
+            )
+        )
+        if already_submitted:
+            await interaction.response.send_message(
+                "❌ You already have a submitted application on file.",
                 ephemeral=True,
             )
             return
@@ -180,6 +203,23 @@ class LobbyApplyButton(Button):
         if not form_fields:
             await interaction.response.send_message(
                 "❌ No application form has been configured. Please contact an administrator.",
+                ephemeral=True,
+            )
+            return
+
+        applications = await self.cog.config.guild(interaction.guild).applications()
+        existing = applications.get(str(interaction.user.id), {})
+        already_submitted = bool(
+            isinstance(existing, dict)
+            and (
+                existing.get("submitted_at") is not None
+                or bool(existing.get("responses"))
+                or existing.get("status") in {"approved", "denied"}
+            )
+        )
+        if already_submitted:
+            await interaction.response.send_message(
+                "❌ You already have a submitted application on file.",
                 ephemeral=True,
             )
             return
@@ -454,8 +494,7 @@ class InterviewButton(Button):
                 apps[str(member.id)]["interview_channel_id"] = new_channel.id
         try:
             await new_channel.send(
-                f"Interview channel for {member.mention}. "
-                f"Discuss here before approving or denying the application."
+                f"{member.mention}, an interview has been requested by {interaction.user.mention}."
             )
         except discord.HTTPException:
             pass
@@ -1000,7 +1039,7 @@ class SetupWizardView(View):
         )
         if role_mode == "restricted" and pending_role:
             summary += f"• Restricted role: {pending_role.mention}\n"
-        summary += "\nCustomize the lobby embed with `[p]applications lobbyembed`."
+        summary += "\nCustomize the lobby embed with `[p]applications lobby embed`."
         try:
             await interaction.message.edit(content=summary, embed=None, view=None)
         except (discord.NotFound, discord.HTTPException):
@@ -1816,7 +1855,7 @@ class Applications(commands.Cog):
             "cleanup_delay": 24,  # Hours before deleting channels/messages after approval/denial
             "kick_timeout_seconds": 86400,  # Time before kicking users who didn't submit (default 24 hours)
             "rejoin_invite": None,  # Invite link URL to send when kicking users who didn't submit
-            "denial_action": "kick",  # kick | tempban | ban
+            "denial_action": "kick",  # none | kick | tempban | ban
             "denial_send_dm": False,
             "denial_tempban_duration_seconds": 86400,
             "early_close_action": "kick",
@@ -2089,10 +2128,11 @@ class Applications(commands.Cog):
     TEMPBAN_MIN_SECONDS = 60
     TEMPBAN_MAX_SECONDS = 2592000  # 30 days
 
-    def _normalize_member_action(self, action: Optional[str]) -> str:
+    def _normalize_member_action(self, action: Optional[str], *, allow_none: bool = False) -> str:
         """Normalize action values and migrate legacy options."""
         a = (action or "").strip().lower()
-        return a if a in self._ACTION_CHOICES else "kick"
+        choices = self._DENIAL_ACTION_CHOICES if allow_none else self._EARLY_CLOSE_ACTION_CHOICES
+        return a if a in choices else "kick"
 
     async def _send_approval_dm(self, guild: discord.Guild, member: discord.Member) -> None:
         """Optionally DM a user when their application is approved."""
@@ -2116,7 +2156,7 @@ class Applications(commands.Cog):
         tempban_seconds: Optional[int] = None,
         context: str = "denial",
     ) -> None:
-        """Execute configured member action (kick/tempban/ban). DM is sent before removal."""
+        """Execute configured member action (none/kick/tempban/ban). DM is sent before removal."""
         if member is None:
             log.warning("_execute_member_action: member is None, skipping action")
             return
@@ -2134,6 +2174,9 @@ class Applications(commands.Cog):
                 log.warning(f"Could not DM user {member.id} for {context} - DMs may be disabled")
             except discord.HTTPException as e:
                 log.error(f"Error sending DM to user {member.id} for {context}: {e}")
+
+        if action == "none":
+            return
 
         if action == "kick":
             if not guild.me.guild_permissions.kick_members:
@@ -2400,7 +2443,7 @@ class Applications(commands.Cog):
 
     async def submit_application(
         self, member: discord.Member, channel: discord.TextChannel, responses: Dict[str, str]
-    ):
+    ) -> bool:
         """Store application and notify admins. If review_channel_id is set, post to review channel; else legacy (post to given channel)."""
         review_channel_id = await self.config.guild(member.guild).review_channel_id()
         app_record = {
@@ -2414,6 +2457,18 @@ class Applications(commands.Cog):
         else:
             app_record["channel_id"] = channel.id
         async with self.config.guild(member.guild).applications() as applications:
+            existing = applications.get(str(member.id), {})
+            already_submitted = bool(
+                isinstance(existing, dict)
+                and (
+                    existing.get("submitted_at") is not None
+                    or bool(existing.get("responses"))
+                    or existing.get("status") in {"approved", "denied"}
+                )
+            )
+            if already_submitted:
+                return False
+
             if str(member.id) not in applications:
                 applications[str(member.id)] = {}
             applications[str(member.id)].update(app_record)
@@ -2472,6 +2527,7 @@ class Applications(commands.Cog):
 
         log.info(f"Application submitted by {member.display_name} in {member.guild.name}")
         await self.log_application_event(member.guild, member, "submitted", responses=responses)
+        return True
 
     async def _update_review_message_after_resolve(
         self,
@@ -2839,7 +2895,47 @@ class Applications(commands.Cog):
 
         await ctx.send(f"Application system is now {state}.")
 
-    @_applications.command(name="restrictedrole")
+    @_applications.group(name="role")
+    async def _role(self, ctx: commands.Context):
+        """Manage application roles and role-based behavior."""
+        pass
+
+    @_applications.group(name="channel")
+    async def _channel(self, ctx: commands.Context):
+        """Manage application channels."""
+        pass
+
+    @_applications.group(name="lobby")
+    async def _lobby(self, ctx: commands.Context):
+        """Manage the lobby panel message and embed."""
+        pass
+
+    @_applications.group(name="policy")
+    async def _policy(self, ctx: commands.Context):
+        """Manage application system policies and timers."""
+        pass
+
+    @_policy.group(name="denial")
+    async def _policy_denial(self, ctx: commands.Context):
+        """Manage denial behavior."""
+        pass
+
+    @_policy.group(name="approval")
+    async def _policy_approval(self, ctx: commands.Context):
+        """Manage approval behavior."""
+        pass
+
+    @_policy.group(name="earlyclose")
+    async def _policy_early_close(self, ctx: commands.Context):
+        """Manage behavior when closing before submission."""
+        pass
+
+    @_applications.group(name="maintenance")
+    async def _maintenance(self, ctx: commands.Context):
+        """Run maintenance and cleanup operations."""
+        pass
+
+    @_role.command(name="restricted")
     async def _set_restricted_role(
         self, ctx: commands.Context, role: Optional[discord.Role] = None
     ):
@@ -2858,7 +2954,7 @@ class Applications(commands.Cog):
                 f"Make sure this role denies view permissions for all channels except the application category."
             )
 
-    @_applications.command(name="bypassrole")
+    @_role.command(name="bypass")
     async def _bypass_role(
         self, ctx: commands.Context, action: str, role: Optional[discord.Role] = None
     ):
@@ -2888,7 +2984,7 @@ class Applications(commands.Cog):
                 else:
                     await ctx.send(f"{role.mention} is not a bypass role.")
 
-    @_applications.command(name="accessrole")
+    @_role.command(name="access")
     async def _access_role(
         self, ctx: commands.Context, action: str, role: Optional[discord.Role] = None
     ):
@@ -2920,7 +3016,7 @@ class Applications(commands.Cog):
                 else:
                     await ctx.send(f"{role.mention} is not an access role.")
 
-    @_applications.command(name="managerrole")
+    @_role.command(name="manager")
     async def _manager_role(
         self, ctx: commands.Context, action: str, role: Optional[discord.Role] = None
     ):
@@ -2950,7 +3046,7 @@ class Applications(commands.Cog):
                 else:
                     await ctx.send(f"{role.mention} is not a manager role.")
 
-    @_applications.command(name="category")
+    @_channel.command(name="category")
     async def _set_category(
         self, ctx: commands.Context, category: Optional[discord.CategoryChannel] = None
     ):
@@ -2962,7 +3058,7 @@ class Applications(commands.Cog):
             await self.config.guild(ctx.guild).category_id.set(category.id)
             await ctx.send(f"Application channels will be created in {category.mention}.")
 
-    @_applications.command(name="logchannel")
+    @_channel.command(name="log")
     async def _set_log_channel(
         self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None
     ):
@@ -2974,7 +3070,7 @@ class Applications(commands.Cog):
             await self.config.guild(ctx.guild).log_channel.set(channel.id)
             await ctx.send(f"Application events will be logged to {channel.mention}.")
 
-    @_applications.command(name="lobbychannel")
+    @_channel.command(name="lobby")
     async def _set_lobby_channel(
         self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None
     ):
@@ -2987,10 +3083,10 @@ class Applications(commands.Cog):
             await self.config.guild(ctx.guild).lobby_channel_id.set(channel.id)
             await ctx.send(
                 f"Lobby channel set to {channel.mention}. "
-                f"Use `{ctx.clean_prefix}applications sendpanel` to send or refresh the panel there."
+                f"Use `{ctx.clean_prefix}applications lobby send` to send or refresh the panel there."
             )
 
-    @_applications.command(name="reviewchannel")
+    @_channel.command(name="review")
     async def _set_review_channel(
         self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None
     ):
@@ -3002,7 +3098,7 @@ class Applications(commands.Cog):
             await self.config.guild(ctx.guild).review_channel_id.set(channel.id)
             await ctx.send(f"New applications will be posted to {channel.mention}.")
 
-    @_applications.command(name="lobbyembed")
+    @_lobby.command(name="embed")
     async def _lobby_embed(self, ctx: commands.Context):
         """Open the embed builder to configure the lobby panel message (title, description, color, footer)."""
         if not await self.config.guild(ctx.guild).enabled():
@@ -3022,7 +3118,7 @@ class Applications(commands.Cog):
             embed.add_field(name="Current title", value=existing.get("title", "Not set")[:1024], inline=False)
         view.message = await ctx.send(embed=embed, view=view)
 
-    @_applications.command(name="sendpanel")
+    @_lobby.command(name="send")
     async def _send_panel(self, ctx: commands.Context):
         """Send or refresh the lobby panel (embed + Apply button) in the configured lobby channel."""
         if not await self.config.guild(ctx.guild).enabled():
@@ -3031,7 +3127,7 @@ class Applications(commands.Cog):
         lobby_channel_id = await self.config.guild(ctx.guild).lobby_channel_id()
         if not lobby_channel_id:
             await ctx.send(
-                "Set a lobby channel first with `[p]applications lobbychannel #channel`. "
+                "Set a lobby channel first with `[p]applications channel lobby #channel`. "
                 "Or run `[p]applications setup` for interactive setup."
             )
             return
@@ -3054,7 +3150,7 @@ class Applications(commands.Cog):
         else:
             await ctx.send("Failed to send the panel. Check bot permissions.")
 
-    @_applications.command(name="notificationrole")
+    @_role.command(name="notification")
     async def _set_notification_role(
         self, ctx: commands.Context, role: Optional[discord.Role] = None
     ):
@@ -3069,7 +3165,7 @@ class Applications(commands.Cog):
                 f"This role will be pinged when new applications are submitted."
             )
 
-    @_applications.command(name="cleanupdelay")
+    @_policy.command(name="cleanupdelay")
     async def _set_cleanup_delay(self, ctx: commands.Context, hours: int):
         """Set the delay in hours before deleting channels after approval/denial."""
         if hours < 0:
@@ -3082,13 +3178,13 @@ class Applications(commands.Cog):
             f"Application channels will be deleted {hours} hour(s) after approval or denial."
         )
 
-    @_applications.command(name="kicktimeout")
+    @_policy.command(name="kicktimeout")
     async def _set_kick_timeout(
         self, ctx: commands.Context, amount: Optional[float] = None, unit: Optional[str] = None
     ):
         """Set how long new members have to submit an application before being kicked.
         
-        Use: [p]applications kicktimeout <amount> <unit>
+        Use: [p]applications policy kicktimeout <amount> <unit>
         Units: seconds/s, minutes/m, hours/h, days/d
         If amount and unit are omitted, shows the current kick timeout.
         Setting a duration below 1 hour will prompt for confirmation.
@@ -3097,7 +3193,10 @@ class Applications(commands.Cog):
             current = await self.config.guild(ctx.guild).kick_timeout_seconds()
             if current is None:
                 current = 86400
-            await ctx.send(f"Current kick timeout: {self._format_timeout(int(current))}.")
+            await ctx.send(
+                f"Current kick timeout: {self._format_timeout(int(current))}.\n"
+                "Available units: **seconds/s**, **minutes/m**, **hours/h**, **days/d**."
+            )
             return
 
         unit_map = {
@@ -3165,7 +3264,7 @@ class Applications(commands.Cog):
         await self.config.guild(ctx.guild).kick_timeout_seconds.set(total_seconds)
         await ctx.send(f"Kick timeout set to {duration_text}.")
 
-    @_applications.command(name="rejoininvite")
+    @_policy.command(name="rejoininvite")
     async def _set_rejoin_invite(
         self, ctx: commands.Context, invite_url: Optional[str] = None
     ):
@@ -3197,33 +3296,37 @@ class Applications(commands.Cog):
         await self.config.guild(ctx.guild).rejoin_invite.set(invite_url)
         await ctx.send(f"Rejoin invite link set to: {invite_url}")
 
-    _ACTION_CHOICES = ("kick", "tempban", "ban")
+    _DENIAL_ACTION_CHOICES = ("none", "kick", "tempban", "ban")
+    _EARLY_CLOSE_ACTION_CHOICES = ("kick", "tempban", "ban")
 
-    @_applications.command(name="denialaction")
+    @_policy_denial.command(name="action")
     async def _denial_action(
         self, ctx: commands.Context, action: Optional[str] = None
     ):
-        """Set what happens when an application is denied: kick, tempban, or ban.
+        """Set what happens when an application is denied: none, kick, tempban, or ban.
         
         If no action is given, shows the current setting.
         """
         if action is None:
             current_raw = await self.config.guild(ctx.guild).denial_action()
-            current = self._normalize_member_action(current_raw)
+            current = self._normalize_member_action(current_raw, allow_none=True)
             if current_raw != current:
                 await self.config.guild(ctx.guild).denial_action.set(current)
-            await ctx.send(f"Denial action is set to: **{current}**.")
+            await ctx.send(
+                f"Denial action is set to: **{current}**.\n"
+                f"Available options: **{', '.join(self._DENIAL_ACTION_CHOICES)}**."
+            )
             return
         a = action.strip().lower()
-        if a not in self._ACTION_CHOICES:
+        if a not in self._DENIAL_ACTION_CHOICES:
             await ctx.send(
-                f"❌ Invalid action. Use one of: {', '.join(self._ACTION_CHOICES)}."
+                f"❌ Invalid action. Use one of: {', '.join(self._DENIAL_ACTION_CHOICES)}."
             )
             return
         await self.config.guild(ctx.guild).denial_action.set(a)
         await ctx.send(f"Denial action set to: **{a}**.")
 
-    @_applications.command(name="denialdm")
+    @_policy_denial.command(name="dm")
     async def _denial_dm(
         self, ctx: commands.Context, on_off: Optional[bool] = None
     ):
@@ -3233,12 +3336,15 @@ class Applications(commands.Cog):
         """
         if on_off is None:
             current = await self.config.guild(ctx.guild).denial_send_dm()
-            await ctx.send(f"Send DM before denial removal: **{'Yes' if current else 'No'}**.")
+            await ctx.send(
+                f"Send DM before denial removal: **{'Yes' if current else 'No'}**.\n"
+                "Available options: **true** or **false**."
+            )
             return
         await self.config.guild(ctx.guild).denial_send_dm.set(on_off)
         await ctx.send(f"Send DM before denial removal: **{'Yes' if on_off else 'No'}**.")
 
-    @_applications.command(name="approvaldm")
+    @_policy_approval.command(name="dm")
     async def _approval_dm(
         self, ctx: commands.Context, on_off: Optional[bool] = None
     ):
@@ -3248,12 +3354,15 @@ class Applications(commands.Cog):
         """
         if on_off is None:
             current = await self.config.guild(ctx.guild).approval_send_dm()
-            await ctx.send(f"Send DM on approval: **{'Yes' if current else 'No'}**.")
+            await ctx.send(
+                f"Send DM on approval: **{'Yes' if current else 'No'}**.\n"
+                "Available options: **true** or **false**."
+            )
             return
         await self.config.guild(ctx.guild).approval_send_dm.set(on_off)
         await ctx.send(f"Send DM on approval: **{'Yes' if on_off else 'No'}**.")
 
-    @_applications.command(name="denialtempbanduration")
+    @_policy_denial.command(name="tempbanduration")
     async def _denial_tempban_duration(
         self,
         ctx: commands.Context,
@@ -3262,7 +3371,7 @@ class Applications(commands.Cog):
     ):
         """Set tempban duration when denial action is tempban.
         
-        Use: [p]applications denialtempbanduration <amount> <unit>
+        Use: [p]applications policy denial tempbanduration <amount> <unit>
         Units: seconds/s, minutes/m, hours/h, days/d.
         If omitted, shows current duration.
         """
@@ -3270,7 +3379,10 @@ class Applications(commands.Cog):
             current = await self.config.guild(ctx.guild).denial_tempban_duration_seconds()
             if current is None:
                 current = 86400
-            await ctx.send(f"Denial tempban duration: {self._format_timeout(int(current))}.")
+            await ctx.send(
+                f"Denial tempban duration: {self._format_timeout(int(current))}.\n"
+                "Available units: **seconds/s**, **minutes/m**, **hours/h**, **days/d**."
+            )
             return
         unit_map = {
             "s": 1, "sec": 1, "second": 1, "seconds": 1,
@@ -3292,7 +3404,7 @@ class Applications(commands.Cog):
         await self.config.guild(ctx.guild).denial_tempban_duration_seconds.set(total_seconds)
         await ctx.send(f"Denial tempban duration set to: {self._format_timeout(total_seconds)}.")
 
-    @_applications.command(name="earlycloseaction")
+    @_policy_early_close.command(name="action")
     async def _early_close_action(
         self, ctx: commands.Context, action: Optional[str] = None
     ):
@@ -3305,18 +3417,21 @@ class Applications(commands.Cog):
             current = self._normalize_member_action(current_raw)
             if current_raw != current:
                 await self.config.guild(ctx.guild).early_close_action.set(current)
-            await ctx.send(f"Early close action is set to: **{current}**.")
+            await ctx.send(
+                f"Early close action is set to: **{current}**.\n"
+                f"Available options: **{', '.join(self._EARLY_CLOSE_ACTION_CHOICES)}**."
+            )
             return
         a = action.strip().lower()
-        if a not in self._ACTION_CHOICES:
+        if a not in self._EARLY_CLOSE_ACTION_CHOICES:
             await ctx.send(
-                f"❌ Invalid action. Use one of: {', '.join(self._ACTION_CHOICES)}."
+                f"❌ Invalid action. Use one of: {', '.join(self._EARLY_CLOSE_ACTION_CHOICES)}."
             )
             return
         await self.config.guild(ctx.guild).early_close_action.set(a)
         await ctx.send(f"Early close action set to: **{a}**.")
 
-    @_applications.command(name="earlyclosedm")
+    @_policy_early_close.command(name="dm")
     async def _early_close_dm(
         self, ctx: commands.Context, on_off: Optional[bool] = None
     ):
@@ -3326,12 +3441,15 @@ class Applications(commands.Cog):
         """
         if on_off is None:
             current = await self.config.guild(ctx.guild).early_close_send_dm()
-            await ctx.send(f"Send DM before early-close removal: **{'Yes' if current else 'No'}**.")
+            await ctx.send(
+                f"Send DM before early-close removal: **{'Yes' if current else 'No'}**.\n"
+                "Available options: **true** or **false**."
+            )
             return
         await self.config.guild(ctx.guild).early_close_send_dm.set(on_off)
         await ctx.send(f"Send DM before early-close removal: **{'Yes' if on_off else 'No'}**.")
 
-    @_applications.command(name="earlyclosetempbanduration")
+    @_policy_early_close.command(name="tempbanduration")
     async def _early_close_tempban_duration(
         self,
         ctx: commands.Context,
@@ -3340,7 +3458,7 @@ class Applications(commands.Cog):
     ):
         """Set tempban duration when early-close action is tempban.
         
-        Use: [p]applications earlyclosetempbanduration <amount> <unit>
+        Use: [p]applications policy earlyclose tempbanduration <amount> <unit>
         Units: seconds/s, minutes/m, hours/h, days/d.
         If omitted, shows current duration.
         """
@@ -3348,7 +3466,10 @@ class Applications(commands.Cog):
             current = await self.config.guild(ctx.guild).early_close_tempban_duration_seconds()
             if current is None:
                 current = 86400
-            await ctx.send(f"Early close tempban duration: {self._format_timeout(int(current))}.")
+            await ctx.send(
+                f"Early close tempban duration: {self._format_timeout(int(current))}.\n"
+                "Available units: **seconds/s**, **minutes/m**, **hours/h**, **days/d**."
+            )
             return
         unit_map = {
             "s": 1, "sec": 1, "second": 1, "seconds": 1,
@@ -3457,14 +3578,14 @@ class Applications(commands.Cog):
 
         await ctx.send(embed=embed, view=view)
 
-    @_applications.command(name="cleanup")
+    @_maintenance.command(name="cleanup")
     async def _cleanup(self, ctx: commands.Context):
         """Manually trigger cleanup of expired application channels."""
         await ctx.send("Cleaning up expired application channels...")
         cleaned = await self.cleanup_channels(ctx.guild)
         await ctx.send(f"✅ Cleaned up {cleaned} expired application channel(s).")
 
-    @_applications.command(name="resend", aliases=["refresh"])
+    @_maintenance.command(name="resend", aliases=["refresh"])
     async def _resend_welcome(self, ctx: commands.Context, member: Optional[discord.Member] = None):
         """Re-send the welcome message to a user's application channel.
         
@@ -3492,7 +3613,7 @@ class Applications(commands.Cog):
             if not member:
                 await ctx.send(
                     "❌ No member specified and this doesn't appear to be an application channel. "
-                    "Please specify a member: `[p]applications resend @user`"
+                    "Please specify a member: `[p]applications maintenance resend @user`"
                 )
                 return
 
@@ -3673,6 +3794,23 @@ class Applications(commands.Cog):
 
         await ctx.send(embed=embed)
 
+    @_field.command(name="preview")
+    async def _field_preview(self, ctx: commands.Context):
+        """Preview the current server application form (opens the real form; submitting does nothing)."""
+        fields = await self.config.guild(ctx.guild).form_fields()
+        if not fields:
+            await ctx.send(
+                "No application form configured. Add fields with `{0}applications field add` or use the field manager: `{0}applications field manager`.".format(
+                    ctx.clean_prefix
+                )
+            )
+            return
+
+        await ctx.send(
+            "Click the button below to open the application form as applicants see it. Submitting the form will not save anything.",
+            view=PreviewFormView(self),
+        )
+
     @_field.command(name="confirmtext")
     async def _field_confirm_text(self, ctx: commands.Context, name: str, *, confirm_text: str):
         """Set the confirmation text for a confirm field.
@@ -3775,7 +3913,7 @@ class Applications(commands.Cog):
         cleanup_delay = await g.cleanup_delay() or 24
         kick_timeout_seconds = await g.kick_timeout_seconds() or 86400
         rejoin_invite = await g.rejoin_invite()
-        denial_action = self._normalize_member_action(await g.denial_action())
+        denial_action = self._normalize_member_action(await g.denial_action(), allow_none=True)
         denial_send_dm = await g.denial_send_dm()
         denial_tempban_seconds = await g.denial_tempban_duration_seconds() or 86400
         early_close_action = self._normalize_member_action(await g.early_close_action())
@@ -3946,39 +4084,25 @@ class Applications(commands.Cog):
 
         await ctx.send(embed=embed)
 
-    @_applications.command(name="preview")
-    async def _preview(self, ctx: commands.Context):
-        """Preview the current server application form (opens the real form; submitting does nothing)."""
-        fields = await self.config.guild(ctx.guild).form_fields()
-        if not fields:
-            await ctx.send(
-                "No application form configured. Add fields with `{0}applications field add` or use the field manager: `{0}applications field manager`.".format(
-                    ctx.clean_prefix
-                )
-            )
-            return
-
-        await ctx.send(
-            "Click the button below to open the application form as applicants see it. Submitting the form will not save anything.",
-            view=PreviewFormView(self),
-        )
-
     @_applications.command(name="approve", aliases=["a"])
     async def _approve(self, ctx: commands.Context, member: Optional[discord.Member] = None):
         """Approve an application.
         
-        If run in an application channel without specifying a member, 
-        it will approve the application for the channel owner.
+        If run in an application or interview channel without specifying a member,
+        it will approve the matching applicant.
         """
         # If no member specified, try to find from current channel
         if member is None:
             applications = await self.config.guild(ctx.guild).applications()
             current_channel_id = ctx.channel.id
             
-            # Find application by channel ID
+            # Find application by legacy channel ID or interview channel ID
             found_member = None
             for user_id, app_data in applications.items():
-                if app_data.get("channel_id") == current_channel_id:
+                if (
+                    app_data.get("channel_id") == current_channel_id
+                    or app_data.get("interview_channel_id") == current_channel_id
+                ):
                     found_member = ctx.guild.get_member(int(user_id))
                     if found_member:
                         member = found_member
@@ -3986,7 +4110,7 @@ class Applications(commands.Cog):
             
             if not member:
                 await ctx.send(
-                    "❌ No member specified and this doesn't appear to be an application channel. "
+                    "❌ No member specified and this doesn't appear to be an application/interview channel. "
                     "Please specify a member: `[p]applications approve @user`"
                 )
                 return
@@ -4101,18 +4225,21 @@ class Applications(commands.Cog):
     ):
         """Deny an application.
         
-        If run in an application channel without specifying a member, 
-        it will deny the application for the channel owner.
+        If run in an application or interview channel without specifying a member,
+        it will deny the matching applicant.
         """
         # If no member specified, try to find from current channel
         if member is None:
             applications = await self.config.guild(ctx.guild).applications()
             current_channel_id = ctx.channel.id
             
-            # Find application by channel ID
+            # Find application by legacy channel ID or interview channel ID
             found_member = None
             for user_id, app_data in applications.items():
-                if app_data.get("channel_id") == current_channel_id:
+                if (
+                    app_data.get("channel_id") == current_channel_id
+                    or app_data.get("interview_channel_id") == current_channel_id
+                ):
                     found_member = ctx.guild.get_member(int(user_id))
                     if found_member:
                         member = found_member
@@ -4120,7 +4247,7 @@ class Applications(commands.Cog):
             
             if not member:
                 await ctx.send(
-                    "❌ No member specified and this doesn't appear to be an application channel. "
+                    "❌ No member specified and this doesn't appear to be an application/interview channel. "
                     "Please specify a member: `[p]applications deny @user [reason]`"
                 )
                 return
@@ -4164,7 +4291,9 @@ class Applications(commands.Cog):
         )
 
         # Execute configured denial action (DM before removal)
-        denial_action = self._normalize_member_action(await self.config.guild(ctx.guild).denial_action())
+        denial_action = self._normalize_member_action(
+            await self.config.guild(ctx.guild).denial_action(), allow_none=True
+        )
         denial_send_dm = await self.config.guild(ctx.guild).denial_send_dm()
         denial_tempban_seconds = (
             await self.config.guild(ctx.guild).denial_tempban_duration_seconds()
@@ -4349,7 +4478,9 @@ class Applications(commands.Cog):
         )
 
         # Execute configured denial action (DM before removal)
-        denial_action = self._normalize_member_action(await self.config.guild(interaction.guild).denial_action())
+        denial_action = self._normalize_member_action(
+            await self.config.guild(interaction.guild).denial_action(), allow_none=True
+        )
         denial_send_dm = await self.config.guild(interaction.guild).denial_send_dm()
         denial_tempban_seconds = (
             await self.config.guild(interaction.guild).denial_tempban_duration_seconds()
@@ -4598,7 +4729,7 @@ class Applications(commands.Cog):
             if str(member.id) in apps:
                 del apps[str(member.id)]
 
-    @_applications.command(name="clearorphaned")
+    @_maintenance.command(name="clearorphaned")
     async def _clear_orphaned(self, ctx: commands.Context):
         """Remove application entries whose channel is missing or deleted.
         
@@ -4625,7 +4756,7 @@ class Applications(commands.Cog):
 
         await ctx.send(f"Removed {len(to_remove)} orphaned application entry(ies): user IDs `{', '.join(to_remove)}`.")
 
-    @_applications.command(name="removeuser")
+    @_maintenance.command(name="removeuser")
     async def _remove_user(self, ctx: commands.Context, user_id: int):
         """Remove an application by user ID (e.g. when the member left or the channel is gone).
         
