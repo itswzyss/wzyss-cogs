@@ -2849,6 +2849,9 @@ class Applications(commands.Cog):
             )
             return
 
+        # Respond to the modal within Discord's 3s limit, then do the rest via followup
+        await interaction.response.defer(ephemeral=True)
+
         # Update status
         app_data["status"] = "denied"
         app_data["denied_by"] = interaction.user.id
@@ -2888,8 +2891,8 @@ class Applications(commands.Cog):
             context="denial",
         )
 
-        # Respond to modal
-        await interaction.response.send_message(
+        # Send confirmation (interaction already deferred)
+        await interaction.followup.send(
             f"✅ Application denied. {member.mention} has been notified.", ephemeral=True
         )
 
