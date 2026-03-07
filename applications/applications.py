@@ -133,10 +133,22 @@ class ApplicationModal(Modal):
             return
 
         # Store responses
-        submitted = await self.cog.submit_application(interaction.user, responses)
+        submitted, failure_reason = await self.cog.submit_application(interaction.user, responses)
         if not submitted:
+            error_message = "❌ Unable to submit your application right now. Please contact an administrator."
+            if failure_reason == "duplicate":
+                error_message = "❌ You already have a submitted application on file."
+            elif failure_reason in {
+                "review_channel_not_configured",
+                "review_channel_not_found",
+                "review_channel_post_failed",
+            }:
+                error_message = (
+                    "❌ Application submissions are temporarily unavailable. "
+                    "Please contact an administrator."
+                )
             await interaction.response.send_message(
-                "❌ You already have a submitted application on file.",
+                error_message,
                 ephemeral=True,
             )
             return
@@ -2328,12 +2340,21 @@ class Applications(commands.Cog):
 
     async def submit_application(
         self, member: discord.Member, responses: Dict[str, str]
-    ) -> bool:
-        """Store application and notify admins by posting to the review channel."""
+    ) -> Tuple[bool, Optional[str]]:
+        """Store application and notify admins by posting to the review channel.
+
+        Returns:
+            Tuple[bool, Optional[str]]: (success, failure_reason)
+                failure_reason values:
+                - "duplicate"
+                - "review_channel_not_configured"
+                - "review_channel_not_found"
+                - "review_channel_post_failed"
+        """
         review_channel_id = await self.config.guild(member.guild).review_channel_id()
         if not review_channel_id:
             log.warning("Review channel is not configured for guild %s", member.guild.id)
-            return False
+            return False, "review_channel_not_configured"
         guild_id = member.guild.id
         user_id = member.id
         app_record = {
@@ -2358,7 +2379,7 @@ class Applications(commands.Cog):
                 )
             )
             if already_submitted and not debug_bypass:
-                return False
+                return False, "duplicate"
 
             if debug_bypass:
                 # Reset stale moderation/cleanup fields so repeated test runs behave like a fresh submission.
@@ -2431,15 +2452,15 @@ class Applications(commands.Cog):
             except (discord.Forbidden, discord.HTTPException) as e:
                 log.error("Failed to post application to review channel: %s", e)
                 await restore_application_state_after_failure()
-                return False
+                return False, "review_channel_post_failed"
         else:
             log.warning("Review channel %s not found for guild %s", review_channel_id, member.guild.name)
             await restore_application_state_after_failure()
-            return False
+            return False, "review_channel_not_found"
 
         log.info(f"Application submitted by {member.display_name} in {member.guild.name}")
         await self.log_application_event(member.guild, member, "submitted", responses=responses)
-        return True
+        return True, None
 
     async def _update_review_message_after_resolve(
         self,
@@ -4527,8 +4548,6 @@ class Applications(commands.Cog):
                         to_remove = []
 
                         for user_id, app_data in applications.items():
-                            if user_id in to_remove:
-                                continue
                             cleanup_time_str = app_data.get("cleanup_scheduled_at")
                             if not cleanup_time_str:
                                 continue
@@ -4614,8 +4633,6 @@ class Applications(commands.Cog):
         to_remove = []
 
         for user_id, app_data in applications.items():
-            if user_id in to_remove:
-                continue
             cleanup_time_str = app_data.get("cleanup_scheduled_at")
             if not cleanup_time_str:
                 continue
