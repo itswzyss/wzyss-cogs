@@ -14,6 +14,10 @@ log = logging.getLogger("red.wzyss-cogs.applications")
 # Discord modals support at most 5 TextInput components per modal.
 MAX_FORM_FIELDS = 5
 
+# Custom ID prefixes for persistent approve/deny buttons (must be stable across cog reloads).
+_APPROVE_CUSTOM_ID_PREFIX = "applications:approve:"
+_DENY_CUSTOM_ID_PREFIX = "applications:deny:"
+
 
 class ApplicationModal(Modal):
     """Dynamic modal for application forms."""
@@ -209,15 +213,34 @@ class DenyModal(Modal):
 
 
 class ApproveButton(Button):
-    """Button to approve an application."""
+    """Button to approve an application. Uses persistent custom_id so the view works after cog reload."""
 
-    def __init__(self, cog: "Applications", member: discord.Member):
-        super().__init__(label="Approve", style=discord.ButtonStyle.success)
+    def __init__(
+        self,
+        cog: "Applications",
+        member: Optional[discord.Member] = None,
+        user_id: Optional[int] = None,
+    ):
+        uid = (member.id if member else user_id) or 0
+        super().__init__(
+            label="Approve",
+            style=discord.ButtonStyle.success,
+            custom_id=f"{_APPROVE_CUSTOM_ID_PREFIX}{uid}",
+        )
         self.cog = cog
-        self.member = member
+        self._member = member
+        self._user_id = user_id or (member.id if member else None)
 
     async def callback(self, interaction: discord.Interaction):
         """Approve the application."""
+        member = self._member or (
+            interaction.guild.get_member(self._user_id) if self._user_id else None
+        )
+        if not member:
+            await interaction.response.send_message(
+                "❌ Applicant is no longer in the server.", ephemeral=True
+            )
+            return
         # Check permissions
         if not await self.cog.can_manage_applications(interaction.user, interaction.guild):
             await interaction.response.send_message(
@@ -227,13 +250,13 @@ class ApproveButton(Button):
 
         # Check if already processed
         applications = await self.cog.config.guild(interaction.guild).applications()
-        if str(self.member.id) not in applications:
+        if str(member.id) not in applications:
             await interaction.response.send_message(
-                f"❌ {self.member.mention} does not have an active application.", ephemeral=True
+                f"❌ {member.mention} does not have an active application.", ephemeral=True
             )
             return
 
-        app_data = applications[str(self.member.id)]
+        app_data = applications[str(member.id)]
         if app_data.get("status") != "pending":
             await interaction.response.send_message(
                 f"❌ This application is already {app_data.get('status')}.", ephemeral=True
@@ -241,19 +264,38 @@ class ApproveButton(Button):
             return
 
         # Approve the application
-        await self.cog.approve_application_interaction(interaction, self.member)
+        await self.cog.approve_application_interaction(interaction, member)
 
 
 class DenyButton(Button):
-    """Button to deny an application."""
+    """Button to deny an application. Uses persistent custom_id so the view works after cog reload."""
 
-    def __init__(self, cog: "Applications", member: discord.Member):
-        super().__init__(label="Deny", style=discord.ButtonStyle.danger)
+    def __init__(
+        self,
+        cog: "Applications",
+        member: Optional[discord.Member] = None,
+        user_id: Optional[int] = None,
+    ):
+        uid = (member.id if member else user_id) or 0
+        super().__init__(
+            label="Deny",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"{_DENY_CUSTOM_ID_PREFIX}{uid}",
+        )
         self.cog = cog
-        self.member = member
+        self._member = member
+        self._user_id = user_id or (member.id if member else None)
 
     async def callback(self, interaction: discord.Interaction):
         """Open denial modal."""
+        member = self._member or (
+            interaction.guild.get_member(self._user_id) if self._user_id else None
+        )
+        if not member:
+            await interaction.response.send_message(
+                "❌ Applicant is no longer in the server.", ephemeral=True
+            )
+            return
         # Check permissions
         if not await self.cog.can_manage_applications(interaction.user, interaction.guild):
             await interaction.response.send_message(
@@ -263,13 +305,13 @@ class DenyButton(Button):
 
         # Check if already processed
         applications = await self.cog.config.guild(interaction.guild).applications()
-        if str(self.member.id) not in applications:
+        if str(member.id) not in applications:
             await interaction.response.send_message(
-                f"❌ {self.member.mention} does not have an active application.", ephemeral=True
+                f"❌ {member.mention} does not have an active application.", ephemeral=True
             )
             return
 
-        app_data = applications[str(self.member.id)]
+        app_data = applications[str(member.id)]
         if app_data.get("status") != "pending":
             await interaction.response.send_message(
                 f"❌ This application is already {app_data.get('status')}.", ephemeral=True
@@ -277,19 +319,24 @@ class DenyButton(Button):
             return
 
         # Open denial modal
-        modal = DenyModal(self.cog, self.member)
+        modal = DenyModal(self.cog, member)
         await interaction.response.send_modal(modal)
 
 
 class ApplicationReviewView(View):
-    """View with approve/deny buttons for application review."""
+    """View with approve/deny buttons for application review. Supports member or user_id for cog_load re-registration."""
 
-    def __init__(self, cog: "Applications", member: discord.Member):
+    def __init__(
+        self,
+        cog: "Applications",
+        member: Optional[discord.Member] = None,
+        user_id: Optional[int] = None,
+    ):
         super().__init__(timeout=None)
         self.cog = cog
-        self.member = member
-        self.add_item(ApproveButton(cog, member))
-        self.add_item(DenyButton(cog, member))
+        uid = (member.id if member else user_id) or 0
+        self.add_item(ApproveButton(cog, member=member, user_id=uid if not member else None))
+        self.add_item(DenyButton(cog, member=member, user_id=uid if not member else None))
 
 
 class FieldAddModal(Modal):
@@ -887,8 +934,35 @@ class Applications(commands.Cog):
         log.info("Applications cog initialized")
 
     async def cog_load(self):
-        """Called when the cog is loaded."""
+        """Called when the cog is loaded. Re-register persistent views for pending applications."""
         self.cleanup_task = self.bot.loop.create_task(self.cleanup_loop())
+        for guild in self.bot.guilds:
+            try:
+                applications = await self.config.guild(guild).applications()
+                for user_id_str, app_data in applications.items():
+                    if app_data.get("status") != "pending":
+                        continue
+                    user_id = int(user_id_str)
+                    view = ApplicationReviewView(self, user_id=user_id)
+                    self.bot.add_view(view)
+                    channel_id = app_data.get("channel_id")
+                    if not channel_id:
+                        continue
+                    channel = guild.get_channel(channel_id)
+                    if not channel:
+                        continue
+                    try:
+                        async for message in channel.history(limit=50):
+                            if message.author != self.bot.user or not message.components:
+                                continue
+                            if "Application Submitted" not in (message.content or ""):
+                                continue
+                            await message.edit(view=view)
+                            break
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+            except Exception as e:
+                log.warning("Failed to re-register application views for guild %s: %s", guild.id, e)
 
     async def cog_unload(self):
         """Called when the cog is unloaded."""
