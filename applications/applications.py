@@ -133,7 +133,7 @@ class ApplicationModal(Modal):
             return
 
         # Store responses
-        submitted = await self.cog.submit_application(interaction.user, interaction.channel, responses)
+        submitted = await self.cog.submit_application(interaction.user, responses)
         if not submitted:
             await interaction.response.send_message(
                 "❌ You already have a submitted application on file.",
@@ -166,6 +166,7 @@ class ApplicationButton(Button):
 
         applications = await self.cog.config.guild(interaction.guild).applications()
         existing = applications.get(str(interaction.user.id), {})
+        debug_bypass = await self.cog._is_debug_bypass_user(interaction.guild, interaction.user.id)
         already_submitted = bool(
             isinstance(existing, dict)
             and (
@@ -174,7 +175,7 @@ class ApplicationButton(Button):
                 or existing.get("status") in {"approved", "denied"}
             )
         )
-        if already_submitted:
+        if already_submitted and not debug_bypass:
             await interaction.response.send_message(
                 "❌ You already have a submitted application on file.",
                 ephemeral=True,
@@ -209,6 +210,7 @@ class LobbyApplyButton(Button):
 
         applications = await self.cog.config.guild(interaction.guild).applications()
         existing = applications.get(str(interaction.user.id), {})
+        debug_bypass = await self.cog._is_debug_bypass_user(interaction.guild, interaction.user.id)
         already_submitted = bool(
             isinstance(existing, dict)
             and (
@@ -217,7 +219,7 @@ class LobbyApplyButton(Button):
                 or existing.get("status") in {"approved", "denied"}
             )
         )
-        if already_submitted:
+        if already_submitted and not debug_bypass:
             await interaction.response.send_message(
                 "❌ You already have a submitted application on file.",
                 ephemeral=True,
@@ -1843,7 +1845,6 @@ class Applications(commands.Cog):
             "access_roles": [],  # List of role IDs that grant access on approval (alternative to restricted_role)
             "bypass_roles": [],  # List of role IDs that skip application
             "manager_roles": [],  # List of role IDs that can manage applications
-            "category_id": None,  # Category ID for application channels (legacy)
             "log_channel": None,  # Channel ID for application logging
             "notification_role": None,  # Role ID to ping on new submissions
             "lobby_channel_id": None,  # Channel where welcome/apply panel lives (new flow)
@@ -1862,6 +1863,8 @@ class Applications(commands.Cog):
             "early_close_send_dm": False,
             "early_close_tempban_duration_seconds": 86400,
             "approval_send_dm": False,
+            "debug_bypass_enabled": False,
+            "debug_bypass_user_id": None,
             "pending_unbans": [],  # [{"user_id": int, "unban_at": str (iso)}, ...]
             "form_fields": [
                 {
@@ -1879,7 +1882,7 @@ class Applications(commands.Cog):
                     "placeholder": "Tell us why you're interested in joining...",
                 },
             ],
-            "applications": {},  # {user_id: {channel_id?, status, submitted_at, responses, review_message_id?, interview_channel_id?, ...}}
+            "applications": {},  # {user_id: {status, submitted_at, responses, review_message_id?, interview_channel_id?, ...}}
         }
 
         self.config.register_guild(**default_guild)
@@ -2134,6 +2137,13 @@ class Applications(commands.Cog):
         choices = self._DENIAL_ACTION_CHOICES if allow_none else self._EARLY_CLOSE_ACTION_CHOICES
         return a if a in choices else "kick"
 
+    async def _is_debug_bypass_user(self, guild: discord.Guild, user_id: int) -> bool:
+        """Return True if debug bypass is enabled for this user in the guild."""
+        g = self.config.guild(guild)
+        enabled = await g.debug_bypass_enabled()
+        debug_user_id = await g.debug_bypass_user_id()
+        return bool(enabled and debug_user_id and int(debug_user_id) == int(user_id))
+
     async def _send_approval_dm(self, guild: discord.Guild, member: discord.Member) -> None:
         """Optionally DM a user when their application is approved."""
         try:
@@ -2229,7 +2239,7 @@ class Applications(commands.Cog):
 
         log.warning("Unknown member action '%s' in %s; no moderation action executed", action, context)
 
-    def _start_application_timer(self, guild_id: int, user_id: int, channel_id: int):
+    def _start_application_timer(self, guild_id: int, user_id: int):
         """Start a timer for a user to submit their application (duration from config)."""
         async def timer_task():
             try:
@@ -2335,127 +2345,22 @@ class Applications(commands.Cog):
         user_role_ids = [role.id for role in user.roles]
         return any(role_id in user_role_ids for role_id in manager_roles)
 
-    async def create_application_channel(
-        self, guild: discord.Guild, member: discord.Member
-    ) -> Optional[discord.TextChannel]:
-        """Create a private channel for the application."""
-        category_id = await self.config.guild(guild).category_id()
-        if not category_id:
-            log.warning(f"No category configured for guild {guild.name}")
-            return None
-
-        category = guild.get_channel(category_id)
-        if not category or not isinstance(category, discord.CategoryChannel):
-            log.warning(f"Category {category_id} not found in guild {guild.name}")
-            # Clear invalid category from config
-            await self.config.guild(guild).category_id.set(None)
-            return None
-
-        # Generate channel name
-        username = member.display_name.replace(" ", "-").lower()[:20]
-        channel_name = f"application-{username}"
-
-        # Check if channel already exists
-        existing = discord.utils.get(category.text_channels, name=channel_name)
-        if existing:
-            log.warning(f"Channel {channel_name} already exists for {member.display_name}")
-            return existing
-
-        # Get admin roles (roles with manage_guild permission)
-        admin_roles = [
-            role
-            for role in guild.roles
-            if role.permissions.manage_guild or role.permissions.administrator
-        ]
-
-        # Get manager roles
-        manager_role_ids = await self.config.guild(guild).manager_roles()
-        manager_roles = [
-            guild.get_role(rid) for rid in manager_role_ids if guild.get_role(rid)
-        ]
-
-        # Create channel with permissions
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            member: discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, read_message_history=True
-            ),
-        }
-
-        # Add admin roles
-        for role in admin_roles:
-            overwrites[role] = discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                manage_messages=True,
-            )
-
-        # Add manager roles
-        for role in manager_roles:
-            overwrites[role] = discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                manage_messages=True,
-            )
-
-        try:
-            channel = await category.create_text_channel(
-                name=channel_name, overwrites=overwrites, reason=f"Application channel for {member.display_name}"
-            )
-            log.info(f"Created application channel {channel.name} for {member.display_name}")
-            return channel
-        except discord.Forbidden:
-            log.error(f"Permission denied creating channel in {guild.name}")
-            return None
-        except discord.HTTPException as e:
-            log.error(f"HTTP error creating channel in {guild.name}: {e}")
-            return None
-
-    async def send_welcome_message(self, channel: discord.TextChannel, member: discord.Member):
-        """Send welcome message with application form button."""
-        embed = discord.Embed(
-            title="Welcome! Please Complete Your Application",
-            description=(
-                "Thank you for joining! Before you can access the full server, "
-                "you need to complete an application. Click the button below to get started."
-            ),
-            color=await self.bot.get_embed_color(channel.guild),
-            timestamp=discord.utils.utcnow(),
-        )
-
-        embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
-        embed.set_footer(text="Your application will be reviewed by our staff team.")
-
-        view = View(timeout=None)
-        view.add_item(ApplicationButton(self))
-
-        try:
-            await channel.send(
-                content=f"{member.mention}\n\n",
-                embed=embed,
-                view=view,
-                allowed_mentions=discord.AllowedMentions(users=[member]),
-            )
-        except discord.HTTPException as e:
-            log.error(f"Error sending welcome message: {e}")
-
     async def submit_application(
-        self, member: discord.Member, channel: discord.TextChannel, responses: Dict[str, str]
+        self, member: discord.Member, responses: Dict[str, str]
     ) -> bool:
-        """Store application and notify admins. If review_channel_id is set, post to review channel; else legacy (post to given channel)."""
+        """Store application and notify admins by posting to the review channel."""
         review_channel_id = await self.config.guild(member.guild).review_channel_id()
+        if not review_channel_id:
+            log.warning("Review channel is not configured for guild %s", member.guild.id)
+            return False
         app_record = {
             "status": "pending",
             "submitted_at": datetime.utcnow().isoformat(),
             "responses": responses,
+            "review_message_id": None,
+            "interview_channel_id": None,
         }
-        if review_channel_id:
-            app_record["review_message_id"] = None
-            app_record["interview_channel_id"] = None
-        else:
-            app_record["channel_id"] = channel.id
+        debug_bypass = await self._is_debug_bypass_user(member.guild, member.id)
         async with self.config.guild(member.guild).applications() as applications:
             existing = applications.get(str(member.id), {})
             already_submitted = bool(
@@ -2466,12 +2371,20 @@ class Applications(commands.Cog):
                     or existing.get("status") in {"approved", "denied"}
                 )
             )
-            if already_submitted:
+            if already_submitted and not debug_bypass:
                 return False
 
-            if str(member.id) not in applications:
-                applications[str(member.id)] = {}
-            applications[str(member.id)].update(app_record)
+            if debug_bypass:
+                # Reset stale moderation/cleanup fields so repeated test runs behave like a fresh submission.
+                existing_joined_at = existing.get("joined_at") if isinstance(existing, dict) else None
+                applications[str(member.id)] = {
+                    "joined_at": existing_joined_at or datetime.utcnow().isoformat(),
+                    **app_record,
+                }
+            else:
+                if str(member.id) not in applications:
+                    applications[str(member.id)] = {}
+                applications[str(member.id)].update(app_record)
 
         # Cancel timer task if it exists
         guild_id = member.guild.id
@@ -2500,30 +2413,30 @@ class Applications(commands.Cog):
 
         allowed_mentions = discord.AllowedMentions(roles=[notification_role]) if notification_role else None
 
-        if review_channel_id:
-            # Review channel is admin-only: send only the notification ping (if any), no applicant-facing "received" text
-            review_content = (f"{notification_role.mention}\n" if notification_role else None)
-            review_channel = member.guild.get_channel(review_channel_id)
-            if review_channel and isinstance(review_channel, discord.TextChannel):
-                try:
-                    # Defensive: ensure only notification ping is sent as content (no applicant-facing text)
-                    send_content = review_content
-                    if send_content and ("Application Submitted" in send_content or "received" in send_content.lower() or "pending review" in send_content.lower()):
-                        send_content = (f"{notification_role.mention}\n" if notification_role else None)
-                    msg = await review_channel.send(
-                        content=send_content,
-                        embed=embed,
-                        view=view,
-                        allowed_mentions=allowed_mentions,
-                    )
-                    self.bot.add_view(view, message_id=msg.id)
-                    async with self.config.guild(member.guild).applications() as applications:
-                        if str(member.id) in applications:
-                            applications[str(member.id)]["review_message_id"] = msg.id
-                except (discord.Forbidden, discord.HTTPException) as e:
-                    log.error("Failed to post application to review channel: %s", e)
-            else:
-                log.warning("Review channel %s not found for guild %s", review_channel_id, member.guild.name)
+        # Review channel is admin-only: send only the notification ping (if any), no applicant-facing "received" text
+        review_content = (f"{notification_role.mention}\n" if notification_role else None)
+        review_channel = member.guild.get_channel(review_channel_id)
+        if review_channel and isinstance(review_channel, discord.TextChannel):
+            try:
+                # Defensive: ensure only notification ping is sent as content (no applicant-facing text)
+                send_content = review_content
+                if send_content and ("Application Submitted" in send_content or "received" in send_content.lower() or "pending review" in send_content.lower()):
+                    send_content = (f"{notification_role.mention}\n" if notification_role else None)
+                msg = await review_channel.send(
+                    content=send_content,
+                    embed=embed,
+                    view=view,
+                    allowed_mentions=allowed_mentions,
+                )
+                self.bot.add_view(view, message_id=msg.id)
+                async with self.config.guild(member.guild).applications() as applications:
+                    if str(member.id) in applications:
+                        applications[str(member.id)]["review_message_id"] = msg.id
+            except (discord.Forbidden, discord.HTTPException) as e:
+                log.error("Failed to post application to review channel: %s", e)
+        else:
+            log.warning("Review channel %s not found for guild %s", review_channel_id, member.guild.name)
+            return False
 
         log.info(f"Application submitted by {member.display_name} in {member.guild.name}")
         await self.log_application_event(member.guild, member, "submitted", responses=responses)
@@ -2780,7 +2693,9 @@ class Applications(commands.Cog):
             return
 
         lobby_channel_id = await self.config.guild(member.guild).lobby_channel_id()
-        use_new_flow = bool(lobby_channel_id)
+        if not lobby_channel_id:
+            log.warning("Lobby channel not configured for guild %s; skipping application onboarding", member.guild.id)
+            return
 
         # Check if user already has an active application
         applications = await self.config.guild(member.guild).applications()
@@ -2788,21 +2703,7 @@ class Applications(commands.Cog):
             app_data = applications[str(member.id)]
             if app_data.get("status") == "pending":
                 log.info(f"Member {member.display_name} already has pending application")
-                if use_new_flow:
-                    await self.ensure_lobby_panel(member.guild)
-                    return
-                # Legacy: check if channel still exists, recreate if needed
-                channel_id = app_data.get("channel_id")
-                if channel_id:
-                    channel = member.guild.get_channel(channel_id)
-                    if not channel:
-                        log.info(f"Recreating deleted application channel for {member.display_name}")
-                        channel = await self.create_application_channel(member.guild, member)
-                        if channel:
-                            async with self.config.guild(member.guild).applications() as apps:
-                                if str(member.id) in apps:
-                                    apps[str(member.id)]["channel_id"] = channel.id
-                            await self.send_welcome_message(channel, member)
+                await self.ensure_lobby_panel(member.guild)
                 return
 
         # Assign restricted role (if configured)
@@ -2820,35 +2721,16 @@ class Applications(commands.Cog):
             else:
                 log.warning(f"Restricted role {restricted_role_id} not found in {member.guild.name}")
 
-        if use_new_flow:
-            # New flow: no per-user channel; ensure lobby panel exists; create app record; start timer
-            await self.ensure_lobby_panel(member.guild)
-            async with self.config.guild(member.guild).applications() as applications:
-                applications[str(member.id)] = {
-                    "status": "pending",
-                    "submitted_at": None,
-                    "responses": {},
-                    "joined_at": datetime.utcnow().isoformat(),
-                }
-            self._start_application_timer(member.guild.id, member.id, 0)
-            return
-
-        # Legacy: create application channel and send welcome message
-        channel = await self.create_application_channel(member.guild, member)
-        if not channel:
-            log.error(f"Failed to create application channel for {member.display_name}")
-            return
-
+        # New flow: no per-user channel; ensure lobby panel exists; create app record; start timer
+        await self.ensure_lobby_panel(member.guild)
         async with self.config.guild(member.guild).applications() as applications:
             applications[str(member.id)] = {
-                "channel_id": channel.id,
                 "status": "pending",
                 "submitted_at": None,
                 "responses": {},
                 "joined_at": datetime.utcnow().isoformat(),
             }
-        await self.send_welcome_message(channel, member)
-        self._start_application_timer(member.guild.id, member.id, channel.id)
+        self._start_application_timer(member.guild.id, member.id)
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
@@ -2857,19 +2739,15 @@ class Applications(commands.Cog):
         if str(member.id) not in applications:
             return
 
-        app_data = applications[str(member.id)]
-        channel_id = app_data.get("channel_id")
-
-        if channel_id:
-            channel = member.guild.get_channel(channel_id)
-            if channel:
-                try:
-                    await channel.delete(reason="Member left server")
-                    log.info(f"Deleted application channel for {member.display_name}")
-                except discord.Forbidden:
-                    log.warning(f"Permission denied deleting channel {channel_id}")
-                except discord.HTTPException as e:
-                    log.error(f"Error deleting channel: {e}")
+        guild_id = member.guild.id
+        user_id = member.id
+        if guild_id in self.timer_tasks and user_id in self.timer_tasks[guild_id]:
+            task = self.timer_tasks[guild_id][user_id]
+            if not task.done():
+                task.cancel()
+            del self.timer_tasks[guild_id][user_id]
+            if not self.timer_tasks[guild_id]:
+                del self.timer_tasks[guild_id]
 
         # Remove from applications
         async with self.config.guild(member.guild).applications() as apps:
@@ -2942,7 +2820,7 @@ class Applications(commands.Cog):
         """Set the role that restricts channel access.
 
         This role should be configured in Discord to deny view permissions
-        for all channels except the application category.
+        for restricted areas until an application is approved.
         """
         if role is None:
             await self.config.guild(ctx.guild).restricted_role.set(None)
@@ -2951,7 +2829,7 @@ class Applications(commands.Cog):
             await self.config.guild(ctx.guild).restricted_role.set(role.id)
             await ctx.send(
                 f"Restricted role set to {role.mention}. "
-                f"Make sure this role denies view permissions for all channels except the application category."
+                f"Make sure this role denies view permissions for restricted channels until approval."
             )
 
     @_role.command(name="bypass")
@@ -3045,18 +2923,6 @@ class Applications(commands.Cog):
                     await ctx.send(f"Removed {role.mention} from manager roles.")
                 else:
                     await ctx.send(f"{role.mention} is not a manager role.")
-
-    @_channel.command(name="category")
-    async def _set_category(
-        self, ctx: commands.Context, category: Optional[discord.CategoryChannel] = None
-    ):
-        """Set the category where application channels will be created."""
-        if category is None:
-            await self.config.guild(ctx.guild).category_id.set(None)
-            await ctx.send("Category cleared.")
-        else:
-            await self.config.guild(ctx.guild).category_id.set(category.id)
-            await ctx.send(f"Application channels will be created in {category.mention}.")
 
     @_channel.command(name="log")
     async def _set_log_channel(
@@ -3175,7 +3041,7 @@ class Applications(commands.Cog):
         await self.config.guild(ctx.guild).cleanup_delay.set(hours)
         await ctx.send(
             f"Cleanup delay set to {hours} hour(s). "
-            f"Application channels will be deleted {hours} hour(s) after approval or denial."
+            f"Resolved application artifacts will be cleaned up {hours} hour(s) after approval or denial."
         )
 
     @_policy.command(name="kicktimeout")
@@ -3580,100 +3446,59 @@ class Applications(commands.Cog):
 
     @_maintenance.command(name="cleanup")
     async def _cleanup(self, ctx: commands.Context):
-        """Manually trigger cleanup of expired application channels."""
-        await ctx.send("Cleaning up expired application channels...")
+        """Manually trigger cleanup of expired application artifacts."""
+        await ctx.send("Cleaning up expired application artifacts...")
         cleaned = await self.cleanup_channels(ctx.guild)
-        await ctx.send(f"✅ Cleaned up {cleaned} expired application channel(s).")
+        await ctx.send(f"✅ Cleaned up {cleaned} expired application artifact(s).")
 
-    @_maintenance.command(name="resend", aliases=["refresh"])
-    async def _resend_welcome(self, ctx: commands.Context, member: Optional[discord.Member] = None):
-        """Re-send the welcome message to a user's application channel.
-        
-        Useful for troubleshooting when buttons stop working after cog updates.
-        If no member is specified and run in an application channel, uses the channel owner.
+    @_maintenance.command(name="debug")
+    async def _debug_bypass(
+        self,
+        ctx: commands.Context,
+        member_or_flag: Optional[str] = None,
+    ):
+        """Configure debug bypass for repeated testing submissions.
+
+        - `[p]applications maintenance debug` shows current status
+        - `[p]applications maintenance debug @user` enables bypass for one user
+        - `[p]applications maintenance debug off` disables bypass
         """
-        if not await self.config.guild(ctx.guild).enabled():
-            await ctx.send("The application system is not enabled.")
+        g = self.config.guild(ctx.guild)
+        current_enabled = await g.debug_bypass_enabled()
+        current_user_id = await g.debug_bypass_user_id()
+        current_member = ctx.guild.get_member(int(current_user_id)) if current_user_id else None
+
+        # No args: show current status
+        if member_or_flag is None:
+            if current_enabled and current_user_id:
+                label = current_member.mention if current_member else f"`{current_user_id}`"
+                await ctx.send(f"Debug bypass is **enabled** for {label}.")
+            else:
+                await ctx.send("Debug bypass is **disabled**.")
             return
 
-        # If no member specified, try to find from current channel
-        if member is None:
-            applications = await self.config.guild(ctx.guild).applications()
-            current_channel_id = ctx.channel.id
-            
-            # Find application by channel ID
-            found_member = None
-            for user_id, app_data in applications.items():
-                if app_data.get("channel_id") == current_channel_id:
-                    found_member = ctx.guild.get_member(int(user_id))
-                    if found_member:
-                        member = found_member
-                        break
-            
-            if not member:
-                await ctx.send(
-                    "❌ No member specified and this doesn't appear to be an application channel. "
-                    "Please specify a member: `[p]applications maintenance resend @user`"
-                )
-                return
-
-        # Get the member's application data
-        applications = await self.config.guild(ctx.guild).applications()
-        if str(member.id) not in applications:
-            await ctx.send(f"❌ {member.mention} does not have an active application.")
+        normalized = member_or_flag.strip().lower()
+        if normalized in {"off", "disable", "disabled", "false", "0", "clear", "none"}:
+            await g.debug_bypass_enabled.set(False)
+            await g.debug_bypass_user_id.set(None)
+            await ctx.send("Debug bypass disabled.")
             return
 
-        app_data = applications[str(member.id)]
-        channel_id = app_data.get("channel_id")
-        
-        if not channel_id:
-            await ctx.send(f"❌ No application channel found for {member.mention}.")
-            return
-
-        channel = ctx.guild.get_channel(channel_id)
-        if not channel or not isinstance(channel, discord.TextChannel):
-            await ctx.send(f"❌ Application channel not found or invalid.")
-            return
-
-        # Check if application is still pending
-        if app_data.get("status") != "pending":
+        try:
+            member = await commands.MemberConverter().convert(ctx, member_or_flag)
+        except commands.BadArgument:
             await ctx.send(
-                f"⚠️ {member.mention}'s application is already {app_data.get('status')}. "
-                f"Re-sending welcome message anyway for troubleshooting."
+                "Invalid target. Use a member mention/ID to enable, or "
+                f"`{ctx.clean_prefix}applications maintenance debug off` to disable."
             )
+            return
 
-        # Delete old welcome messages (messages from the bot in this channel)
-        try:
-            async for message in channel.history(limit=50):
-                if message.author == ctx.guild.me:
-                    # Check if it's a welcome message (contains "Welcome" in embed title or content)
-                    is_welcome = False
-                    if message.embeds:
-                        for embed in message.embeds:
-                            if embed.title and "Welcome" in embed.title:
-                                is_welcome = True
-                                break
-                    if not is_welcome and message.content and "Welcome" in message.content:
-                        is_welcome = True
-                    
-                    if is_welcome:
-                        try:
-                            await message.delete()
-                        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-                            pass  # Ignore errors deleting old messages
-        except discord.Forbidden:
-            await ctx.send("⚠️ Permission denied reading channel history. Re-sending welcome message anyway.")
-        except discord.HTTPException:
-            pass  # Ignore errors
-
-        # Send fresh welcome message
-        try:
-            await self.send_welcome_message(channel, member)
-            await ctx.send(f"✅ Re-sent welcome message to {member.mention}'s application channel.")
-        except discord.Forbidden:
-            await ctx.send(f"❌ Permission denied sending message to {channel.mention}.")
-        except discord.HTTPException as e:
-            await ctx.send(f"❌ Error sending welcome message: {e}")
+        await g.debug_bypass_user_id.set(member.id)
+        await g.debug_bypass_enabled.set(True)
+        await ctx.send(
+            "Debug bypass enabled for "
+            f"{member.mention}. This user can re-submit applications for testing."
+        )
 
     @_applications.group(name="field")
     async def _field(self, ctx: commands.Context):
@@ -3899,9 +3724,6 @@ class Applications(commands.Cog):
             ctx.guild.get_role(rid) for rid in bypass_role_ids if ctx.guild.get_role(rid)
         ]
 
-        category_id = await g.category_id()
-        category = ctx.guild.get_channel(category_id) if category_id else None
-
         log_channel_id = await g.log_channel()
         log_channel = ctx.guild.get_channel(log_channel_id) if log_channel_id else None
 
@@ -3920,6 +3742,8 @@ class Applications(commands.Cog):
         early_close_send_dm = await g.early_close_send_dm()
         early_close_tempban_seconds = await g.early_close_tempban_duration_seconds() or 86400
         approval_send_dm = await g.approval_send_dm()
+        debug_bypass_enabled = await g.debug_bypass_enabled()
+        debug_bypass_user_id = await g.debug_bypass_user_id()
         pending_unbans = await g.pending_unbans() or []
 
         form_fields = await g.form_fields() or []
@@ -3959,12 +3783,6 @@ class Applications(commands.Cog):
             name="Role System",
             value=role_system_info,
             inline=False,
-        )
-
-        embed.add_field(
-            name="Category",
-            value=category.mention if category else "Not set",
-            inline=True,
         )
 
         embed.add_field(
@@ -4050,6 +3868,24 @@ class Applications(commands.Cog):
             value=str(len(pending_unbans)),
             inline=True,
         )
+        debug_member = (
+            ctx.guild.get_member(int(debug_bypass_user_id)) if debug_bypass_user_id else None
+        )
+        debug_target = (
+            debug_member.mention
+            if debug_member
+            else (f"`{debug_bypass_user_id}`" if debug_bypass_user_id else "Not set")
+        )
+        embed.add_field(
+            name="Debug Bypass",
+            value=("Enabled" if debug_bypass_enabled else "Disabled"),
+            inline=True,
+        )
+        embed.add_field(
+            name="Debug Target",
+            value=debug_target,
+            inline=True,
+        )
 
         if bypass_roles:
             bypass_list = ", ".join([r.mention for r in bypass_roles])
@@ -4088,7 +3924,7 @@ class Applications(commands.Cog):
     async def _approve(self, ctx: commands.Context, member: Optional[discord.Member] = None):
         """Approve an application.
         
-        If run in an application or interview channel without specifying a member,
+        If run in an interview channel without specifying a member,
         it will approve the matching applicant.
         """
         # If no member specified, try to find from current channel
@@ -4096,13 +3932,10 @@ class Applications(commands.Cog):
             applications = await self.config.guild(ctx.guild).applications()
             current_channel_id = ctx.channel.id
             
-            # Find application by legacy channel ID or interview channel ID
+            # Find application by interview channel ID
             found_member = None
             for user_id, app_data in applications.items():
-                if (
-                    app_data.get("channel_id") == current_channel_id
-                    or app_data.get("interview_channel_id") == current_channel_id
-                ):
+                if app_data.get("interview_channel_id") == current_channel_id:
                     found_member = ctx.guild.get_member(int(user_id))
                     if found_member:
                         member = found_member
@@ -4110,7 +3943,7 @@ class Applications(commands.Cog):
             
             if not member:
                 await ctx.send(
-                    "❌ No member specified and this doesn't appear to be an application/interview channel. "
+                    "❌ No member specified and this doesn't appear to be an interview channel. "
                     "Please specify a member: `[p]applications approve @user`"
                 )
                 return
@@ -4196,24 +4029,6 @@ class Applications(commands.Cog):
         if await self.config.guild(ctx.guild).approval_send_dm():
             await self._send_approval_dm(ctx.guild, member)
 
-        # Notify in channel (legacy per-user channel)
-        channel_id = app_data.get("channel_id")
-        if channel_id:
-            channel = ctx.guild.get_channel(channel_id)
-            if channel:
-                embed = await self.create_review_embed(
-                    member, app_data.get("responses", {}), "approved"
-                )
-                try:
-                    await channel.send(
-                        f"✅ **Application Approved!**\n\n"
-                        f"Congratulations {member.mention}! Your application has been approved. "
-                        f"You now have full access to the server.",
-                        embed=embed,
-                    )
-                except discord.HTTPException:
-                    pass
-
         # Update review channel message (new flow): remove buttons, show approved
         await self._update_review_message_after_resolve(ctx.guild, app_data, member, "approved")
 
@@ -4225,7 +4040,7 @@ class Applications(commands.Cog):
     ):
         """Deny an application.
         
-        If run in an application or interview channel without specifying a member,
+        If run in an interview channel without specifying a member,
         it will deny the matching applicant.
         """
         # If no member specified, try to find from current channel
@@ -4233,13 +4048,10 @@ class Applications(commands.Cog):
             applications = await self.config.guild(ctx.guild).applications()
             current_channel_id = ctx.channel.id
             
-            # Find application by legacy channel ID or interview channel ID
+            # Find application by interview channel ID
             found_member = None
             for user_id, app_data in applications.items():
-                if (
-                    app_data.get("channel_id") == current_channel_id
-                    or app_data.get("interview_channel_id") == current_channel_id
-                ):
+                if app_data.get("interview_channel_id") == current_channel_id:
                     found_member = ctx.guild.get_member(int(user_id))
                     if found_member:
                         member = found_member
@@ -4247,7 +4059,7 @@ class Applications(commands.Cog):
             
             if not member:
                 await ctx.send(
-                    "❌ No member specified and this doesn't appear to be an application/interview channel. "
+                    "❌ No member specified and this doesn't appear to be an interview channel. "
                     "Please specify a member: `[p]applications deny @user [reason]`"
                 )
                 return
@@ -4310,27 +4122,6 @@ class Applications(commands.Cog):
             tempban_seconds=denial_tempban_seconds,
             context="denial",
         )
-
-        # Notify in channel (legacy per-user channel)
-        channel_id = app_data.get("channel_id")
-        if channel_id:
-            channel = ctx.guild.get_channel(channel_id)
-            if channel:
-                embed = await self.create_review_embed(
-                    member, app_data.get("responses", {}), "denied"
-                )
-                if reason:
-                    embed.add_field(name="Reason", value=reason, inline=False)
-
-                try:
-                    await channel.send(
-                        f"❌ **Application Denied**\n\n"
-                        f"Sorry {member.mention}, your application has been denied. "
-                        f"You can appeal this decision by messaging an admin in this channel.",
-                        embed=embed,
-                    )
-                except discord.HTTPException:
-                    pass
 
         # Update review channel message (new flow): remove buttons, show denied
         await self._update_review_message_after_resolve(ctx.guild, app_data, member, "denied", reason=reason)
@@ -4412,24 +4203,6 @@ class Applications(commands.Cog):
                 f"✅ Approved {member.mention}'s application.", ephemeral=True
             )
 
-        # Send new message in application channel (legacy)
-        channel_id = app_data.get("channel_id")
-        if channel_id:
-            channel = interaction.guild.get_channel(channel_id)
-            if channel:
-                embed = await self.create_review_embed(
-                    member, app_data.get("responses", {}), "approved"
-                )
-                try:
-                    await channel.send(
-                        f"✅ **Application Approved by {interaction.user.mention}**\n\n"
-                        f"Congratulations {member.mention}! Your application has been approved. "
-                        f"You now have full access to the server.",
-                        embed=embed,
-                    )
-                except discord.HTTPException:
-                    pass
-
         # Update review channel message (new flow)
         await self._update_review_message_after_resolve(interaction.guild, app_data, member, "approved")
 
@@ -4508,50 +4281,6 @@ class Applications(commands.Cog):
             interaction.guild, app_data, member, "denied", reason=reason
         )
 
-        # Try to find and update the original message with buttons (legacy per-user channel)
-        channel_id = app_data.get("channel_id")
-        if channel_id:
-            channel = interaction.guild.get_channel(channel_id)
-            if channel:
-                # Try to find the submission message and update it
-                try:
-                    async for message in channel.history(limit=50):
-                        if message.author == interaction.guild.me and message.embeds:
-                            embed = message.embeds[0]
-                            if embed.title and member.display_name in embed.title and "pending" in embed.title.lower():
-                                # Found the submission message, update it
-                                new_embed = await self.create_review_embed(
-                                    member, app_data.get("responses", {}), "denied"
-                                )
-                                new_embed.add_field(name="Reason", value=reason, inline=False)
-                                await message.edit(
-                                    content=(
-                                        f"❌ **Application Denied by {interaction.user.mention}**\n\n"
-                                        f"Sorry {member.mention}, your application has been denied. "
-                                        f"You can appeal this decision by messaging an admin in this channel."
-                                    ),
-                                    embed=new_embed,
-                                    view=None,
-                                )
-                                break
-                except discord.HTTPException:
-                    pass
-
-                # Also send a notification message
-                embed = await self.create_review_embed(
-                    member, app_data.get("responses", {}), "denied"
-                )
-                embed.add_field(name="Reason", value=reason, inline=False)
-                try:
-                    await channel.send(
-                        f"❌ **Application Denied**\n\n"
-                        f"Sorry {member.mention}, your application has been denied. "
-                        f"You can appeal this decision by messaging an admin in this channel.",
-                        embed=embed,
-                    )
-                except discord.HTTPException:
-                    pass
-
         log.info(f"Application denied for {member.display_name} by {interaction.user.display_name}")
 
     @_applications.command(name="view")
@@ -4601,14 +4330,11 @@ class Applications(commands.Cog):
         )
 
         review_channel_id = await self.config.guild(ctx.guild).review_channel_id()
+        review_channel = ctx.guild.get_channel(review_channel_id) if review_channel_id else None
         for user_id, app_data in list(pending.items())[:10]:  # Limit to 10
             member = ctx.guild.get_member(int(user_id))
             if member:
-                channel_id = app_data.get("channel_id")
-                channel = ctx.guild.get_channel(channel_id) if channel_id else None
-                if not channel and review_channel_id:
-                    channel = ctx.guild.get_channel(review_channel_id)
-                loc = f"**Location:** {channel.mention}" if channel else "**Location:** Review channel"
+                loc = f"**Location:** {review_channel.mention}" if review_channel else "**Location:** Review channel"
                 embed.add_field(
                     name=member.display_name,
                     value=f"{loc}\n**User:** {member.mention}",
@@ -4622,28 +4348,28 @@ class Applications(commands.Cog):
 
     @_applications.command(name="close")
     async def _close(self, ctx: commands.Context, member: Optional[discord.Member] = None):
-        """Close/delete an application channel.
-        
-        If run in an application channel without specifying a member, 
-        it will close the current channel.
+        """Close an application and remove review/interview artifacts.
+
+        If run in an interview channel without specifying a member,
+        it will close that applicant's application.
         """
         # If no member specified, try to find from current channel
         if member is None:
             applications = await self.config.guild(ctx.guild).applications()
             current_channel_id = ctx.channel.id
-            
-            # Find application by channel ID
+
+            # Find application by interview channel ID
             found_member = None
             for user_id, app_data in applications.items():
-                if app_data.get("channel_id") == current_channel_id:
+                if app_data.get("interview_channel_id") == current_channel_id:
                     found_member = ctx.guild.get_member(int(user_id))
                     if found_member:
                         member = found_member
                         break
-            
+
             if not member:
                 await ctx.send(
-                    "❌ No member specified and this doesn't appear to be an application channel. "
+                    "❌ No member specified and this doesn't appear to be an interview channel. "
                     "Please specify a member: `[p]applications close @user`"
                 )
                 return
@@ -4654,7 +4380,6 @@ class Applications(commands.Cog):
             return
 
         app_data = applications[str(member.id)]
-        channel_id = app_data.get("channel_id")
         submitted = app_data.get("submitted_at") or app_data.get("responses")
         # Skip early_close action for users who were already approved (e.g. approved without submitting).
         run_early_close = not submitted and app_data.get("status") != "approved"
@@ -4686,43 +4411,26 @@ class Applications(commands.Cog):
                 decision_maker=ctx.guild.get_member(ctx.author.id),
             )
 
-        if channel_id:
-            channel = ctx.guild.get_channel(channel_id)
-            if channel:
+        review_message_id = app_data.get("review_message_id")
+        review_channel_id = await self.config.guild(ctx.guild).review_channel_id()
+        if review_channel_id and review_message_id:
+            ch = ctx.guild.get_channel(review_channel_id)
+            if ch:
                 try:
-                    await channel.delete(reason=f"Application closed by {ctx.author.display_name}")
-                    if channel.id != ctx.channel.id:
-                        await ctx.send(f"✅ Closed application channel for {member.mention}.")
-                except discord.Forbidden:
-                    await ctx.send("❌ Permission denied deleting channel.")
-                except discord.HTTPException as e:
-                    await ctx.send(f"❌ Error deleting channel: {e}")
-            else:
-                await ctx.send("Channel not found.")
-        else:
-            # New flow: may have review message only; optionally delete it and interview channel
-            review_message_id = app_data.get("review_message_id")
-            review_channel_id = await self.config.guild(ctx.guild).review_channel_id()
-            if review_channel_id and review_message_id:
-                ch = ctx.guild.get_channel(review_channel_id)
-                if ch:
+                    msg = await ch.fetch_message(review_message_id)
+                    await msg.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+        if await self.config.guild(ctx.guild).delete_interview_on_resolve():
+            interview_channel_id = app_data.get("interview_channel_id")
+            if interview_channel_id:
+                ich = ctx.guild.get_channel(interview_channel_id)
+                if ich:
                     try:
-                        msg = await ch.fetch_message(review_message_id)
-                        await msg.delete()
-                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        await ich.delete(reason="Application closed")
+                    except (discord.Forbidden, discord.HTTPException):
                         pass
-                if await self.config.guild(ctx.guild).delete_interview_on_resolve():
-                    interview_channel_id = app_data.get("interview_channel_id")
-                    if interview_channel_id:
-                        ich = ctx.guild.get_channel(interview_channel_id)
-                        if ich:
-                            try:
-                                await ich.delete(reason="Application closed")
-                            except (discord.Forbidden, discord.HTTPException):
-                                pass
-                await ctx.send(f"✅ Closed application for {member.mention}.")
-            else:
-                await ctx.send("No channel associated with this application.")
+        await ctx.send(f"✅ Closed application for {member.mention}.")
 
         # Remove from applications
         async with self.config.guild(ctx.guild).applications() as apps:
@@ -4731,38 +4439,40 @@ class Applications(commands.Cog):
 
     @_maintenance.command(name="clearorphaned")
     async def _clear_orphaned(self, ctx: commands.Context):
-        """Remove application entries whose channel is missing or deleted.
-        
-        Use this when you have pending applications that cannot be closed normally
-        (e.g. the channel was deleted or the application is stuck with no channel).
-        """
+        """Remove application entries whose review/interview artifacts are missing."""
         applications = await self.config.guild(ctx.guild).applications()
-        to_remove = []
+        review_channel_id = await self.config.guild(ctx.guild).review_channel_id()
+        review_channel = ctx.guild.get_channel(review_channel_id) if review_channel_id else None
+        to_remove = set()
         for user_id, app_data in applications.items():
-            channel_id = app_data.get("channel_id")
-            if channel_id:
-                channel = ctx.guild.get_channel(channel_id)
-                if channel is None:
-                    to_remove.append(user_id)
+            if app_data.get("status") != "pending":
+                continue
+            review_message_id = app_data.get("review_message_id")
+            if review_channel and review_message_id:
+                try:
+                    await review_channel.fetch_message(review_message_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    to_remove.add(user_id)
+            elif review_message_id:
+                to_remove.add(user_id)
+            interview_channel_id = app_data.get("interview_channel_id")
+            if interview_channel_id and not ctx.guild.get_channel(interview_channel_id):
+                to_remove.add(user_id)
 
         if not to_remove:
             await ctx.send("No orphaned application entries found.")
             return
 
         async with self.config.guild(ctx.guild).applications() as apps:
-            for user_id in to_remove:
+            for user_id in sorted(to_remove):
                 if user_id in apps:
                     del apps[user_id]
 
-        await ctx.send(f"Removed {len(to_remove)} orphaned application entry(ies): user IDs `{', '.join(to_remove)}`.")
+        await ctx.send(f"Removed {len(to_remove)} orphaned application entry(ies): user IDs `{', '.join(sorted(to_remove))}`.")
 
     @_maintenance.command(name="removeuser")
     async def _remove_user(self, ctx: commands.Context, user_id: int):
-        """Remove an application by user ID (e.g. when the member left or the channel is gone).
-        
-        Use when you cannot use `applications close @member` because the member is no longer
-        in the server or the application channel no longer exists.
-        """
+        """Remove an application by user ID (e.g. when the member left)."""
         applications = await self.config.guild(ctx.guild).applications()
         user_id_str = str(user_id)
         if user_id_str not in applications:
@@ -4770,14 +4480,6 @@ class Applications(commands.Cog):
             return
 
         app_data = applications[user_id_str]
-        channel_id = app_data.get("channel_id")
-        if channel_id:
-            channel = ctx.guild.get_channel(channel_id)
-            if channel:
-                try:
-                    await channel.delete(reason=f"Application removed by {ctx.author.display_name}")
-                except (discord.Forbidden, discord.HTTPException):
-                    pass
         review_channel_id = await self.config.guild(ctx.guild).review_channel_id()
         review_message_id = app_data.get("review_message_id")
         if review_channel_id and review_message_id:
@@ -4804,7 +4506,7 @@ class Applications(commands.Cog):
         await ctx.send(f"Removed application record for user ID `{user_id}`.")
 
     async def cleanup_loop(self):
-        """Background task to periodically clean up expired application channels."""
+        """Background task to periodically clean up expired application artifacts."""
         await self.bot.wait_until_ready()
 
         while True:
@@ -4812,7 +4514,7 @@ class Applications(commands.Cog):
                 # Wait 1 hour before checking again
                 await asyncio.sleep(3600)
 
-                log.debug("Running application channel cleanup check")
+                log.debug("Running application cleanup check")
 
                 for guild in self.bot.guilds:
                     try:
@@ -4823,11 +4525,6 @@ class Applications(commands.Cog):
                         current_time = datetime.utcnow()
 
                         to_remove = []
-                        # Orphaned entries (legacy): channel_id set but channel was deleted
-                        for user_id, app_data in applications.items():
-                            channel_id = app_data.get("channel_id")
-                            if channel_id and guild.get_channel(channel_id) is None:
-                                to_remove.append(user_id)
 
                         for user_id, app_data in applications.items():
                             if user_id in to_remove:
@@ -4839,25 +4536,8 @@ class Applications(commands.Cog):
                             try:
                                 cleanup_time = datetime.fromisoformat(cleanup_time_str)
                                 if current_time >= cleanup_time:
-                                    channel_id = app_data.get("channel_id")
                                     review_message_id = app_data.get("review_message_id")
                                     review_channel_id = await self.config.guild(guild).review_channel_id()
-                                    if channel_id:
-                                        channel = guild.get_channel(channel_id)
-                                        if channel:
-                                            try:
-                                                await channel.delete(
-                                                    reason="Application channel cleanup (approved/denied)"
-                                                )
-                                                log.info(
-                                                    f"Cleaned up application channel {channel.name} for user {user_id} in {guild.name}"
-                                                )
-                                            except discord.Forbidden:
-                                                log.warning(
-                                                    f"Permission denied deleting channel {channel_id} in {guild.name}"
-                                                )
-                                            except discord.HTTPException as e:
-                                                log.error(f"Error deleting channel {channel_id}: {e}")
                                     if review_channel_id and review_message_id:
                                         ch = guild.get_channel(review_channel_id)
                                         if ch:
@@ -4923,7 +4603,7 @@ class Applications(commands.Cog):
                 await asyncio.sleep(300)  # 5 minutes
 
     async def cleanup_channels(self, guild: discord.Guild) -> int:
-        """Manually trigger cleanup of expired channels. Returns number of channels cleaned."""
+        """Manually trigger cleanup of expired application artifacts. Returns number cleaned."""
         if not await self.config.guild(guild).enabled():
             return 0
 
@@ -4932,11 +4612,6 @@ class Applications(commands.Cog):
         cleaned = 0
 
         to_remove = []
-        # Orphaned entries (legacy): channel_id set but channel was deleted
-        for user_id, app_data in applications.items():
-            channel_id = app_data.get("channel_id")
-            if channel_id and guild.get_channel(channel_id) is None:
-                to_remove.append(user_id)
 
         for user_id, app_data in applications.items():
             if user_id in to_remove:
@@ -4948,26 +4623,6 @@ class Applications(commands.Cog):
             try:
                 cleanup_time = datetime.fromisoformat(cleanup_time_str)
                 if current_time >= cleanup_time:
-                    channel_id = app_data.get("channel_id")
-                    if channel_id:
-                        channel = guild.get_channel(channel_id)
-                        if channel:
-                            try:
-                                await channel.delete(
-                                    reason="Manual application channel cleanup"
-                                )
-                                cleaned += 1
-                                log.info(
-                                    f"Manually cleaned up application channel {channel.name} for user {user_id} in {guild.name}"
-                                )
-                            except discord.Forbidden:
-                                log.warning(
-                                    f"Permission denied deleting channel {channel_id} in {guild.name}"
-                                )
-                            except discord.HTTPException as e:
-                                log.error(f"Error deleting channel {channel_id}: {e}")
-                        else:
-                            cleaned += 1
                     review_message_id = app_data.get("review_message_id")
                     review_channel_id = await self.config.guild(guild).review_channel_id()
                     if review_channel_id and review_message_id:
