@@ -150,8 +150,16 @@ class ApplicationModal(Modal):
 class ApplicationButton(Button):
     """Button to open the application form."""
 
-    def __init__(self, cog: "Applications"):
-        super().__init__(label="Start Application", style=discord.ButtonStyle.primary, emoji="📝")
+    def __init__(
+        self,
+        cog: "Applications",
+        *,
+        label: str = "Start Application",
+        style: discord.ButtonStyle = discord.ButtonStyle.primary,
+        emoji: Optional[str] = "📝",
+        custom_id: Optional[str] = None,
+    ):
+        super().__init__(label=label, style=style, emoji=emoji, custom_id=custom_id)
         self.cog = cog
 
     async def callback(self, interaction: discord.Interaction):
@@ -191,12 +199,12 @@ class LobbyApplyButton(ApplicationButton):
 
     def __init__(self, cog: "Applications"):
         super().__init__(
+            cog,
             label="Start Application",
             style=discord.ButtonStyle.primary,
             emoji="📝",
             custom_id=_LOBBY_APPLY_CUSTOM_ID,
         )
-        self.cog = cog
 
 
 class LobbyPanelView(View):
@@ -860,29 +868,6 @@ class SetupWizardView(View):
             except discord.HTTPException:
                 pass
 
-    async def _advance(self, interaction: discord.Interaction):
-        if self._step == "role_mode":
-            self._step = "lobby_choice"
-        elif self._step == "lobby_choice":
-            self._step = "lobby_select"
-        elif self._step == "lobby_select":
-            self._step = "review_choice"
-        elif self._step == "review_choice":
-            self._step = "review_select"
-        elif self._step == "review_select":
-            self._step = "log_choice"
-        elif self._step == "log_choice":
-            self._step = "log_select"
-        elif self._step == "log_select":
-            self._step = "manager"
-        elif self._step == "manager":
-            self._step = "notification"
-        elif self._step == "manager_select":
-            self._step = "manager"
-        elif self._step == "notification":
-            self._step = "confirm"
-        await self._update_ui(interaction)
-
     async def _finalize(self, interaction: discord.Interaction):
         """Apply overwrites, save config, send panel."""
         guild = interaction.guild
@@ -911,7 +896,16 @@ class SetupWizardView(View):
                 )
                 s["pending_role"] = pending_role
             except (discord.Forbidden, discord.HTTPException):
-                await interaction.followup.send("Could not create Application Pending role.", ephemeral=True)
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        "Could not create Application Pending role.",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.response.send_message(
+                        "Could not create Application Pending role.",
+                        ephemeral=True,
+                    )
                 return
 
         pending_role = s.get("pending_role")
