@@ -186,8 +186,8 @@ class ApplicationButton(Button):
         await interaction.response.send_modal(modal)
 
 
-class LobbyApplyButton(Button):
-    """Persistent Apply button for the lobby panel. custom_id must be stable for cog reloads."""
+class LobbyApplyButton(ApplicationButton):
+    """Persistent Apply button for the lobby panel; reuses ApplicationButton callback."""
 
     def __init__(self, cog: "Applications"):
         super().__init__(
@@ -197,37 +197,6 @@ class LobbyApplyButton(Button):
             custom_id=_LOBBY_APPLY_CUSTOM_ID,
         )
         self.cog = cog
-
-    async def callback(self, interaction: discord.Interaction):
-        """Open the application modal."""
-        form_fields = await self.cog.config.guild(interaction.guild).form_fields()
-        if not form_fields:
-            await interaction.response.send_message(
-                "❌ No application form has been configured. Please contact an administrator.",
-                ephemeral=True,
-            )
-            return
-
-        applications = await self.cog.config.guild(interaction.guild).applications()
-        existing = applications.get(str(interaction.user.id), {})
-        debug_bypass = await self.cog._is_debug_bypass_user(interaction.guild, interaction.user.id)
-        already_submitted = bool(
-            isinstance(existing, dict)
-            and (
-                existing.get("submitted_at") is not None
-                or bool(existing.get("responses"))
-                or existing.get("status") in {"approved", "denied"}
-            )
-        )
-        if already_submitted and not debug_bypass:
-            await interaction.response.send_message(
-                "❌ You already have a submitted application on file.",
-                ephemeral=True,
-            )
-            return
-
-        modal = ApplicationModal(self.cog, form_fields)
-        await interaction.response.send_modal(modal)
 
 
 class LobbyPanelView(View):
@@ -2134,6 +2103,10 @@ class Applications(commands.Cog):
     def _normalize_member_action(self, action: Optional[str], *, allow_none: bool = False) -> str:
         """Normalize action values and migrate legacy options."""
         a = (action or "").strip().lower()
+        # Legacy value used "notify" for no moderation action.
+        # Preserve that behavior during migration instead of escalating to kick.
+        if a in {"notify", "none"}:
+            return "none"
         choices = self._DENIAL_ACTION_CHOICES if allow_none else self._EARLY_CLOSE_ACTION_CHOICES
         return a if a in choices else "kick"
 
@@ -2353,6 +2326,8 @@ class Applications(commands.Cog):
         if not review_channel_id:
             log.warning("Review channel is not configured for guild %s", member.guild.id)
             return False
+        guild_id = member.guild.id
+        user_id = member.id
         app_record = {
             "status": "pending",
             "submitted_at": datetime.utcnow().isoformat(),
@@ -2361,8 +2336,11 @@ class Applications(commands.Cog):
             "interview_channel_id": None,
         }
         debug_bypass = await self._is_debug_bypass_user(member.guild, member.id)
+        previous_app_state: Optional[Dict] = None
         async with self.config.guild(member.guild).applications() as applications:
             existing = applications.get(str(member.id), {})
+            if isinstance(existing, dict):
+                previous_app_state = dict(existing)
             already_submitted = bool(
                 isinstance(existing, dict)
                 and (
@@ -2386,9 +2364,23 @@ class Applications(commands.Cog):
                     applications[str(member.id)] = {}
                 applications[str(member.id)].update(app_record)
 
+        async def restore_application_state_after_failure():
+            """Rollback submit state if review message cannot be posted."""
+            async with self.config.guild(member.guild).applications() as applications:
+                if previous_app_state is None:
+                    applications.pop(str(member.id), None)
+                else:
+                    applications[str(member.id)] = previous_app_state
+
+            # Keep timeout enforcement active for users that still have an unsubmitted application.
+            needs_timer = previous_app_state is None or previous_app_state.get("submitted_at") is None
+            if needs_timer and (
+                guild_id not in self.timer_tasks
+                or user_id not in self.timer_tasks[guild_id]
+            ):
+                self._start_application_timer(guild_id, user_id)
+
         # Cancel timer task if it exists
-        guild_id = member.guild.id
-        user_id = member.id
         if guild_id in self.timer_tasks and user_id in self.timer_tasks[guild_id]:
             task = self.timer_tasks[guild_id][user_id]
             if not task.done():
@@ -2434,8 +2426,11 @@ class Applications(commands.Cog):
                         applications[str(member.id)]["review_message_id"] = msg.id
             except (discord.Forbidden, discord.HTTPException) as e:
                 log.error("Failed to post application to review channel: %s", e)
+                await restore_application_state_after_failure()
+                return False
         else:
             log.warning("Review channel %s not found for guild %s", review_channel_id, member.guild.name)
+            await restore_application_state_after_failure()
             return False
 
         log.info(f"Application submitted by {member.display_name} in {member.guild.name}")
