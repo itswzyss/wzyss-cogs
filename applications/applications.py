@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 
 import discord
@@ -14,9 +14,11 @@ log = logging.getLogger("red.wzyss-cogs.applications")
 # Discord modals support at most 5 TextInput components per modal.
 MAX_FORM_FIELDS = 5
 
-# Custom ID prefixes for persistent approve/deny buttons (must be stable across cog reloads).
+# Custom ID prefixes for persistent buttons (must be stable across cog reloads).
+_LOBBY_APPLY_CUSTOM_ID = "applications:apply"
 _APPROVE_CUSTOM_ID_PREFIX = "applications:approve:"
 _DENY_CUSTOM_ID_PREFIX = "applications:deny:"
+_INTERVIEW_CUSTOM_ID_PREFIX = "applications:interview:"
 
 
 class ApplicationModal(Modal):
@@ -131,7 +133,25 @@ class ApplicationModal(Modal):
             return
 
         # Store responses
-        await self.cog.submit_application(interaction.user, interaction.channel, responses)
+        submitted, failure_reason = await self.cog.submit_application(interaction.user, responses)
+        if not submitted:
+            error_message = "❌ Unable to submit your application right now. Please contact an administrator."
+            if failure_reason == "duplicate":
+                error_message = "❌ You already have a submitted application on file."
+            elif failure_reason in {
+                "review_channel_not_configured",
+                "review_channel_not_found",
+                "review_channel_post_failed",
+            }:
+                error_message = (
+                    "❌ Application submissions are temporarily unavailable. "
+                    "Please contact an administrator."
+                )
+            await interaction.response.send_message(
+                error_message,
+                ephemeral=True,
+            )
+            return
 
         await interaction.response.send_message(
             "✅ Your application has been submitted! An admin will review it shortly.",
@@ -142,8 +162,16 @@ class ApplicationModal(Modal):
 class ApplicationButton(Button):
     """Button to open the application form."""
 
-    def __init__(self, cog: "Applications"):
-        super().__init__(label="Start Application", style=discord.ButtonStyle.primary, emoji="📝")
+    def __init__(
+        self,
+        cog: "Applications",
+        *,
+        label: str = "Start Application",
+        style: discord.ButtonStyle = discord.ButtonStyle.primary,
+        emoji: Optional[str] = "📝",
+        custom_id: Optional[str] = None,
+    ):
+        super().__init__(label=label, style=style, emoji=emoji, custom_id=custom_id)
         self.cog = cog
 
     async def callback(self, interaction: discord.Interaction):
@@ -156,8 +184,48 @@ class ApplicationButton(Button):
             )
             return
 
+        applications = await self.cog.config.guild(interaction.guild).applications()
+        existing = applications.get(str(interaction.user.id), {})
+        debug_bypass = await self.cog._is_debug_bypass_user(interaction.guild, interaction.user.id)
+        already_submitted = bool(
+            isinstance(existing, dict)
+            and (
+                existing.get("submitted_at") is not None
+                or bool(existing.get("responses"))
+                or existing.get("status") in {"approved", "denied"}
+            )
+        )
+        if already_submitted and not debug_bypass:
+            await interaction.response.send_message(
+                "❌ You already have a submitted application on file.",
+                ephemeral=True,
+            )
+            return
+
         modal = ApplicationModal(self.cog, form_fields)
         await interaction.response.send_modal(modal)
+
+
+class LobbyApplyButton(ApplicationButton):
+    """Persistent Apply button for the lobby panel; reuses ApplicationButton callback."""
+
+    def __init__(self, cog: "Applications"):
+        super().__init__(
+            cog,
+            label="Start Application",
+            style=discord.ButtonStyle.primary,
+            emoji="📝",
+            custom_id=_LOBBY_APPLY_CUSTOM_ID,
+        )
+
+
+class LobbyPanelView(View):
+    """Single persistent view for the lobby panel (embed + Apply button). timeout=None per section 0."""
+
+    def __init__(self, cog: "Applications"):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.add_item(LobbyApplyButton(cog))
 
 
 class PreviewFormButton(Button):
@@ -323,8 +391,112 @@ class DenyButton(Button):
         await interaction.response.send_modal(modal)
 
 
+class InterviewButton(Button):
+    """Button to open an interview channel for the applicant. Persistent custom_id for cog reloads."""
+
+    def __init__(
+        self,
+        cog: "Applications",
+        member: Optional[discord.Member] = None,
+        user_id: Optional[int] = None,
+    ):
+        uid = (member.id if member else user_id) or 0
+        super().__init__(
+            label="Interview",
+            style=discord.ButtonStyle.secondary,
+            emoji="💬",
+            custom_id=f"{_INTERVIEW_CUSTOM_ID_PREFIX}{uid}",
+        )
+        self.cog = cog
+        self._member = member
+        self._user_id = user_id or (member.id if member else None)
+
+    async def callback(self, interaction: discord.Interaction):
+        member = self._member or (
+            interaction.guild.get_member(self._user_id) if self._user_id else None
+        )
+        if not member:
+            await interaction.response.send_message(
+                "❌ Applicant is no longer in the server.", ephemeral=True
+            )
+            return
+        if not await self.cog.can_manage_applications(interaction.user, interaction.guild):
+            await interaction.response.send_message(
+                "❌ You don't have permission to manage applications.", ephemeral=True
+            )
+            return
+        applications = await self.cog.config.guild(interaction.guild).applications()
+        if str(member.id) not in applications:
+            await interaction.response.send_message(
+                f"❌ No active application for {member.mention}.", ephemeral=True
+            )
+            return
+        app_data = applications[str(member.id)]
+        interview_channel_id = app_data.get("interview_channel_id")
+        if interview_channel_id:
+            ch = interaction.guild.get_channel(interview_channel_id)
+            if ch:
+                await interaction.response.send_message(
+                    f"Interview channel already exists: {ch.mention}",
+                    ephemeral=True,
+                )
+                return
+        # Create interview channel (use same category as review channel if possible)
+        guild = interaction.guild
+        review_channel_id = await self.cog.config.guild(guild).review_channel_id()
+        category = None
+        if review_channel_id:
+            ch = guild.get_channel(review_channel_id)
+            if ch and getattr(ch, "category", None):
+                category = ch.category
+        username = member.display_name.replace(" ", "-").lower()[:20]
+        channel_name = f"interview-{username}"
+        manager_role_ids = await self.cog.config.guild(guild).manager_roles()
+        manager_roles = [guild.get_role(rid) for rid in manager_role_ids if guild.get_role(rid)]
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            member: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True
+            ),
+        }
+        for role in manager_roles:
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                manage_messages=True,
+            )
+        try:
+            new_channel = await guild.create_text_channel(
+                name=channel_name,
+                category=category,
+                overwrites=overwrites,
+                reason=f"Interview channel for {member.display_name}",
+            )
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.error("Failed to create interview channel: %s", e)
+            await interaction.response.send_message(
+                "❌ Could not create interview channel. Check bot permissions.",
+                ephemeral=True,
+            )
+            return
+        async with self.cog.config.guild(guild).applications() as apps:
+            if str(member.id) in apps:
+                apps[str(member.id)]["interview_channel_id"] = new_channel.id
+        try:
+            await new_channel.send(
+                f"{member.mention}, an interview has been requested by {interaction.user.mention}."
+            )
+        except discord.HTTPException:
+            pass
+        await interaction.response.send_message(
+            f"✅ Interview channel created: {new_channel.mention}",
+            ephemeral=True,
+        )
+
+
 class ApplicationReviewView(View):
-    """View with approve/deny buttons for application review. Supports member or user_id for cog_load re-registration."""
+    """View with approve/deny/interview buttons for application review. Supports member or user_id for cog_load."""
 
     def __init__(
         self,
@@ -337,6 +509,772 @@ class ApplicationReviewView(View):
         uid = (member.id if member else user_id) or 0
         self.add_item(ApproveButton(cog, member=member, user_id=uid if not member else None))
         self.add_item(DenyButton(cog, member=member, user_id=uid if not member else None))
+        self.add_item(InterviewButton(cog, member=member, user_id=uid if not member else None))
+
+
+# --- Lobby embed builder (panel message in lobby channel) ---
+
+
+class LobbyEmbedConfigModal(Modal):
+    """Modal for configuring the lobby panel embed."""
+
+    def __init__(
+        self,
+        cog: "Applications",
+        existing_data: Optional[Dict] = None,
+        builder_view: Optional["LobbyEmbedBuilderView"] = None,
+    ):
+        title = "Edit Lobby Embed" if existing_data else "Configure Lobby Embed"
+        super().__init__(title=title)
+        self.cog = cog
+        self.existing_data = existing_data or {}
+        self.builder_view = builder_view
+
+        self.title_input = TextInput(
+            label="Title",
+            placeholder="Welcome! Please Apply",
+            default=self.existing_data.get("title", ""),
+            required=True,
+            max_length=256,
+        )
+        self.add_item(self.title_input)
+
+        self.description_input = TextInput(
+            label="Description",
+            placeholder="Thank you for joining. Click the button below to submit your application.",
+            default=self.existing_data.get("description", ""),
+            required=False,
+            style=discord.TextStyle.paragraph,
+            max_length=4000,
+        )
+        self.add_item(self.description_input)
+
+        self.color_input = TextInput(
+            label="Color (hex, optional)",
+            placeholder="#FF0000 or leave empty for default",
+            default=self.existing_data.get("color_hex", ""),
+            required=False,
+            max_length=7,
+        )
+        self.add_item(self.color_input)
+
+        self.footer_input = TextInput(
+            label="Footer (optional)",
+            placeholder="Footer text",
+            default=self.existing_data.get("footer", ""),
+            required=False,
+            max_length=2048,
+        )
+        self.add_item(self.footer_input)
+
+        self.thumbnail_input = TextInput(
+            label="Thumbnail URL (optional)",
+            placeholder="https://example.com/image.png",
+            default=self.existing_data.get("thumbnail_url", ""),
+            required=False,
+            max_length=2000,
+        )
+        self.add_item(self.thumbnail_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        color_hex = (self.color_input.value or "").strip().lstrip("#") or None
+        color = None
+        if color_hex and len(color_hex) == 6:
+            try:
+                color = int(color_hex, 16)
+            except ValueError:
+                color_hex = None
+
+        embed_data = {
+            "title": (self.title_input.value or "").strip() or None,
+            "description": (self.description_input.value or "").strip() or None,
+            "color": color,
+            "color_hex": color_hex,
+            "footer": (self.footer_input.value or "").strip() or None,
+            "thumbnail_url": (self.thumbnail_input.value or "").strip() or None,
+        }
+
+        key = interaction.user.id
+        if key not in self.cog._lobby_embed_builder_states:
+            self.cog._lobby_embed_builder_states[key] = {}
+        self.cog._lobby_embed_builder_states[key]["embed_data"] = embed_data
+
+        await interaction.response.send_message(
+            "Embed configuration saved. Use Preview or Save.",
+            ephemeral=True,
+        )
+        if self.builder_view:
+            await self.builder_view._refresh_embed(user_id=interaction.user.id)
+
+
+class LobbyEmbedBuilderView(View):
+    """Interactive embed builder for the lobby panel: Configure Embed, Preview, Save, Cancel."""
+
+    def __init__(self, cog: "Applications", owner_user_id: Optional[int] = None):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+        self.message: Optional[discord.Message] = None
+
+    def _get_state(self, user_id: int) -> Dict:
+        if user_id not in self.cog._lobby_embed_builder_states:
+            self.cog._lobby_embed_builder_states[user_id] = {"embed_data": {}}
+        return self.cog._lobby_embed_builder_states[user_id]
+
+    async def _refresh_embed(
+        self,
+        interaction: Optional[discord.Interaction] = None,
+        *,
+        user_id: Optional[int] = None,
+    ):
+        user_id = user_id or (interaction.user.id if interaction else self.owner_user_id)
+        if not user_id:
+            return
+        guild = interaction.guild if interaction else (self.message.guild if self.message else None)
+        if not guild:
+            return
+
+        state = self._get_state(user_id)
+        embed_data = state.get("embed_data", {})
+
+        embed = discord.Embed(
+            title="Lobby Panel Embed Builder",
+            description="Use the buttons below to configure, preview, or save.",
+            color=await self.cog.bot.get_embed_color(guild),
+        )
+        embed.add_field(name="Title", value=(embed_data.get("title") or "Not set")[:1024], inline=False)
+        embed.add_field(name="Description", value=(embed_data.get("description") or "Not set")[:1024], inline=False)
+        embed.add_field(name="Color", value=embed_data.get("color_hex") or "Default", inline=True)
+        embed.add_field(name="Footer", value=((embed_data.get("footer") or "Not set")[:256]), inline=True)
+
+        try:
+            if interaction:
+                if interaction.response.is_done():
+                    await interaction.edit_original_response(embed=embed, view=self)
+                else:
+                    await interaction.response.edit_message(embed=embed, view=self)
+            elif self.message:
+                await self.message.edit(embed=embed, view=self)
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+    @discord.ui.button(label="Configure Embed", style=discord.ButtonStyle.primary, emoji="\u270d\ufe0f", row=0)
+    async def configure_embed(self, interaction: discord.Interaction, button: Button):
+        state = self._get_state(interaction.user.id)
+        existing = state.get("embed_data", {})
+        modal = LobbyEmbedConfigModal(self.cog, existing, builder_view=self)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Preview", style=discord.ButtonStyle.secondary, emoji="\U0001f441\ufe0f", row=0)
+    async def preview(self, interaction: discord.Interaction, button: Button):
+        state = self._get_state(interaction.user.id)
+        embed_data = state.get("embed_data", {})
+        if not embed_data.get("title"):
+            await interaction.response.send_message(
+                "Set a title first (Configure Embed).",
+                ephemeral=True,
+            )
+            return
+        embed = await self.cog._embed_from_lobby_data(interaction.guild, embed_data)
+        if not embed:
+            await interaction.response.send_message(
+                "Configure at least a title for the embed.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Save", style=discord.ButtonStyle.success, emoji="\u2705", row=0)
+    async def save(self, interaction: discord.Interaction, button: Button):
+        state = self._get_state(interaction.user.id)
+        embed_data = state.get("embed_data", {})
+        if not embed_data.get("title"):
+            await interaction.response.send_message(
+                "Lobby embed requires a title. Configure Embed first.",
+                ephemeral=True,
+            )
+            return
+        await self.cog.config.guild(interaction.guild).lobby_embed.set(embed_data)
+        self.cog._lobby_embed_builder_states.pop(interaction.user.id, None)
+        await interaction.response.send_message(
+            "Lobby embed saved. The panel in the lobby channel will use this when sent or refreshed.",
+            ephemeral=True,
+        )
+        try:
+            if self.message:
+                await self.message.delete()
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=0)
+    async def cancel(self, interaction: discord.Interaction, button: Button):
+        self.cog._lobby_embed_builder_states.pop(interaction.user.id, None)
+        await interaction.response.send_message("Cancelled.", ephemeral=True)
+        try:
+            if self.message:
+                await self.message.delete()
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+
+# --- Setup wizard (interactive server setup) ---
+
+# Max options in a single Select (Discord limit 25)
+_SETUP_SELECT_MAX = 25
+
+
+def _setup_build_channel_options(guild: discord.Guild) -> List[discord.SelectOption]:
+    """Build Select options from guild text channels (up to _SETUP_SELECT_MAX)."""
+    channels = [c for c in guild.text_channels if c.permissions_for(guild.me).view_channel][:_SETUP_SELECT_MAX]
+    return [discord.SelectOption(label="#" + c.name[:25], value=str(c.id), description=c.name[:50]) for c in channels]
+
+
+def _setup_build_role_options(guild: discord.Guild) -> List[discord.SelectOption]:
+    """Build Select options from guild roles (excluding @everyone, up to _SETUP_SELECT_MAX)."""
+    roles = [r for r in reversed(guild.roles) if r != guild.default_role and r < guild.me.top_role][:_SETUP_SELECT_MAX]
+    return [discord.SelectOption(label=r.name[:25], value=str(r.id), description=f"ID: {r.id}") for r in roles]
+
+
+class SetupWizardView(View):
+    """Multi-step interactive setup: role mode -> lobby -> review -> log -> manager -> notification -> confirm."""
+
+    def __init__(self, cog: "Applications", ctx: commands.Context):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.ctx = ctx
+        self._step = "role_mode"
+        self._state: Dict = {
+            "role_mode": None,
+            "lobby_channel_id": None,
+            "review_channel_id": None,
+            "log_channel_id": None,
+            "manager_role_ids": [],
+            "notification_role_id": None,
+            "category": None,
+            "pending_role": None,
+        }
+        self._message: Optional[discord.Message] = None
+        self._build_step_children()
+
+    def _author_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.ctx.author.id
+
+    def _build_step_children(self):
+        self.clear_items()
+        guild = self.ctx.guild
+        if not guild:
+            return
+        if self._step == "role_mode":
+            self.add_item(SetupRoleModeButton(self, "restricted", "Restricted role", discord.ButtonStyle.primary))
+            self.add_item(SetupRoleModeButton(self, "access", "Access roles", discord.ButtonStyle.secondary))
+        elif self._step == "lobby_choice":
+            self.add_item(SetupChoiceButton(self, "lobby_existing", "Use existing channel"))
+            self.add_item(SetupChoiceButton(self, "lobby_create", "Create new"))
+        elif self._step == "lobby_select":
+            opts = _setup_build_channel_options(guild)
+            if not opts:
+                self.add_item(SetupChoiceButton(self, "lobby_create", "No channels available; create new"))
+            else:
+                self.add_item(SetupChannelSelect(self, "lobby", opts))
+        elif self._step == "review_choice":
+            self.add_item(SetupChoiceButton(self, "review_existing", "Use existing channel"))
+            self.add_item(SetupChoiceButton(self, "review_create", "Create new"))
+        elif self._step == "review_select":
+            opts = _setup_build_channel_options(guild)
+            if not opts:
+                self.add_item(SetupChoiceButton(self, "review_create", "No channels available; create new"))
+            else:
+                self.add_item(SetupChannelSelect(self, "review", opts))
+        elif self._step == "log_choice":
+            self.add_item(SetupChoiceButton(self, "log_existing", "Use existing channel"))
+            self.add_item(SetupChoiceButton(self, "log_create", "Create new"))
+            self.add_item(SetupChoiceButton(self, "log_skip", "Skip log channel"))
+        elif self._step == "log_select":
+            opts = _setup_build_channel_options(guild)
+            if not opts:
+                self.add_item(SetupChoiceButton(self, "log_create", "Create new"))
+                self.add_item(SetupChoiceButton(self, "log_skip", "Skip"))
+            else:
+                self.add_item(SetupChannelSelect(self, "log", opts))
+        elif self._step == "manager":
+            self.add_item(SetupManagerButton(self, "add", "Add manager role"))
+            self.add_item(SetupManagerButton(self, "done", "Done"))
+            self.add_item(SetupManagerButton(self, "skip", "Skip"))
+        elif self._step == "manager_select":
+            opts = _setup_build_role_options(guild)
+            if not opts:
+                self.add_item(SetupManagerButton(self, "done", "No roles available; Done"))
+            else:
+                self.add_item(SetupRoleSelect(self, "manager", opts))
+        elif self._step == "notification":
+            opts = _setup_build_role_options(guild)
+            skip = [discord.SelectOption(label="Skip", value="skip", description="Do not set notification role")]
+            self.add_item(SetupRoleSelect(self, "notification", skip + opts))
+        elif self._step == "confirm":
+            self.add_item(SetupConfirmButton(self))
+
+    def _step_content_embed(self) -> Tuple[str, Optional[discord.Embed]]:
+        """Return (content, embed) for current step."""
+        guild = self.ctx.guild
+        s = self._state
+        if self._step == "role_mode":
+            return "", discord.Embed(
+                title="Application System Setup",
+                description=(
+                    "Choose how new members get access:\n\n"
+                    "**Restricted role:** New members get a role that denies access to most channels until approved. "
+                    "On approval, the role is removed.\n\n"
+                    "**Access roles:** New members have no special role. On approval, they receive roles that grant access."
+                ),
+                color=discord.Color.blue(),
+                timestamp=discord.utils.utcnow(),
+            )
+        if self._step == "lobby_choice":
+            return "**Step 2: Lobby channel** – Where applicants see the apply panel.", None
+        if self._step == "lobby_select":
+            return "Select the **lobby** channel:", None
+        if self._step == "review_choice":
+            return "**Step 3: Review channel** – Where submitted applications are posted for admins.", None
+        if self._step == "review_select":
+            return "Select the **review** channel:", None
+        if self._step == "log_choice":
+            return "**Step 4: Log channel** (optional) – Application events can be logged here.", None
+        if self._step == "log_select":
+            return "Select the **log** channel:", None
+        if self._step == "manager":
+            count = len(s.get("manager_role_ids") or [])
+            return f"**Step 5: Manager roles** – Who can approve/deny applications. Added: {count}. Add more, Done, or Skip.", None
+        if self._step == "manager_select":
+            return "Select a **manager** role to add:", None
+        if self._step == "notification":
+            return "**Step 6: Notification role** – Role to ping when a new application is submitted.", None
+        if self._step == "confirm":
+            lines = [
+                "**Summary**",
+                f"• Mode: **{s.get('role_mode', '')}**",
+            ]
+            lobby_id = s.get("lobby_channel_id")
+            review_id = s.get("review_channel_id")
+            log_id = s.get("log_channel_id")
+            if guild:
+                if lobby_id:
+                    ch = guild.get_channel(lobby_id)
+                    lines.append(f"• Lobby: {ch.mention if ch else lobby_id}")
+                if review_id:
+                    ch = guild.get_channel(review_id)
+                    lines.append(f"• Review: {ch.mention if ch else review_id}")
+                if log_id:
+                    ch = guild.get_channel(log_id)
+                    lines.append(f"• Log: {ch.mention if ch else log_id}")
+                else:
+                    lines.append("• Log: (skip)")
+                manager_ids = s.get("manager_role_ids") or []
+                if manager_ids:
+                    roles = [guild.get_role(r) for r in manager_ids if guild.get_role(r)]
+                    lines.append("• Managers: " + ", ".join(r.mention for r in roles) if roles else "• Managers: (none)")
+                else:
+                    lines.append("• Managers: (skip)")
+                notif_id = s.get("notification_role_id")
+                if notif_id:
+                    r = guild.get_role(notif_id)
+                    lines.append(f"• Notification: {r.mention if r else notif_id}")
+                else:
+                    lines.append("• Notification: (skip)")
+            return "\n".join(lines), None
+        return "", None
+
+    async def _update_ui(self, interaction: discord.Interaction):
+        content, embed = self._step_content_embed()
+        self._build_step_children()
+        try:
+            await interaction.response.edit_message(content=content or None, embed=embed, view=self)
+        except (discord.NotFound, discord.HTTPException):
+            try:
+                await interaction.followup.send(content or "Setup step updated.", ephemeral=True)
+            except discord.HTTPException:
+                pass
+
+    async def _finalize(self, interaction: discord.Interaction):
+        """Apply overwrites, save config, send panel."""
+        guild = interaction.guild
+        if not guild or not guild.me.guild_permissions.manage_channels:
+            await interaction.response.edit_message(content="Bot needs **Manage Channels** permission.", view=None)
+            self.stop()
+            return
+        if not guild.me.guild_permissions.manage_roles:
+            await interaction.response.edit_message(content="Bot needs **Manage Roles** permission.", view=None)
+            self.stop()
+            return
+        s = self._state
+        role_mode = s.get("role_mode") or "access"
+        lobby_id = s.get("lobby_channel_id")
+        review_id = s.get("review_channel_id")
+        log_id = s.get("log_channel_id")
+        manager_ids = s.get("manager_role_ids") or []
+        notification_id = s.get("notification_role_id")
+        pending_role = s.get("pending_role")
+
+        if role_mode == "restricted" and pending_role is None:
+            try:
+                pending_role = await guild.create_role(
+                    name="Application Pending",
+                    reason="Applications cog setup",
+                )
+                s["pending_role"] = pending_role
+            except (discord.Forbidden, discord.HTTPException):
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        "Could not create Application Pending role.",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.response.send_message(
+                        "Could not create Application Pending role.",
+                        ephemeral=True,
+                    )
+                return
+
+        pending_role = s.get("pending_role")
+
+        if not lobby_id or not review_id:
+            await interaction.response.edit_message(content="Lobby and review channels are required.", view=None)
+            self.stop()
+            return
+
+        lobby_ch = guild.get_channel(lobby_id)
+        review_ch = guild.get_channel(review_id)
+        log_ch = guild.get_channel(log_id) if log_id else None
+        if not lobby_ch or not isinstance(lobby_ch, discord.TextChannel):
+            await interaction.response.edit_message(content="Lobby channel no longer found.", view=None)
+            self.stop()
+            return
+        if not review_ch or not isinstance(review_ch, discord.TextChannel):
+            await interaction.response.edit_message(content="Review channel no longer found.", view=None)
+            self.stop()
+            return
+
+        bot_overwrite = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True,
+            manage_messages=True, embed_links=True,
+        )
+        manager_roles = [guild.get_role(rid) for rid in manager_ids if guild.get_role(rid)]
+
+        def overwrites_for_lobby():
+            ow = {guild.me: bot_overwrite}
+            if role_mode == "restricted" and pending_role:
+                ow[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+                ow[pending_role] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True
+                )
+            else:
+                ow[guild.default_role] = discord.PermissionOverwrite(view_channel=True)
+            for r in manager_roles:
+                ow[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+            return ow
+
+        def overwrites_for_review_log():
+            ow = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                guild.me: bot_overwrite,
+            }
+            if role_mode == "restricted" and pending_role:
+                ow[pending_role] = discord.PermissionOverwrite(view_channel=False)
+            for r in manager_roles:
+                ow[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+            return ow
+
+        try:
+            await interaction.response.defer()
+        except discord.NotFound:
+            pass
+
+        try:
+            await lobby_ch.edit(overwrites=overwrites_for_lobby())
+            await review_ch.edit(overwrites=overwrites_for_review_log())
+            if log_ch and isinstance(log_ch, discord.TextChannel):
+                await log_ch.edit(overwrites=overwrites_for_review_log())
+        except (discord.Forbidden, discord.HTTPException) as e:
+            await interaction.followup.send(f"Could not set channel permissions: {e}", ephemeral=True)
+
+        guild_config = self.cog.config.guild(guild)
+        await guild_config.lobby_channel_id.set(lobby_id)
+        await guild_config.review_channel_id.set(review_id)
+        await guild_config.log_channel.set(log_id if log_id else None)
+        await guild_config.role_mode.set(role_mode)
+        await guild_config.enabled.set(True)
+        await guild_config.manager_roles.set(manager_ids)
+        await guild_config.notification_role.set(notification_id if notification_id else None)
+        if role_mode == "restricted" and pending_role:
+            await guild_config.restricted_role.set(pending_role.id)
+        elif role_mode == "access":
+            existing_access = await guild_config.access_roles()
+            if not existing_access:
+                try:
+                    member_role = await guild.create_role(
+                        name="Member",
+                        reason="Applications cog setup (access role)",
+                    )
+                    await guild_config.access_roles.set([member_role.id])
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+        msg = await self.cog.send_lobby_panel(lobby_ch)
+        if msg:
+            await guild_config.lobby_panel_message_id.set(msg.id)
+
+        summary = (
+            f"**Setup complete ({role_mode} mode).**\n"
+            f"• Lobby: {lobby_ch.mention}\n"
+            f"• Review: {review_ch.mention}\n"
+            f"• Log: {log_ch.mention if log_ch else 'Not set'}\n"
+        )
+        if role_mode == "restricted" and pending_role:
+            summary += f"• Restricted role: {pending_role.mention}\n"
+        summary += "\nCustomize the lobby embed with `[p]applications lobby embed`."
+        try:
+            await interaction.message.edit(content=summary, embed=None, view=None)
+        except (discord.NotFound, discord.HTTPException):
+            await interaction.followup.send(summary, ephemeral=True)
+        self.stop()
+
+    async def on_timeout(self):
+        try:
+            if self._message:
+                await self._message.edit(content="Setup timed out.", view=None)
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+
+class SetupRoleModeButton(Button):
+    def __init__(self, wizard: SetupWizardView, mode: str, label: str, style: discord.ButtonStyle):
+        super().__init__(label=label, style=style)
+        self.wizard = wizard
+        self.mode = mode
+
+    async def callback(self, interaction: discord.Interaction):
+        if not self.wizard._author_check(interaction):
+            await interaction.response.send_message("Only the command author can use this.", ephemeral=True)
+            return
+        self.wizard._state["role_mode"] = self.mode
+        self.wizard._step = "lobby_choice"
+        await self.wizard._update_ui(interaction)
+
+
+class SetupChoiceButton(Button):
+    def __init__(self, wizard: SetupWizardView, choice: str, label: str):
+        super().__init__(label=label, style=discord.ButtonStyle.secondary)
+        self.wizard = wizard
+        self.choice = choice
+
+    async def callback(self, interaction: discord.Interaction):
+        if not self.wizard._author_check(interaction):
+            await interaction.response.send_message("Only the command author can use this.", ephemeral=True)
+            return
+        guild = interaction.guild
+        if not guild or not guild.me.guild_permissions.manage_channels:
+            await interaction.response.send_message("Bot needs **Manage Channels** permission.", ephemeral=True)
+            return
+        if not guild.me.guild_permissions.manage_roles:
+            await interaction.response.send_message("Bot needs **Manage Roles** permission.", ephemeral=True)
+            return
+
+        s = self.wizard._state
+        role_mode = s.get("role_mode") or "access"
+        category = s.get("category")
+        pending_role = s.get("pending_role")
+
+        if self.choice == "lobby_existing":
+            self.wizard._step = "lobby_select"
+            await self.wizard._update_ui(interaction)
+            return
+        if self.choice == "lobby_create":
+            try:
+                if category is None:
+                    category = await guild.create_category_channel("Applications", reason="Applications cog setup")
+                    s["category"] = category
+                bot_ow = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True,
+                    manage_messages=True, embed_links=True,
+                )
+                lobby_ow = {guild.me: bot_ow}
+                if role_mode == "restricted":
+                    if pending_role is None:
+                        pending_role = await guild.create_role(name="Application Pending", reason="Applications cog setup")
+                        s["pending_role"] = pending_role
+                    lobby_ow[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+                    lobby_ow[pending_role] = discord.PermissionOverwrite(
+                        view_channel=True, send_messages=True, read_message_history=True
+                    )
+                else:
+                    lobby_ow[guild.default_role] = discord.PermissionOverwrite(view_channel=True)
+                ch = await guild.create_text_channel(
+                    "lobby", category=category, overwrites=lobby_ow, reason="Applications cog setup"
+                )
+                s["lobby_channel_id"] = ch.id
+            except (discord.Forbidden, discord.HTTPException) as e:
+                await interaction.response.send_message(f"Could not create lobby: {e}", ephemeral=True)
+                return
+            self.wizard._step = "review_choice"
+            await self.wizard._update_ui(interaction)
+            return
+        if self.choice == "review_existing":
+            self.wizard._step = "review_select"
+            await self.wizard._update_ui(interaction)
+            return
+        if self.choice == "review_create":
+            try:
+                if category is None:
+                    category = await guild.create_category_channel("Applications", reason="Applications cog setup")
+                    s["category"] = category
+                if role_mode == "restricted" and pending_role is None:
+                    pending_role = await guild.create_role(name="Application Pending", reason="Applications cog setup")
+                    s["pending_role"] = pending_role
+                bot_ow = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True,
+                    manage_messages=True, embed_links=True,
+                )
+                review_ow = {
+                    guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                    guild.me: bot_ow,
+                }
+                if pending_role:
+                    review_ow[pending_role] = discord.PermissionOverwrite(view_channel=False)
+                ch = await guild.create_text_channel(
+                    "application-review", category=category, overwrites=review_ow, reason="Applications cog setup"
+                )
+                s["review_channel_id"] = ch.id
+            except (discord.Forbidden, discord.HTTPException) as e:
+                await interaction.response.send_message(f"Could not create review channel: {e}", ephemeral=True)
+                return
+            self.wizard._step = "log_choice"
+            await self.wizard._update_ui(interaction)
+            return
+        if self.choice == "log_existing":
+            self.wizard._step = "log_select"
+            await self.wizard._update_ui(interaction)
+            return
+        if self.choice == "log_create":
+            try:
+                if category is None:
+                    category = await guild.create_category_channel("Applications", reason="Applications cog setup")
+                    s["category"] = category
+                if role_mode == "restricted" and pending_role is None:
+                    pending_role = await guild.create_role(name="Application Pending", reason="Applications cog setup")
+                    s["pending_role"] = pending_role
+                bot_ow = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True,
+                    manage_messages=True, embed_links=True,
+                )
+                log_ow = {
+                    guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                    guild.me: bot_ow,
+                }
+                if pending_role:
+                    log_ow[pending_role] = discord.PermissionOverwrite(view_channel=False)
+                ch = await guild.create_text_channel(
+                    "application-log", category=category, overwrites=log_ow, reason="Applications cog setup"
+                )
+                s["log_channel_id"] = ch.id
+            except (discord.Forbidden, discord.HTTPException) as e:
+                await interaction.response.send_message(f"Could not create log channel: {e}", ephemeral=True)
+                return
+            self.wizard._step = "manager"
+            await self.wizard._update_ui(interaction)
+            return
+        if self.choice == "log_skip":
+            s["log_channel_id"] = None
+            self.wizard._step = "manager"
+            await self.wizard._update_ui(interaction)
+            return
+        if self.choice == "add":
+            self.wizard._step = "manager_select"
+            await self.wizard._update_ui(interaction)
+            return
+        if self.choice == "done" or self.choice == "skip":
+            self.wizard._step = "notification"
+            await self.wizard._update_ui(interaction)
+            return
+
+
+class SetupChannelSelect(Select):
+    def __init__(self, wizard: SetupWizardView, channel_type: str, options: List[discord.SelectOption]):
+        super().__init__(placeholder=f"Select {channel_type} channel...", options=options, min_values=1, max_values=1)
+        self.wizard = wizard
+        self.channel_type = channel_type
+
+    async def callback(self, interaction: discord.Interaction):
+        if not self.wizard._author_check(interaction):
+            await interaction.response.send_message("Only the command author can use this.", ephemeral=True)
+            return
+        val = self.values[0]
+        cid = int(val)
+        self.wizard._state[f"{self.channel_type}_channel_id"] = cid
+        if self.channel_type == "lobby":
+            self.wizard._step = "review_choice"
+        elif self.channel_type == "review":
+            self.wizard._step = "log_choice"
+        elif self.channel_type == "log":
+            self.wizard._step = "manager"
+        await self.wizard._update_ui(interaction)
+
+
+class SetupRoleSelect(Select):
+    def __init__(self, wizard: SetupWizardView, role_kind: str, options: List[discord.SelectOption]):
+        super().__init__(placeholder="Select role...", options=options, min_values=1, max_values=1)
+        self.wizard = wizard
+        self.role_kind = role_kind
+
+    async def callback(self, interaction: discord.Interaction):
+        if not self.wizard._author_check(interaction):
+            await interaction.response.send_message("Only the command author can use this.", ephemeral=True)
+            return
+        val = self.values[0]
+        if val == "skip":
+            if self.role_kind == "notification":
+                self.wizard._state["notification_role_id"] = None
+                self.wizard._step = "confirm"
+                await self.wizard._update_ui(interaction)
+            return
+        rid = int(val)
+        if self.role_kind == "manager":
+            ids = self.wizard._state.setdefault("manager_role_ids", [])
+            if rid not in ids:
+                ids.append(rid)
+            self.wizard._step = "manager"
+            await self.wizard._update_ui(interaction)
+        else:
+            self.wizard._state["notification_role_id"] = rid
+            self.wizard._step = "confirm"
+            await self.wizard._update_ui(interaction)
+
+
+class SetupManagerButton(Button):
+    def __init__(self, wizard: SetupWizardView, action: str, label: str):
+        super().__init__(label=label, style=discord.ButtonStyle.secondary)
+        self.wizard = wizard
+        self.action = action
+
+    async def callback(self, interaction: discord.Interaction):
+        if not self.wizard._author_check(interaction):
+            await interaction.response.send_message("Only the command author can use this.", ephemeral=True)
+            return
+        if self.action == "add":
+            self.wizard._step = "manager_select"
+        elif self.action in ("done", "skip"):
+            self.wizard._step = "notification"
+        await self.wizard._update_ui(interaction)
+
+
+class SetupConfirmButton(Button):
+    def __init__(self, wizard: SetupWizardView):
+        super().__init__(label="Complete setup", style=discord.ButtonStyle.primary)
+        self.wizard = wizard
+
+    async def callback(self, interaction: discord.Interaction):
+        if not self.wizard._author_check(interaction):
+            await interaction.response.send_message("Only the command author can use this.", ephemeral=True)
+            return
+        await self.wizard._finalize(interaction)
 
 
 class FieldAddModal(Modal):
@@ -896,18 +1834,26 @@ class Applications(commands.Cog):
             "access_roles": [],  # List of role IDs that grant access on approval (alternative to restricted_role)
             "bypass_roles": [],  # List of role IDs that skip application
             "manager_roles": [],  # List of role IDs that can manage applications
-            "category_id": None,  # Category ID for application channels
             "log_channel": None,  # Channel ID for application logging
             "notification_role": None,  # Role ID to ping on new submissions
-            "cleanup_delay": 24,  # Hours before deleting channels after approval/denial
+            "lobby_channel_id": None,  # Channel where welcome/apply panel lives (new flow)
+            "review_channel_id": None,  # Single channel where submissions are posted for review (new flow)
+            "lobby_panel_message_id": None,  # Message ID of panel in lobby (embed + Apply button)
+            "lobby_embed": None,  # Dict for panel embed: title, description, color_hex, footer, thumbnail_url
+            "role_mode": None,  # "restricted" | "access" (optional, inferred from roles)
+            "delete_interview_on_resolve": True,  # Delete interview channel when application resolved
+            "cleanup_delay": 24,  # Hours before deleting channels/messages after approval/denial
             "kick_timeout_seconds": 86400,  # Time before kicking users who didn't submit (default 24 hours)
             "rejoin_invite": None,  # Invite link URL to send when kicking users who didn't submit
-            "denial_action": "notify",  # notify | kick | tempban | ban
+            "denial_action": "kick",  # none | kick | tempban | ban
             "denial_send_dm": False,
             "denial_tempban_duration_seconds": 86400,
-            "early_close_action": "notify",
+            "early_close_action": "kick",
             "early_close_send_dm": False,
             "early_close_tempban_duration_seconds": 86400,
+            "approval_send_dm": False,
+            "debug_bypass_enabled": False,
+            "debug_bypass_user_id": None,
             "pending_unbans": [],  # [{"user_id": int, "unban_at": str (iso)}, ...]
             "form_fields": [
                 {
@@ -925,44 +1871,64 @@ class Applications(commands.Cog):
                     "placeholder": "Tell us why you're interested in joining...",
                 },
             ],
-            "applications": {},  # {user_id: {channel_id, status, submitted_at, responses}}
+            "applications": {},  # {user_id: {status, submitted_at, responses, review_message_id?, interview_channel_id?, ...}}
         }
 
         self.config.register_guild(**default_guild)
         self.cleanup_task: Optional[asyncio.Task] = None
         self.timer_tasks: Dict[int, Dict[int, asyncio.Task]] = {}  # {guild_id: {user_id: task}}
+        self._lobby_embed_builder_states: Dict[int, Dict] = {}  # user_id -> {embed_data}
         log.info("Applications cog initialized")
 
     async def cog_load(self):
-        """Called when the cog is loaded. Re-register persistent views for pending applications."""
+        """Called when the cog is loaded. Re-register persistent views per section 0."""
         self.cleanup_task = self.bot.loop.create_task(self.cleanup_loop())
-        for guild in self.bot.guilds:
+        # One global lobby panel view (Apply button)
+        self.bot.add_view(LobbyPanelView(self))
+        # On full bot restart, guilds may not be loaded yet; defer per-guild view registration until ready
+        async def register_guild_views():
+            await self.bot.wait_until_ready()
+            for guild in self.bot.guilds:
+                try:
+                    await self._register_persistent_views_for_guild(guild)
+                except Exception as e:
+                    log.warning("Failed to re-register application views for guild %s: %s", guild.id, e)
+        if self.bot.is_ready():
+            for guild in self.bot.guilds:
+                try:
+                    await self._register_persistent_views_for_guild(guild)
+                except Exception as e:
+                    log.warning("Failed to re-register application views for guild %s: %s", guild.id, e)
+        else:
+            self.bot.loop.create_task(register_guild_views())
+
+    async def _register_persistent_views_for_guild(self, guild: discord.Guild):
+        """Register lobby panel and per-application review views for one guild. Safe to call multiple times."""
+        lobby_channel_id = await self.config.guild(guild).lobby_channel_id()
+        if lobby_channel_id:
+            await self.ensure_lobby_panel(guild)
+        applications = await self.config.guild(guild).applications() or {}
+        review_channel_id = await self.config.guild(guild).review_channel_id()
+        for user_id_str, app_data in applications.items():
+            if not isinstance(app_data, dict) or app_data.get("status") != "pending":
+                continue
             try:
-                applications = await self.config.guild(guild).applications()
-                for user_id_str, app_data in applications.items():
-                    if app_data.get("status") != "pending":
-                        continue
-                    user_id = int(user_id_str)
-                    view = ApplicationReviewView(self, user_id=user_id)
-                    self.bot.add_view(view)
-                    channel_id = app_data.get("channel_id")
-                    if not channel_id:
-                        continue
-                    channel = guild.get_channel(channel_id)
-                    if not channel:
-                        continue
-                    try:
-                        async for message in channel.history(limit=50):
-                            if message.author != self.bot.user or not message.components:
-                                continue
-                            if "Application Submitted" not in (message.content or ""):
-                                continue
-                            await message.edit(view=view)
-                            break
-                    except (discord.Forbidden, discord.HTTPException):
-                        pass
-            except Exception as e:
-                log.warning("Failed to re-register application views for guild %s: %s", guild.id, e)
+                user_id = int(user_id_str)
+            except (ValueError, TypeError):
+                continue
+            review_message_id = app_data.get("review_message_id")
+            if not review_channel_id or not review_message_id:
+                continue
+            view = ApplicationReviewView(self, user_id=user_id)
+            self.bot.add_view(view, message_id=review_message_id)
+            channel = guild.get_channel(review_channel_id)
+            if channel:
+                try:
+                    msg = await channel.fetch_message(review_message_id)
+                    if msg and msg.author == self.bot.user:
+                        await msg.edit(view=view)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
 
     async def cog_unload(self):
         """Called when the cog is unloaded."""
@@ -985,6 +1951,160 @@ class Applications(commands.Cog):
         member_role_ids = [role.id for role in member.roles]
         return any(role_id in member_role_ids for role_id in bypass_roles)
 
+    async def _embed_from_lobby_data(
+        self, guild: discord.Guild, embed_data: Optional[Dict]
+    ) -> Optional[discord.Embed]:
+        """Build a discord.Embed from lobby_embed config dict. Returns None if no title."""
+        if not embed_data or not embed_data.get("title"):
+            return None
+        color = embed_data.get("color")
+        if color is None:
+            color = await self.bot.get_embed_color(guild)
+        embed = discord.Embed(
+            title=embed_data["title"][:256],
+            description=(embed_data.get("description") or "")[:4096],
+            color=color,
+        )
+        if embed_data.get("footer"):
+            embed.set_footer(text=embed_data["footer"][:2048])
+        if embed_data.get("thumbnail_url"):
+            embed.set_thumbnail(url=embed_data["thumbnail_url"])
+        return embed
+
+    async def send_lobby_panel(self, channel: discord.TextChannel) -> Optional[discord.Message]:
+        """Send or resend the lobby panel (embed + Apply button). Registers view per section 0. Returns the message or None."""
+        lobby_embed_data = await self.config.guild(channel.guild).lobby_embed()
+        if lobby_embed_data and lobby_embed_data.get("title"):
+            embed = await self._embed_from_lobby_data(channel.guild, lobby_embed_data)
+        else:
+            embed = discord.Embed(
+                title="Welcome! Please Complete Your Application",
+                description=(
+                    "Thank you for joining! Before you can access the full server, "
+                    "you need to complete an application. Click the button below to get started."
+                ),
+                color=await self.bot.get_embed_color(channel.guild),
+            )
+            embed.set_footer(text="Your application will be reviewed by our staff team.")
+        view = LobbyPanelView(self)
+        self.bot.add_view(view)
+        try:
+            msg = await channel.send(embed=embed, view=view)
+            return msg
+        except discord.HTTPException as e:
+            log.error("Error sending lobby panel: %s", e)
+            return None
+
+    async def _run_config_checks(self, guild: discord.Guild) -> List[Dict]:
+        """Run configuration checks. Returns list of {name, passed, message, fixable, fix_action}."""
+        results = []
+        guild_config = self.config.guild(guild)
+
+        # Lobby channel
+        lobby_channel_id = await guild_config.lobby_channel_id()
+        lobby_ok = bool(lobby_channel_id and guild.get_channel(lobby_channel_id))
+        results.append({
+            "name": "Lobby channel",
+            "passed": lobby_ok,
+            "message": f"Lobby channel set and found: #{guild.get_channel(lobby_channel_id).name}" if lobby_ok else ("Not set" if not lobby_channel_id else "Channel not found or invalid"),
+            "fixable": not lobby_ok and bool(lobby_channel_id),
+        })
+
+        # Review channel
+        review_channel_id = await guild_config.review_channel_id()
+        review_ok = bool(review_channel_id and guild.get_channel(review_channel_id))
+        results.append({
+            "name": "Review channel",
+            "passed": review_ok,
+            "message": f"Review channel set and found" if review_ok else ("Not set" if not review_channel_id else "Channel not found"),
+            "fixable": not review_ok and bool(review_channel_id),
+        })
+
+        # Log channel
+        log_channel_id = await guild_config.log_channel()
+        log_ok = not log_channel_id or bool(guild.get_channel(log_channel_id))
+        results.append({
+            "name": "Log channel",
+            "passed": log_ok,
+            "message": "Set and found" if log_channel_id and log_ok else ("Not set" if not log_channel_id else "Channel not found"),
+            "fixable": not log_ok and bool(log_channel_id),
+        })
+
+        # Panel message in lobby
+        panel_message_id = await guild_config.lobby_panel_message_id()
+        panel_ok = False
+        if lobby_channel_id and panel_message_id:
+            ch = guild.get_channel(lobby_channel_id)
+            if ch and isinstance(ch, discord.TextChannel):
+                try:
+                    msg = await ch.fetch_message(panel_message_id)
+                    panel_ok = msg and msg.author == self.bot.user
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+        elif not lobby_channel_id:
+            panel_ok = True
+        results.append({
+            "name": "Lobby panel message",
+            "passed": panel_ok,
+            "message": "Panel message exists in lobby" if panel_ok else ("Missing or deleted" if lobby_channel_id else "N/A (no lobby channel)"),
+            "fixable": lobby_channel_id and not panel_ok,
+        })
+
+        # Role system
+        restricted_role_id = await guild_config.restricted_role()
+        access_roles = await guild_config.access_roles()
+        role_ok = bool(restricted_role_id and guild.get_role(restricted_role_id)) or bool(access_roles and any(guild.get_role(r) for r in access_roles))
+        results.append({
+            "name": "Role system",
+            "passed": role_ok,
+            "message": "Restricted or access role(s) set and found" if role_ok else "No valid restricted or access roles",
+            "fixable": False,
+        })
+
+        # Manager roles
+        manager_roles = await guild_config.manager_roles()
+        manager_ok = not manager_roles or any(guild.get_role(r) for r in manager_roles)
+        results.append({
+            "name": "Manager roles",
+            "passed": manager_ok,
+            "message": "At least one manager role found" if manager_ok else "Manager roles set but none found",
+            "fixable": not manager_ok and bool(manager_roles),
+        })
+
+        # Form fields
+        form_fields = await guild_config.form_fields()
+        form_ok = bool(form_fields and len(form_fields) >= 1)
+        results.append({
+            "name": "Form fields",
+            "passed": form_ok,
+            "message": f"{len(form_fields)} field(s) configured" if form_ok else "No form fields configured",
+            "fixable": False,
+        })
+
+        return results
+
+    async def ensure_lobby_panel(self, guild: discord.Guild) -> bool:
+        """Ensure the lobby panel message exists. If missing or invalid, send a new one and save message ID. Returns True if panel is now valid."""
+        lobby_channel_id = await self.config.guild(guild).lobby_channel_id()
+        panel_message_id = await self.config.guild(guild).lobby_panel_message_id()
+        if not lobby_channel_id:
+            return False
+        channel = guild.get_channel(lobby_channel_id)
+        if not channel or not isinstance(channel, discord.TextChannel):
+            return False
+        if panel_message_id:
+            try:
+                msg = await channel.fetch_message(panel_message_id)
+                if msg and msg.author == self.bot.user:
+                    return True
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        msg = await self.send_lobby_panel(channel)
+        if msg:
+            await self.config.guild(guild).lobby_panel_message_id.set(msg.id)
+            return True
+        return False
+
     def _format_timeout(self, seconds: int) -> str:
         """Format a duration in seconds as a human-readable string (e.g. '24 hours', '30 minutes')."""
         if seconds < 60:
@@ -1000,6 +2120,35 @@ class Applications(commands.Cog):
     TEMPBAN_MIN_SECONDS = 60
     TEMPBAN_MAX_SECONDS = 2592000  # 30 days
 
+    def _normalize_member_action(self, action: Optional[str], *, allow_none: bool = False) -> str:
+        """Normalize action values and migrate legacy options."""
+        a = (action or "").strip().lower()
+        # Legacy value used "notify" for no moderation action.
+        # Preserve that behavior during migration instead of escalating to kick.
+        if a in {"notify", "none"}:
+            return "none"
+        choices = self._DENIAL_ACTION_CHOICES if allow_none else self._EARLY_CLOSE_ACTION_CHOICES
+        return a if a in choices else "kick"
+
+    async def _is_debug_bypass_user(self, guild: discord.Guild, user_id: int) -> bool:
+        """Return True if debug bypass is enabled for this user in the guild."""
+        g = self.config.guild(guild)
+        enabled = await g.debug_bypass_enabled()
+        debug_user_id = await g.debug_bypass_user_id()
+        return bool(enabled and debug_user_id and int(debug_user_id) == int(user_id))
+
+    async def _send_approval_dm(self, guild: discord.Guild, member: discord.Member) -> None:
+        """Optionally DM a user when their application is approved."""
+        try:
+            await member.send(
+                f"Your application was approved in **{guild.name}**. "
+                "You should now have access based on the server's configured roles."
+            )
+        except discord.Forbidden:
+            log.warning("Could not DM user %s for approval - DMs may be disabled", member.id)
+        except discord.HTTPException as e:
+            log.error("Error sending approval DM to user %s: %s", member.id, e)
+
     async def _execute_member_action(
         self,
         guild: discord.Guild,
@@ -1010,9 +2159,7 @@ class Applications(commands.Cog):
         tempban_seconds: Optional[int] = None,
         context: str = "denial",
     ) -> None:
-        """Execute configured member action (notify/kick/tempban/ban). DM is sent before removal."""
-        if action == "notify":
-            return
+        """Execute configured member action (none/kick/tempban/ban). DM is sent before removal."""
         if member is None:
             log.warning("_execute_member_action: member is None, skipping action")
             return
@@ -1030,6 +2177,9 @@ class Applications(commands.Cog):
                 log.warning(f"Could not DM user {member.id} for {context} - DMs may be disabled")
             except discord.HTTPException as e:
                 log.error(f"Error sending DM to user {member.id} for {context}: {e}")
+
+        if action == "none":
+            return
 
         if action == "kick":
             if not guild.me.guild_permissions.kick_members:
@@ -1078,8 +2228,11 @@ class Applications(commands.Cog):
                 log.error(f"Permission denied tempbanning {member.id} in {guild.name}")
             except discord.HTTPException as e:
                 log.error(f"Error tempbanning {member.id} in {guild.name}: {e}")
+            return
 
-    def _start_application_timer(self, guild_id: int, user_id: int, channel_id: int):
+        log.warning("Unknown member action '%s' in %s; no moderation action executed", action, context)
+
+    def _start_application_timer(self, guild_id: int, user_id: int):
         """Start a timer for a user to submit their application (duration from config)."""
         async def timer_task():
             try:
@@ -1185,134 +2338,78 @@ class Applications(commands.Cog):
         user_role_ids = [role.id for role in user.roles]
         return any(role_id in user_role_ids for role_id in manager_roles)
 
-    async def create_application_channel(
-        self, guild: discord.Guild, member: discord.Member
-    ) -> Optional[discord.TextChannel]:
-        """Create a private channel for the application."""
-        category_id = await self.config.guild(guild).category_id()
-        if not category_id:
-            log.warning(f"No category configured for guild {guild.name}")
-            return None
-
-        category = guild.get_channel(category_id)
-        if not category or not isinstance(category, discord.CategoryChannel):
-            log.warning(f"Category {category_id} not found in guild {guild.name}")
-            # Clear invalid category from config
-            await self.config.guild(guild).category_id.set(None)
-            return None
-
-        # Generate channel name
-        username = member.display_name.replace(" ", "-").lower()[:20]
-        channel_name = f"application-{username}"
-
-        # Check if channel already exists
-        existing = discord.utils.get(category.text_channels, name=channel_name)
-        if existing:
-            log.warning(f"Channel {channel_name} already exists for {member.display_name}")
-            return existing
-
-        # Get admin roles (roles with manage_guild permission)
-        admin_roles = [
-            role
-            for role in guild.roles
-            if role.permissions.manage_guild or role.permissions.administrator
-        ]
-
-        # Get manager roles
-        manager_role_ids = await self.config.guild(guild).manager_roles()
-        manager_roles = [
-            guild.get_role(rid) for rid in manager_role_ids if guild.get_role(rid)
-        ]
-
-        # Create channel with permissions
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            member: discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, read_message_history=True
-            ),
-        }
-
-        # Add admin roles
-        for role in admin_roles:
-            overwrites[role] = discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                manage_messages=True,
-            )
-
-        # Add manager roles
-        for role in manager_roles:
-            overwrites[role] = discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                manage_messages=True,
-            )
-
-        try:
-            channel = await category.create_text_channel(
-                name=channel_name, overwrites=overwrites, reason=f"Application channel for {member.display_name}"
-            )
-            log.info(f"Created application channel {channel.name} for {member.display_name}")
-            return channel
-        except discord.Forbidden:
-            log.error(f"Permission denied creating channel in {guild.name}")
-            return None
-        except discord.HTTPException as e:
-            log.error(f"HTTP error creating channel in {guild.name}: {e}")
-            return None
-
-    async def send_welcome_message(self, channel: discord.TextChannel, member: discord.Member):
-        """Send welcome message with application form button."""
-        embed = discord.Embed(
-            title="Welcome! Please Complete Your Application",
-            description=(
-                "Thank you for joining! Before you can access the full server, "
-                "you need to complete an application. Click the button below to get started."
-            ),
-            color=await self.bot.get_embed_color(channel.guild),
-            timestamp=discord.utils.utcnow(),
-        )
-
-        embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
-        embed.set_footer(text="Your application will be reviewed by our staff team.")
-
-        view = View(timeout=None)
-        view.add_item(ApplicationButton(self))
-
-        try:
-            await channel.send(
-                content=f"{member.mention}\n\n",
-                embed=embed,
-                view=view,
-                allowed_mentions=discord.AllowedMentions(users=[member]),
-            )
-        except discord.HTTPException as e:
-            log.error(f"Error sending welcome message: {e}")
-
     async def submit_application(
-        self, member: discord.Member, channel: discord.TextChannel, responses: Dict[str, str]
-    ):
-        """Store application and notify admins."""
-        applications = await self.config.guild(member.guild).applications()
-        if str(member.id) not in applications:
-            applications[str(member.id)] = {}
+        self, member: discord.Member, responses: Dict[str, str]
+    ) -> Tuple[bool, Optional[str]]:
+        """Store application and notify admins by posting to the review channel.
 
-        applications[str(member.id)].update(
-            {
-                "channel_id": channel.id,
-                "status": "pending",
-                "submitted_at": datetime.utcnow().isoformat(),
-                "responses": responses,
-            }
-        )
-
-        await self.config.guild(member.guild).applications.set(applications)
-
-        # Cancel timer task if it exists
+        Returns:
+            Tuple[bool, Optional[str]]: (success, failure_reason)
+                failure_reason values:
+                - "duplicate"
+                - "review_channel_not_configured"
+                - "review_channel_not_found"
+                - "review_channel_post_failed"
+        """
+        review_channel_id = await self.config.guild(member.guild).review_channel_id()
+        if not review_channel_id:
+            log.warning("Review channel is not configured for guild %s", member.guild.id)
+            return False, "review_channel_not_configured"
         guild_id = member.guild.id
         user_id = member.id
+        app_record = {
+            "status": "pending",
+            "submitted_at": datetime.utcnow().isoformat(),
+            "responses": responses,
+            "review_message_id": None,
+            "interview_channel_id": None,
+        }
+        debug_bypass = await self._is_debug_bypass_user(member.guild, member.id)
+        previous_app_state: Optional[Dict] = None
+        async with self.config.guild(member.guild).applications() as applications:
+            existing = applications.get(str(member.id), {})
+            if isinstance(existing, dict):
+                previous_app_state = dict(existing)
+            already_submitted = bool(
+                isinstance(existing, dict)
+                and (
+                    existing.get("submitted_at") is not None
+                    or bool(existing.get("responses"))
+                    or existing.get("status") in {"approved", "denied"}
+                )
+            )
+            if already_submitted and not debug_bypass:
+                return False, "duplicate"
+
+            if debug_bypass:
+                # Reset stale moderation/cleanup fields so repeated test runs behave like a fresh submission.
+                existing_joined_at = existing.get("joined_at") if isinstance(existing, dict) else None
+                applications[str(member.id)] = {
+                    "joined_at": existing_joined_at or datetime.utcnow().isoformat(),
+                    **app_record,
+                }
+            else:
+                if str(member.id) not in applications:
+                    applications[str(member.id)] = {}
+                applications[str(member.id)].update(app_record)
+
+        async def restore_application_state_after_failure():
+            """Rollback submit state if review message cannot be posted."""
+            async with self.config.guild(member.guild).applications() as applications:
+                if previous_app_state is None:
+                    applications.pop(str(member.id), None)
+                else:
+                    applications[str(member.id)] = previous_app_state
+
+            # Keep timeout enforcement active for users that still have an unsubmitted application.
+            needs_timer = previous_app_state is None or previous_app_state.get("submitted_at") is None
+            if needs_timer and (
+                guild_id not in self.timer_tasks
+                or user_id not in self.timer_tasks[guild_id]
+            ):
+                self._start_application_timer(guild_id, user_id)
+
+        # Cancel timer task if it exists
         if guild_id in self.timer_tasks and user_id in self.timer_tasks[guild_id]:
             task = self.timer_tasks[guild_id][user_id]
             if not task.done():
@@ -1324,45 +2421,93 @@ class Applications(commands.Cog):
         # Create review embed
         embed = await self.create_review_embed(member, responses, "pending")
 
-        # Create review view with approve/deny buttons
-        view = ApplicationReviewView(self, member)
+        # Create review view with approve/deny (and later interview) buttons; register for persistence (section 0)
+        view = ApplicationReviewView(self, member=member)
 
-        # Get notification role to ping in the application channel
         notification_role = None
         notification_role_id = await self.config.guild(member.guild).notification_role()
         if notification_role_id:
             notification_role = member.guild.get_role(notification_role_id)
             if not notification_role:
-                # Role was deleted, clear from config
                 await self.config.guild(member.guild).notification_role.set(None)
                 log.warning(f"Notification role {notification_role_id} not found in {member.guild.name}")
 
-        # Build message content with notification role ping if configured
-        content = f"📋 **Application Submitted**\n\n"
-        if notification_role:
-            content = f"{notification_role.mention}\n\n{content}"
-        content += (
-            f"Your application has been received and is pending review. "
-            f"An admin will review it shortly."
-        )
+        allowed_mentions = discord.AllowedMentions(roles=[notification_role]) if notification_role else None
 
-        # Notify in channel
-        # Use allowed_mentions to ensure role mention is properly highlighted
-        allowed_mentions = None
-        if notification_role:
-            allowed_mentions = discord.AllowedMentions(roles=[notification_role])
-        
-        await channel.send(
-            content,
-            embed=embed,
-            view=view,
-            allowed_mentions=allowed_mentions,
-        )
+        # Review channel is admin-only: send only the notification ping (if any), no applicant-facing "received" text
+        review_content = (f"{notification_role.mention}\n" if notification_role else None)
+        review_channel = member.guild.get_channel(review_channel_id)
+        if review_channel and isinstance(review_channel, discord.TextChannel):
+            try:
+                msg = await review_channel.send(
+                    content=review_content,
+                    embed=embed,
+                    view=view,
+                    allowed_mentions=allowed_mentions,
+                )
+                self.bot.add_view(view, message_id=msg.id)
+                async with self.config.guild(member.guild).applications() as applications:
+                    if str(member.id) in applications:
+                        applications[str(member.id)]["review_message_id"] = msg.id
+            except (discord.Forbidden, discord.HTTPException) as e:
+                log.error("Failed to post application to review channel: %s", e)
+                await restore_application_state_after_failure()
+                return False, "review_channel_post_failed"
+        else:
+            log.warning("Review channel %s not found for guild %s", review_channel_id, member.guild.name)
+            await restore_application_state_after_failure()
+            return False, "review_channel_not_found"
 
         log.info(f"Application submitted by {member.display_name} in {member.guild.name}")
-
-        # Log to log channel (without notification role ping)
         await self.log_application_event(member.guild, member, "submitted", responses=responses)
+        return True, None
+
+    async def _update_review_message_after_resolve(
+        self,
+        guild: discord.Guild,
+        app_data: Dict,
+        member: discord.Member,
+        new_status: str,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Edit the review channel message to show approved/denied and remove the view. Optional delete interview channel."""
+        review_channel_id = await self.config.guild(guild).review_channel_id()
+        review_message_id = app_data.get("review_message_id")
+        if not review_channel_id or not review_message_id:
+            return
+        channel = guild.get_channel(review_channel_id)
+        if not channel or not isinstance(channel, discord.TextChannel):
+            return
+        try:
+            msg = await channel.fetch_message(review_message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+        embed = await self.create_review_embed(
+            member, app_data.get("responses", {}), new_status
+        )
+        if reason and new_status == "denied":
+            embed.add_field(name="Reason", value=reason[:1024], inline=False)
+        content = (
+            f"✅ **Application Approved** – {member.mention}"
+            if new_status == "approved"
+            else f"❌ **Application Denied** – {member.mention}"
+        )
+        if reason and new_status == "denied":
+            content += f"\nReason: {reason[:500]}"
+        try:
+            await msg.edit(content=content, embed=embed, view=None)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        # Optionally delete interview channel
+        if await self.config.guild(guild).delete_interview_on_resolve():
+            interview_channel_id = app_data.get("interview_channel_id")
+            if interview_channel_id:
+                ich = guild.get_channel(interview_channel_id)
+                if ich:
+                    try:
+                        await ich.delete(reason="Application resolved")
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
 
     async def log_application_event(
         self,
@@ -1376,6 +2521,10 @@ class Applications(commands.Cog):
         """Log an application event to the log channel."""
         log_channel_id = await self.config.guild(guild).log_channel()
         if not log_channel_id:
+            return
+
+        review_channel_id = await self.config.guild(guild).review_channel_id()
+        if event_type == "submitted" and review_channel_id and log_channel_id == review_channel_id:
             return
 
         log_channel = guild.get_channel(log_channel_id)
@@ -1563,29 +2712,21 @@ class Applications(commands.Cog):
             log.info(f"Member {member.display_name} has bypass role, skipping application")
             return
 
+        lobby_channel_id = await self.config.guild(member.guild).lobby_channel_id()
+        if not lobby_channel_id:
+            log.warning("Lobby channel not configured for guild %s; skipping application onboarding", member.guild.id)
+            return
+
         # Check if user already has an active application
         applications = await self.config.guild(member.guild).applications()
         if str(member.id) in applications:
             app_data = applications[str(member.id)]
             if app_data.get("status") == "pending":
                 log.info(f"Member {member.display_name} already has pending application")
-                # Check if channel still exists, recreate if needed
-                channel_id = app_data.get("channel_id")
-                if channel_id:
-                    channel = member.guild.get_channel(channel_id)
-                    if not channel:
-                        # Channel was deleted, recreate it
-                        log.info(f"Recreating deleted application channel for {member.display_name}")
-                        channel = await self.create_application_channel(member.guild, member)
-                        if channel:
-                            app_data["channel_id"] = channel.id
-                            applications[str(member.id)] = app_data
-                            await self.config.guild(member.guild).applications.set(applications)
-                            await self.send_welcome_message(channel, member)
+                await self.ensure_lobby_panel(member.guild)
                 return
 
         # Assign restricted role (if configured)
-        # Note: Either restricted_role OR access_roles should be used, not both
         restricted_role_id = await self.config.guild(member.guild).restricted_role()
         if restricted_role_id:
             restricted_role = member.guild.get_role(restricted_role_id)
@@ -1599,29 +2740,17 @@ class Applications(commands.Cog):
                     log.error(f"Error assigning restricted role: {e}")
             else:
                 log.warning(f"Restricted role {restricted_role_id} not found in {member.guild.name}")
-        # If access roles are configured (and no restricted role), no role assignment needed on join
 
-        # Create application channel
-        channel = await self.create_application_channel(member.guild, member)
-        if not channel:
-            log.error(f"Failed to create application channel for {member.display_name}")
-            return
-
-        # Store application record
-        applications[str(member.id)] = {
-            "channel_id": channel.id,
-            "status": "pending",
-            "submitted_at": None,
-            "responses": {},
-            "joined_at": datetime.utcnow().isoformat(),
-        }
-        await self.config.guild(member.guild).applications.set(applications)
-
-        # Send welcome message
-        await self.send_welcome_message(channel, member)
-
-        # Start 24-hour timer
-        self._start_application_timer(member.guild.id, member.id, channel.id)
+        # New flow: no per-user channel; ensure lobby panel exists; create app record; start timer
+        await self.ensure_lobby_panel(member.guild)
+        async with self.config.guild(member.guild).applications() as applications:
+            applications[str(member.id)] = {
+                "status": "pending",
+                "submitted_at": None,
+                "responses": {},
+                "joined_at": datetime.utcnow().isoformat(),
+            }
+        self._start_application_timer(member.guild.id, member.id)
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
@@ -1630,23 +2759,20 @@ class Applications(commands.Cog):
         if str(member.id) not in applications:
             return
 
-        app_data = applications[str(member.id)]
-        channel_id = app_data.get("channel_id")
-
-        if channel_id:
-            channel = member.guild.get_channel(channel_id)
-            if channel:
-                try:
-                    await channel.delete(reason="Member left server")
-                    log.info(f"Deleted application channel for {member.display_name}")
-                except discord.Forbidden:
-                    log.warning(f"Permission denied deleting channel {channel_id}")
-                except discord.HTTPException as e:
-                    log.error(f"Error deleting channel: {e}")
+        guild_id = member.guild.id
+        user_id = member.id
+        if guild_id in self.timer_tasks and user_id in self.timer_tasks[guild_id]:
+            task = self.timer_tasks[guild_id][user_id]
+            if not task.done():
+                task.cancel()
+            del self.timer_tasks[guild_id][user_id]
+            if not self.timer_tasks[guild_id]:
+                del self.timer_tasks[guild_id]
 
         # Remove from applications
-        del applications[str(member.id)]
-        await self.config.guild(member.guild).applications.set(applications)
+        async with self.config.guild(member.guild).applications() as apps:
+            if str(member.id) in apps:
+                del apps[str(member.id)]
 
     @commands.group(name="applications", aliases=["app"])
     @commands.admin_or_permissions(manage_guild=True)
@@ -1667,14 +2793,54 @@ class Applications(commands.Cog):
 
         await ctx.send(f"Application system is now {state}.")
 
-    @_applications.command(name="restrictedrole")
+    @_applications.group(name="role")
+    async def _role(self, ctx: commands.Context):
+        """Manage application roles and role-based behavior."""
+        pass
+
+    @_applications.group(name="channel")
+    async def _channel(self, ctx: commands.Context):
+        """Manage application channels."""
+        pass
+
+    @_applications.group(name="lobby")
+    async def _lobby(self, ctx: commands.Context):
+        """Manage the lobby panel message and embed."""
+        pass
+
+    @_applications.group(name="policy")
+    async def _policy(self, ctx: commands.Context):
+        """Manage application system policies and timers."""
+        pass
+
+    @_policy.group(name="denial")
+    async def _policy_denial(self, ctx: commands.Context):
+        """Manage denial behavior."""
+        pass
+
+    @_policy.group(name="approval")
+    async def _policy_approval(self, ctx: commands.Context):
+        """Manage approval behavior."""
+        pass
+
+    @_policy.group(name="earlyclose")
+    async def _policy_early_close(self, ctx: commands.Context):
+        """Manage behavior when closing before submission."""
+        pass
+
+    @_applications.group(name="maintenance")
+    async def _maintenance(self, ctx: commands.Context):
+        """Run maintenance and cleanup operations."""
+        pass
+
+    @_role.command(name="restricted")
     async def _set_restricted_role(
         self, ctx: commands.Context, role: Optional[discord.Role] = None
     ):
         """Set the role that restricts channel access.
 
         This role should be configured in Discord to deny view permissions
-        for all channels except the application category.
+        for restricted areas until an application is approved.
         """
         if role is None:
             await self.config.guild(ctx.guild).restricted_role.set(None)
@@ -1683,10 +2849,10 @@ class Applications(commands.Cog):
             await self.config.guild(ctx.guild).restricted_role.set(role.id)
             await ctx.send(
                 f"Restricted role set to {role.mention}. "
-                f"Make sure this role denies view permissions for all channels except the application category."
+                f"Make sure this role denies view permissions for restricted channels until approval."
             )
 
-    @_applications.command(name="bypassrole")
+    @_role.command(name="bypass")
     async def _bypass_role(
         self, ctx: commands.Context, action: str, role: Optional[discord.Role] = None
     ):
@@ -1716,7 +2882,7 @@ class Applications(commands.Cog):
                 else:
                     await ctx.send(f"{role.mention} is not a bypass role.")
 
-    @_applications.command(name="accessrole")
+    @_role.command(name="access")
     async def _access_role(
         self, ctx: commands.Context, action: str, role: Optional[discord.Role] = None
     ):
@@ -1748,7 +2914,7 @@ class Applications(commands.Cog):
                 else:
                     await ctx.send(f"{role.mention} is not an access role.")
 
-    @_applications.command(name="managerrole")
+    @_role.command(name="manager")
     async def _manager_role(
         self, ctx: commands.Context, action: str, role: Optional[discord.Role] = None
     ):
@@ -1778,19 +2944,7 @@ class Applications(commands.Cog):
                 else:
                     await ctx.send(f"{role.mention} is not a manager role.")
 
-    @_applications.command(name="category")
-    async def _set_category(
-        self, ctx: commands.Context, category: Optional[discord.CategoryChannel] = None
-    ):
-        """Set the category where application channels will be created."""
-        if category is None:
-            await self.config.guild(ctx.guild).category_id.set(None)
-            await ctx.send("Category cleared.")
-        else:
-            await self.config.guild(ctx.guild).category_id.set(category.id)
-            await ctx.send(f"Application channels will be created in {category.mention}.")
-
-    @_applications.command(name="logchannel")
+    @_channel.command(name="log")
     async def _set_log_channel(
         self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None
     ):
@@ -1802,7 +2956,88 @@ class Applications(commands.Cog):
             await self.config.guild(ctx.guild).log_channel.set(channel.id)
             await ctx.send(f"Application events will be logged to {channel.mention}.")
 
-    @_applications.command(name="notificationrole")
+    @_channel.command(name="lobby")
+    async def _set_lobby_channel(
+        self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None
+    ):
+        """Set the lobby/welcome channel where the apply panel (embed + button) is sent."""
+        if channel is None:
+            await self.config.guild(ctx.guild).lobby_channel_id.set(None)
+            await self.config.guild(ctx.guild).lobby_panel_message_id.set(None)
+            await ctx.send("Lobby channel cleared.")
+        else:
+            await self.config.guild(ctx.guild).lobby_channel_id.set(channel.id)
+            await ctx.send(
+                f"Lobby channel set to {channel.mention}. "
+                f"Use `{ctx.clean_prefix}applications lobby send` to send or refresh the panel there."
+            )
+
+    @_channel.command(name="review")
+    async def _set_review_channel(
+        self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None
+    ):
+        """Set the channel where submitted applications are posted for admin review."""
+        if channel is None:
+            await self.config.guild(ctx.guild).review_channel_id.set(None)
+            await ctx.send("Review channel cleared.")
+        else:
+            await self.config.guild(ctx.guild).review_channel_id.set(channel.id)
+            await ctx.send(f"New applications will be posted to {channel.mention}.")
+
+    @_lobby.command(name="embed")
+    async def _lobby_embed(self, ctx: commands.Context):
+        """Open the embed builder to configure the lobby panel message (title, description, color, footer)."""
+        if not await self.config.guild(ctx.guild).enabled():
+            await ctx.send("Enable the application system first with `[p]applications toggle true`.")
+            return
+        existing = await self.config.guild(ctx.guild).lobby_embed()
+        if existing is None:
+            existing = {}
+        self._lobby_embed_builder_states[ctx.author.id] = {"embed_data": existing}
+        view = LobbyEmbedBuilderView(self, owner_user_id=ctx.author.id)
+        embed = discord.Embed(
+            title="Lobby Panel Embed Builder",
+            description="Use the buttons below to configure, preview, or save the embed shown in the lobby.",
+            color=await ctx.embed_color(),
+        )
+        if existing and existing.get("title"):
+            embed.add_field(name="Current title", value=existing.get("title", "Not set")[:1024], inline=False)
+        view.message = await ctx.send(embed=embed, view=view)
+        await view._refresh_embed(user_id=ctx.author.id)
+
+    @_lobby.command(name="send")
+    async def _send_panel(self, ctx: commands.Context):
+        """Send or refresh the lobby panel (embed + Apply button) in the configured lobby channel."""
+        if not await self.config.guild(ctx.guild).enabled():
+            await ctx.send("Enable the application system first with `[p]applications toggle true`.")
+            return
+        lobby_channel_id = await self.config.guild(ctx.guild).lobby_channel_id()
+        if not lobby_channel_id:
+            await ctx.send(
+                "Set a lobby channel first with `[p]applications channel lobby #channel`. "
+                "Or run `[p]applications setup` for interactive setup."
+            )
+            return
+        channel = ctx.guild.get_channel(lobby_channel_id)
+        if not channel or not isinstance(channel, discord.TextChannel):
+            await ctx.send("Lobby channel not found.")
+            return
+        panel_message_id = await self.config.guild(ctx.guild).lobby_panel_message_id()
+        if panel_message_id:
+            try:
+                old_msg = await channel.fetch_message(panel_message_id)
+                if old_msg and old_msg.author == self.bot.user:
+                    await old_msg.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        msg = await self.send_lobby_panel(channel)
+        if msg:
+            await self.config.guild(ctx.guild).lobby_panel_message_id.set(msg.id)
+            await ctx.send(f"Panel sent to {channel.mention}.")
+        else:
+            await ctx.send("Failed to send the panel. Check bot permissions.")
+
+    @_role.command(name="notification")
     async def _set_notification_role(
         self, ctx: commands.Context, role: Optional[discord.Role] = None
     ):
@@ -1817,7 +3052,7 @@ class Applications(commands.Cog):
                 f"This role will be pinged when new applications are submitted."
             )
 
-    @_applications.command(name="cleanupdelay")
+    @_policy.command(name="cleanupdelay")
     async def _set_cleanup_delay(self, ctx: commands.Context, hours: int):
         """Set the delay in hours before deleting channels after approval/denial."""
         if hours < 0:
@@ -1827,16 +3062,16 @@ class Applications(commands.Cog):
         await self.config.guild(ctx.guild).cleanup_delay.set(hours)
         await ctx.send(
             f"Cleanup delay set to {hours} hour(s). "
-            f"Application channels will be deleted {hours} hour(s) after approval or denial."
+            f"Resolved application artifacts will be cleaned up {hours} hour(s) after approval or denial."
         )
 
-    @_applications.command(name="kicktimeout")
+    @_policy.command(name="kicktimeout")
     async def _set_kick_timeout(
         self, ctx: commands.Context, amount: Optional[float] = None, unit: Optional[str] = None
     ):
         """Set how long new members have to submit an application before being kicked.
         
-        Use: [p]applications kicktimeout <amount> <unit>
+        Use: [p]applications policy kicktimeout <amount> <unit>
         Units: seconds/s, minutes/m, hours/h, days/d
         If amount and unit are omitted, shows the current kick timeout.
         Setting a duration below 1 hour will prompt for confirmation.
@@ -1845,7 +3080,10 @@ class Applications(commands.Cog):
             current = await self.config.guild(ctx.guild).kick_timeout_seconds()
             if current is None:
                 current = 86400
-            await ctx.send(f"Current kick timeout: {self._format_timeout(int(current))}.")
+            await ctx.send(
+                f"Current kick timeout: {self._format_timeout(int(current))}.\n"
+                "Available units: **seconds/s**, **minutes/m**, **hours/h**, **days/d**."
+            )
             return
 
         unit_map = {
@@ -1913,7 +3151,7 @@ class Applications(commands.Cog):
         await self.config.guild(ctx.guild).kick_timeout_seconds.set(total_seconds)
         await ctx.send(f"Kick timeout set to {duration_text}.")
 
-    @_applications.command(name="rejoininvite")
+    @_policy.command(name="rejoininvite")
     async def _set_rejoin_invite(
         self, ctx: commands.Context, invite_url: Optional[str] = None
     ):
@@ -1945,30 +3183,37 @@ class Applications(commands.Cog):
         await self.config.guild(ctx.guild).rejoin_invite.set(invite_url)
         await ctx.send(f"Rejoin invite link set to: {invite_url}")
 
-    _ACTION_CHOICES = ("notify", "kick", "tempban", "ban")
+    _DENIAL_ACTION_CHOICES = ("none", "kick", "tempban", "ban")
+    _EARLY_CLOSE_ACTION_CHOICES = ("kick", "tempban", "ban")
 
-    @_applications.command(name="denialaction")
+    @_policy_denial.command(name="action")
     async def _denial_action(
         self, ctx: commands.Context, action: Optional[str] = None
     ):
-        """Set what happens when an application is denied: notify, kick, tempban, or ban.
+        """Set what happens when an application is denied: none, kick, tempban, or ban.
         
         If no action is given, shows the current setting.
         """
         if action is None:
-            current = await self.config.guild(ctx.guild).denial_action()
-            await ctx.send(f"Denial action is set to: **{current}**.")
+            current_raw = await self.config.guild(ctx.guild).denial_action()
+            current = self._normalize_member_action(current_raw, allow_none=True)
+            if current_raw != current:
+                await self.config.guild(ctx.guild).denial_action.set(current)
+            await ctx.send(
+                f"Denial action is set to: **{current}**.\n"
+                f"Available options: **{', '.join(self._DENIAL_ACTION_CHOICES)}**."
+            )
             return
         a = action.strip().lower()
-        if a not in self._ACTION_CHOICES:
+        if a not in self._DENIAL_ACTION_CHOICES:
             await ctx.send(
-                f"❌ Invalid action. Use one of: {', '.join(self._ACTION_CHOICES)}."
+                f"❌ Invalid action. Use one of: {', '.join(self._DENIAL_ACTION_CHOICES)}."
             )
             return
         await self.config.guild(ctx.guild).denial_action.set(a)
         await ctx.send(f"Denial action set to: **{a}**.")
 
-    @_applications.command(name="denialdm")
+    @_policy_denial.command(name="dm")
     async def _denial_dm(
         self, ctx: commands.Context, on_off: Optional[bool] = None
     ):
@@ -1978,12 +3223,33 @@ class Applications(commands.Cog):
         """
         if on_off is None:
             current = await self.config.guild(ctx.guild).denial_send_dm()
-            await ctx.send(f"Send DM before denial removal: **{'Yes' if current else 'No'}**.")
+            await ctx.send(
+                f"Send DM before denial removal: **{'Yes' if current else 'No'}**.\n"
+                "Available options: **true** or **false**."
+            )
             return
         await self.config.guild(ctx.guild).denial_send_dm.set(on_off)
         await ctx.send(f"Send DM before denial removal: **{'Yes' if on_off else 'No'}**.")
 
-    @_applications.command(name="denialtempbanduration")
+    @_policy_approval.command(name="dm")
+    async def _approval_dm(
+        self, ctx: commands.Context, on_off: Optional[bool] = None
+    ):
+        """Set whether to DM the user when an application is approved.
+
+        If not set, shows current value.
+        """
+        if on_off is None:
+            current = await self.config.guild(ctx.guild).approval_send_dm()
+            await ctx.send(
+                f"Send DM on approval: **{'Yes' if current else 'No'}**.\n"
+                "Available options: **true** or **false**."
+            )
+            return
+        await self.config.guild(ctx.guild).approval_send_dm.set(on_off)
+        await ctx.send(f"Send DM on approval: **{'Yes' if on_off else 'No'}**.")
+
+    @_policy_denial.command(name="tempbanduration")
     async def _denial_tempban_duration(
         self,
         ctx: commands.Context,
@@ -1992,7 +3258,7 @@ class Applications(commands.Cog):
     ):
         """Set tempban duration when denial action is tempban.
         
-        Use: [p]applications denialtempbanduration <amount> <unit>
+        Use: [p]applications policy denial tempbanduration <amount> <unit>
         Units: seconds/s, minutes/m, hours/h, days/d.
         If omitted, shows current duration.
         """
@@ -2000,7 +3266,10 @@ class Applications(commands.Cog):
             current = await self.config.guild(ctx.guild).denial_tempban_duration_seconds()
             if current is None:
                 current = 86400
-            await ctx.send(f"Denial tempban duration: {self._format_timeout(int(current))}.")
+            await ctx.send(
+                f"Denial tempban duration: {self._format_timeout(int(current))}.\n"
+                "Available units: **seconds/s**, **minutes/m**, **hours/h**, **days/d**."
+            )
             return
         unit_map = {
             "s": 1, "sec": 1, "second": 1, "seconds": 1,
@@ -2022,28 +3291,34 @@ class Applications(commands.Cog):
         await self.config.guild(ctx.guild).denial_tempban_duration_seconds.set(total_seconds)
         await ctx.send(f"Denial tempban duration set to: {self._format_timeout(total_seconds)}.")
 
-    @_applications.command(name="earlycloseaction")
+    @_policy_early_close.command(name="action")
     async def _early_close_action(
         self, ctx: commands.Context, action: Optional[str] = None
     ):
-        """Set what happens when an application is closed before the user submitted: notify, kick, tempban, or ban.
+        """Set what happens when an application is closed before the user submitted: kick, tempban, or ban.
         
         If no action is given, shows the current setting.
         """
         if action is None:
-            current = await self.config.guild(ctx.guild).early_close_action()
-            await ctx.send(f"Early close action is set to: **{current}**.")
+            current_raw = await self.config.guild(ctx.guild).early_close_action()
+            current = self._normalize_member_action(current_raw)
+            if current_raw != current:
+                await self.config.guild(ctx.guild).early_close_action.set(current)
+            await ctx.send(
+                f"Early close action is set to: **{current}**.\n"
+                f"Available options: **{', '.join(self._EARLY_CLOSE_ACTION_CHOICES)}**."
+            )
             return
         a = action.strip().lower()
-        if a not in self._ACTION_CHOICES:
+        if a not in self._EARLY_CLOSE_ACTION_CHOICES:
             await ctx.send(
-                f"❌ Invalid action. Use one of: {', '.join(self._ACTION_CHOICES)}."
+                f"❌ Invalid action. Use one of: {', '.join(self._EARLY_CLOSE_ACTION_CHOICES)}."
             )
             return
         await self.config.guild(ctx.guild).early_close_action.set(a)
         await ctx.send(f"Early close action set to: **{a}**.")
 
-    @_applications.command(name="earlyclosedm")
+    @_policy_early_close.command(name="dm")
     async def _early_close_dm(
         self, ctx: commands.Context, on_off: Optional[bool] = None
     ):
@@ -2053,12 +3328,15 @@ class Applications(commands.Cog):
         """
         if on_off is None:
             current = await self.config.guild(ctx.guild).early_close_send_dm()
-            await ctx.send(f"Send DM before early-close removal: **{'Yes' if current else 'No'}**.")
+            await ctx.send(
+                f"Send DM before early-close removal: **{'Yes' if current else 'No'}**.\n"
+                "Available options: **true** or **false**."
+            )
             return
         await self.config.guild(ctx.guild).early_close_send_dm.set(on_off)
         await ctx.send(f"Send DM before early-close removal: **{'Yes' if on_off else 'No'}**.")
 
-    @_applications.command(name="earlyclosetempbanduration")
+    @_policy_early_close.command(name="tempbanduration")
     async def _early_close_tempban_duration(
         self,
         ctx: commands.Context,
@@ -2067,7 +3345,7 @@ class Applications(commands.Cog):
     ):
         """Set tempban duration when early-close action is tempban.
         
-        Use: [p]applications earlyclosetempbanduration <amount> <unit>
+        Use: [p]applications policy earlyclose tempbanduration <amount> <unit>
         Units: seconds/s, minutes/m, hours/h, days/d.
         If omitted, shows current duration.
         """
@@ -2075,7 +3353,10 @@ class Applications(commands.Cog):
             current = await self.config.guild(ctx.guild).early_close_tempban_duration_seconds()
             if current is None:
                 current = 86400
-            await ctx.send(f"Early close tempban duration: {self._format_timeout(int(current))}.")
+            await ctx.send(
+                f"Early close tempban duration: {self._format_timeout(int(current))}.\n"
+                "Available units: **seconds/s**, **minutes/m**, **hours/h**, **days/d**."
+            )
             return
         unit_map = {
             "s": 1, "sec": 1, "second": 1, "seconds": 1,
@@ -2097,102 +3378,148 @@ class Applications(commands.Cog):
         await self.config.guild(ctx.guild).early_close_tempban_duration_seconds.set(total_seconds)
         await ctx.send(f"Early close tempban duration set to: {self._format_timeout(total_seconds)}.")
 
-    @_applications.command(name="cleanup")
-    async def _cleanup(self, ctx: commands.Context):
-        """Manually trigger cleanup of expired application channels."""
-        await ctx.send("Cleaning up expired application channels...")
-        cleaned = await self.cleanup_channels(ctx.guild)
-        await ctx.send(f"✅ Cleaned up {cleaned} expired application channel(s).")
+    @_applications.command(name="setup", aliases=["serversetup"])
+    async def _setup(self, ctx: commands.Context):
+        """Interactive server setup: create category, channels, roles, and send the lobby panel."""
+        if not ctx.guild:
+            await ctx.send("This command can only be used in a server.")
+            return
+        embed = discord.Embed(
+            title="Application System Setup",
+            description=(
+                "Choose how new members get access:\n\n"
+                "**Restricted role:** New members get a role that denies access to most channels until approved. "
+                "On approval, the role is removed.\n\n"
+                "**Access roles:** New members have no special role. On approval, they receive roles that grant access."
+            ),
+            color=await ctx.embed_color(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.set_footer(text="Click a button below. Setup can be run anytime; you can use existing channels or create new ones.")
+        view = SetupWizardView(self, ctx)
+        view._message = await ctx.send(embed=embed, view=view)
 
-    @_applications.command(name="resend", aliases=["refresh"])
-    async def _resend_welcome(self, ctx: commands.Context, member: Optional[discord.Member] = None):
-        """Re-send the welcome message to a user's application channel.
-        
-        Useful for troubleshooting when buttons stop working after cog updates.
-        If no member is specified and run in an application channel, uses the channel owner.
-        """
+    @_applications.command(name="check", aliases=["configcheck"])
+    async def _check(self, ctx: commands.Context):
+        """Run configuration checks and report issues. Optionally auto-fix fixable items."""
         if not await self.config.guild(ctx.guild).enabled():
-            await ctx.send("The application system is not enabled.")
+            await ctx.send("Enable the application system first with `[p]applications toggle true`.")
             return
-
-        # If no member specified, try to find from current channel
-        if member is None:
-            applications = await self.config.guild(ctx.guild).applications()
-            current_channel_id = ctx.channel.id
-            
-            # Find application by channel ID
-            found_member = None
-            for user_id, app_data in applications.items():
-                if app_data.get("channel_id") == current_channel_id:
-                    found_member = ctx.guild.get_member(int(user_id))
-                    if found_member:
-                        member = found_member
-                        break
-            
-            if not member:
-                await ctx.send(
-                    "❌ No member specified and this doesn't appear to be an application channel. "
-                    "Please specify a member: `[p]applications resend @user`"
-                )
-                return
-
-        # Get the member's application data
-        applications = await self.config.guild(ctx.guild).applications()
-        if str(member.id) not in applications:
-            await ctx.send(f"❌ {member.mention} does not have an active application.")
-            return
-
-        app_data = applications[str(member.id)]
-        channel_id = app_data.get("channel_id")
-        
-        if not channel_id:
-            await ctx.send(f"❌ No application channel found for {member.mention}.")
-            return
-
-        channel = ctx.guild.get_channel(channel_id)
-        if not channel or not isinstance(channel, discord.TextChannel):
-            await ctx.send(f"❌ Application channel not found or invalid.")
-            return
-
-        # Check if application is still pending
-        if app_data.get("status") != "pending":
-            await ctx.send(
-                f"⚠️ {member.mention}'s application is already {app_data.get('status')}. "
-                f"Re-sending welcome message anyway for troubleshooting."
+        results = await self._run_config_checks(ctx.guild)
+        embed = discord.Embed(
+            title="Application System Check",
+            color=await ctx.embed_color(),
+            timestamp=discord.utils.utcnow(),
+        )
+        fixable = []
+        for r in results:
+            status = "✅" if r["passed"] else "❌"
+            embed.add_field(
+                name=f"{status} {r['name']}",
+                value=r["message"][:1024],
+                inline=False,
             )
+            if r.get("fixable"):
+                fixable.append(r)
+        if fixable:
+            embed.set_footer(text="Click Auto-fix below to attempt to fix the failed items.")
+        view = None
+        if fixable:
+            author_id = ctx.author.id
 
-        # Delete old welcome messages (messages from the bot in this channel)
-        try:
-            async for message in channel.history(limit=50):
-                if message.author == ctx.guild.me:
-                    # Check if it's a welcome message (contains "Welcome" in embed title or content)
-                    is_welcome = False
-                    if message.embeds:
-                        for embed in message.embeds:
-                            if embed.title and "Welcome" in embed.title:
-                                is_welcome = True
-                                break
-                    if not is_welcome and message.content and "Welcome" in message.content:
-                        is_welcome = True
-                    
-                    if is_welcome:
-                        try:
-                            await message.delete()
-                        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-                            pass  # Ignore errors deleting old messages
-        except discord.Forbidden:
-            await ctx.send("⚠️ Permission denied reading channel history. Re-sending welcome message anyway.")
-        except discord.HTTPException:
-            pass  # Ignore errors
+            class CheckFixView(View):
+                def __init__(self, cog: "Applications", guild: discord.Guild, fixable_list: list, embed_orig):
+                    super().__init__(timeout=120)
+                    self.cog = cog
+                    self.guild = guild
+                    self.fixable_list = fixable_list
+                    self.embed_orig = embed_orig
 
-        # Send fresh welcome message
+                @discord.ui.button(label="Auto-fix", style=discord.ButtonStyle.primary, row=0)
+                async def fix_button(self, interaction: discord.Interaction, button: Button):
+                    if interaction.user.id != author_id:
+                        await interaction.response.send_message("Only the command author can run auto-fix.", ephemeral=True)
+                        return
+                    await interaction.response.defer(ephemeral=True)
+                    guild_config = self.cog.config.guild(self.guild)
+                    for r in self.fixable_list:
+                        name = r["name"]
+                        if name == "Lobby channel":
+                            await guild_config.lobby_channel_id.set(None)
+                            await guild_config.lobby_panel_message_id.set(None)
+                        elif name == "Review channel":
+                            await guild_config.review_channel_id.set(None)
+                        elif name == "Log channel":
+                            await guild_config.log_channel.set(None)
+                        elif name == "Lobby panel message":
+                            await self.cog.ensure_lobby_panel(self.guild)
+                        elif name == "Manager roles":
+                            await guild_config.manager_roles.set([])
+                    await interaction.followup.send(
+                        "Auto-fix applied. Run the check command again to verify.",
+                        ephemeral=True,
+                    )
+                    self.stop()
+
+            view = CheckFixView(self, ctx.guild, fixable, embed)
+
+        await ctx.send(embed=embed, view=view)
+
+    @_maintenance.command(name="cleanup")
+    async def _cleanup(self, ctx: commands.Context):
+        """Manually trigger cleanup of expired application artifacts."""
+        await ctx.send("Cleaning up expired application artifacts...")
+        cleaned = await self.cleanup_channels(ctx.guild)
+        await ctx.send(f"✅ Cleaned up {cleaned} expired application artifact(s).")
+
+    @_maintenance.command(name="debug")
+    async def _debug_bypass(
+        self,
+        ctx: commands.Context,
+        member_or_flag: Optional[str] = None,
+    ):
+        """Configure debug bypass for repeated testing submissions.
+
+        - `[p]applications maintenance debug` shows current status
+        - `[p]applications maintenance debug @user` enables bypass for one user
+        - `[p]applications maintenance debug off` disables bypass
+        """
+        g = self.config.guild(ctx.guild)
+        current_enabled = await g.debug_bypass_enabled()
+        current_user_id = await g.debug_bypass_user_id()
+        current_member = ctx.guild.get_member(int(current_user_id)) if current_user_id else None
+
+        # No args: show current status
+        if member_or_flag is None:
+            if current_enabled and current_user_id:
+                label = current_member.mention if current_member else f"`{current_user_id}`"
+                await ctx.send(f"Debug bypass is **enabled** for {label}.")
+            else:
+                await ctx.send("Debug bypass is **disabled**.")
+            return
+
+        normalized = member_or_flag.strip().lower()
+        if normalized in {"off", "disable", "disabled", "false", "0", "clear", "none"}:
+            await g.debug_bypass_enabled.set(False)
+            await g.debug_bypass_user_id.set(None)
+            await ctx.send("Debug bypass disabled.")
+            return
+
         try:
-            await self.send_welcome_message(channel, member)
-            await ctx.send(f"✅ Re-sent welcome message to {member.mention}'s application channel.")
-        except discord.Forbidden:
-            await ctx.send(f"❌ Permission denied sending message to {channel.mention}.")
-        except discord.HTTPException as e:
-            await ctx.send(f"❌ Error sending welcome message: {e}")
+            member = await commands.MemberConverter().convert(ctx, member_or_flag)
+        except commands.BadArgument:
+            await ctx.send(
+                "Invalid target. Use a member mention/ID to enable, or "
+                f"`{ctx.clean_prefix}applications maintenance debug off` to disable."
+            )
+            return
+
+        await g.debug_bypass_user_id.set(member.id)
+        await g.debug_bypass_enabled.set(True)
+        await ctx.send(
+            "Debug bypass enabled for "
+            f"{member.mention}. This user can re-submit applications for testing."
+        )
 
     @_applications.group(name="field")
     async def _field(self, ctx: commands.Context):
@@ -2313,6 +3640,23 @@ class Applications(commands.Cog):
 
         await ctx.send(embed=embed)
 
+    @_field.command(name="preview")
+    async def _field_preview(self, ctx: commands.Context):
+        """Preview the current server application form (opens the real form; submitting does nothing)."""
+        fields = await self.config.guild(ctx.guild).form_fields()
+        if not fields:
+            await ctx.send(
+                "No application form configured. Add fields with `{0}applications field add` or use the field manager: `{0}applications field manager`.".format(
+                    ctx.clean_prefix
+                )
+            )
+            return
+
+        await ctx.send(
+            "Click the button below to open the application form as applicants see it. Submitting the form will not save anything.",
+            view=PreviewFormView(self),
+        )
+
     @_field.command(name="confirmtext")
     async def _field_confirm_text(self, ctx: commands.Context, name: str, *, confirm_text: str):
         """Set the confirmation text for a confirm field.
@@ -2385,50 +3729,55 @@ class Applications(commands.Cog):
     @_applications.command(name="settings")
     async def _settings(self, ctx: commands.Context):
         """Show current application system settings."""
-        settings = await self.config.guild(ctx.guild).all()
-
-        restricted_role_id = settings.get("restricted_role")
+        g = self.config.guild(ctx.guild)
+        restricted_role_id = await g.restricted_role()
         restricted_role = (
             ctx.guild.get_role(restricted_role_id) if restricted_role_id else None
         )
 
-        access_role_ids = settings.get("access_roles", [])
+        access_role_ids = await g.access_roles() or []
         access_roles = [
             ctx.guild.get_role(rid) for rid in access_role_ids if ctx.guild.get_role(rid)
         ]
 
-        bypass_role_ids = settings.get("bypass_roles", [])
+        bypass_role_ids = await g.bypass_roles() or []
         bypass_roles = [
             ctx.guild.get_role(rid) for rid in bypass_role_ids if ctx.guild.get_role(rid)
         ]
 
-        category_id = settings.get("category_id")
-        category = ctx.guild.get_channel(category_id) if category_id else None
-
-        log_channel_id = settings.get("log_channel")
+        log_channel_id = await g.log_channel()
         log_channel = ctx.guild.get_channel(log_channel_id) if log_channel_id else None
 
-        notification_role_id = settings.get("notification_role")
+        notification_role_id = await g.notification_role()
         notification_role = (
             ctx.guild.get_role(notification_role_id) if notification_role_id else None
         )
 
-        cleanup_delay = settings.get("cleanup_delay", 24)
-        kick_timeout_seconds = settings.get("kick_timeout_seconds", 86400)
-        rejoin_invite = settings.get("rejoin_invite")
-        denial_action = settings.get("denial_action", "notify")
-        denial_send_dm = settings.get("denial_send_dm", False)
-        denial_tempban_seconds = settings.get("denial_tempban_duration_seconds", 86400)
-        early_close_action = settings.get("early_close_action", "notify")
-        early_close_send_dm = settings.get("early_close_send_dm", False)
-        early_close_tempban_seconds = settings.get("early_close_tempban_duration_seconds", 86400)
-        pending_unbans = settings.get("pending_unbans", [])
+        cleanup_delay = await g.cleanup_delay() or 24
+        kick_timeout_seconds = await g.kick_timeout_seconds() or 86400
+        rejoin_invite = await g.rejoin_invite()
+        denial_action = self._normalize_member_action(await g.denial_action(), allow_none=True)
+        denial_send_dm = await g.denial_send_dm()
+        denial_tempban_seconds = await g.denial_tempban_duration_seconds() or 86400
+        early_close_action = self._normalize_member_action(await g.early_close_action())
+        early_close_send_dm = await g.early_close_send_dm()
+        early_close_tempban_seconds = await g.early_close_tempban_duration_seconds() or 86400
+        approval_send_dm = await g.approval_send_dm()
+        debug_bypass_enabled = await g.debug_bypass_enabled()
+        debug_bypass_user_id = await g.debug_bypass_user_id()
+        pending_unbans = await g.pending_unbans() or []
 
-        form_fields = settings.get("form_fields", [])
-        applications = settings.get("applications", {})
+        form_fields = await g.form_fields() or []
+        applications_raw = await g.applications()
+        applications = applications_raw if isinstance(applications_raw, dict) else {}
         pending_count = sum(
-            1 for app in applications.values() if app.get("status") == "pending"
+            1 for app in applications.values() if isinstance(app, dict) and app.get("status") == "pending"
         )
+
+        enabled = await g.enabled()
+        lobby_channel_id = await g.lobby_channel_id()
+        review_channel_id = await g.review_channel_id()
+        manager_role_ids = await g.manager_roles() or []
 
         embed = discord.Embed(
             title="Application System Settings",
@@ -2437,7 +3786,7 @@ class Applications(commands.Cog):
 
         embed.add_field(
             name="Enabled",
-            value="Yes" if settings.get("enabled") else "No",
+            value="Yes" if enabled else "No",
             inline=True,
         )
 
@@ -2458,14 +3807,21 @@ class Applications(commands.Cog):
         )
 
         embed.add_field(
-            name="Category",
-            value=category.mention if category else "Not set",
+            name="Log Channel",
+            value=log_channel.mention if log_channel else "Not set",
             inline=True,
         )
 
+        lobby_channel = ctx.guild.get_channel(lobby_channel_id) if lobby_channel_id else None
+        review_channel = ctx.guild.get_channel(review_channel_id) if review_channel_id else None
         embed.add_field(
-            name="Log Channel",
-            value=log_channel.mention if log_channel else "Not set",
+            name="Lobby Channel",
+            value=lobby_channel.mention if lobby_channel else "Not set",
+            inline=True,
+        )
+        embed.add_field(
+            name="Review Channel",
+            value=review_channel.mention if review_channel else "Not set",
             inline=True,
         )
 
@@ -2504,6 +3860,11 @@ class Applications(commands.Cog):
             inline=True,
         )
         embed.add_field(
+            name="Approval DM",
+            value="Yes" if approval_send_dm else "No",
+            inline=True,
+        )
+        embed.add_field(
             name="Denial Tempban",
             value=self._format_timeout(int(denial_tempban_seconds or 86400)) if denial_action == "tempban" else "N/A",
             inline=True,
@@ -2528,6 +3889,24 @@ class Applications(commands.Cog):
             value=str(len(pending_unbans)),
             inline=True,
         )
+        debug_member = (
+            ctx.guild.get_member(int(debug_bypass_user_id)) if debug_bypass_user_id else None
+        )
+        debug_target = (
+            debug_member.mention
+            if debug_member
+            else (f"`{debug_bypass_user_id}`" if debug_bypass_user_id else "Not set")
+        )
+        embed.add_field(
+            name="Debug Bypass",
+            value=("Enabled" if debug_bypass_enabled else "Disabled"),
+            inline=True,
+        )
+        embed.add_field(
+            name="Debug Target",
+            value=debug_target,
+            inline=True,
+        )
 
         if bypass_roles:
             bypass_list = ", ".join([r.mention for r in bypass_roles])
@@ -2537,7 +3916,6 @@ class Applications(commands.Cog):
                 inline=False,
             )
 
-        manager_role_ids = settings.get("manager_roles", [])
         manager_roles = [
             ctx.guild.get_role(rid) for rid in manager_role_ids if ctx.guild.get_role(rid)
         ]
@@ -2563,39 +3941,22 @@ class Applications(commands.Cog):
 
         await ctx.send(embed=embed)
 
-    @_applications.command(name="preview")
-    async def _preview(self, ctx: commands.Context):
-        """Preview the current server application form (opens the real form; submitting does nothing)."""
-        fields = await self.config.guild(ctx.guild).form_fields()
-        if not fields:
-            await ctx.send(
-                "No application form configured. Add fields with `{0}applications field add` or use the field manager: `{0}applications field manager`.".format(
-                    ctx.clean_prefix
-                )
-            )
-            return
-
-        await ctx.send(
-            "Click the button below to open the application form as applicants see it. Submitting the form will not save anything.",
-            view=PreviewFormView(self),
-        )
-
     @_applications.command(name="approve", aliases=["a"])
     async def _approve(self, ctx: commands.Context, member: Optional[discord.Member] = None):
         """Approve an application.
         
-        If run in an application channel without specifying a member, 
-        it will approve the application for the channel owner.
+        If run in an interview channel without specifying a member,
+        it will approve the matching applicant.
         """
         # If no member specified, try to find from current channel
         if member is None:
             applications = await self.config.guild(ctx.guild).applications()
             current_channel_id = ctx.channel.id
             
-            # Find application by channel ID
+            # Find application by interview channel ID
             found_member = None
             for user_id, app_data in applications.items():
-                if app_data.get("channel_id") == current_channel_id:
+                if app_data.get("interview_channel_id") == current_channel_id:
                     found_member = ctx.guild.get_member(int(user_id))
                     if found_member:
                         member = found_member
@@ -2603,7 +3964,7 @@ class Applications(commands.Cog):
             
             if not member:
                 await ctx.send(
-                    "❌ No member specified and this doesn't appear to be an application channel. "
+                    "❌ No member specified and this doesn't appear to be an interview channel. "
                     "Please specify a member: `[p]applications approve @user`"
                 )
                 return
@@ -2676,8 +4037,9 @@ class Applications(commands.Cog):
         cleanup_time = datetime.utcnow() + timedelta(hours=cleanup_delay)
         app_data["cleanup_scheduled_at"] = cleanup_time.isoformat()
         
-        applications[str(member.id)] = app_data
-        await self.config.guild(ctx.guild).applications.set(applications)
+        async with self.config.guild(ctx.guild).applications() as apps:
+            if str(member.id) in apps:
+                apps[str(member.id)].update(app_data)
 
         # Log to log channel
         decision_maker = ctx.guild.get_member(ctx.author.id)
@@ -2685,23 +4047,11 @@ class Applications(commands.Cog):
             ctx.guild, member, "approved", decision_maker=decision_maker
         )
 
-        # Notify in channel
-        channel_id = app_data.get("channel_id")
-        if channel_id:
-            channel = ctx.guild.get_channel(channel_id)
-            if channel:
-                embed = await self.create_review_embed(
-                    member, app_data.get("responses", {}), "approved"
-                )
-                try:
-                    await channel.send(
-                        f"✅ **Application Approved!**\n\n"
-                        f"Congratulations {member.mention}! Your application has been approved. "
-                        f"You now have full access to the server.",
-                        embed=embed,
-                    )
-                except discord.HTTPException:
-                    pass
+        if await self.config.guild(ctx.guild).approval_send_dm():
+            await self._send_approval_dm(ctx.guild, member)
+
+        # Update review channel message (new flow): remove buttons, show approved
+        await self._update_review_message_after_resolve(ctx.guild, app_data, member, "approved")
 
         await ctx.send(f"✅ Approved {member.mention}'s application.")
 
@@ -2711,18 +4061,18 @@ class Applications(commands.Cog):
     ):
         """Deny an application.
         
-        If run in an application channel without specifying a member, 
-        it will deny the application for the channel owner.
+        If run in an interview channel without specifying a member,
+        it will deny the matching applicant.
         """
         # If no member specified, try to find from current channel
         if member is None:
             applications = await self.config.guild(ctx.guild).applications()
             current_channel_id = ctx.channel.id
             
-            # Find application by channel ID
+            # Find application by interview channel ID
             found_member = None
             for user_id, app_data in applications.items():
-                if app_data.get("channel_id") == current_channel_id:
+                if app_data.get("interview_channel_id") == current_channel_id:
                     found_member = ctx.guild.get_member(int(user_id))
                     if found_member:
                         member = found_member
@@ -2730,7 +4080,7 @@ class Applications(commands.Cog):
             
             if not member:
                 await ctx.send(
-                    "❌ No member specified and this doesn't appear to be an application channel. "
+                    "❌ No member specified and this doesn't appear to be an interview channel. "
                     "Please specify a member: `[p]applications deny @user [reason]`"
                 )
                 return
@@ -2763,8 +4113,9 @@ class Applications(commands.Cog):
         cleanup_time = datetime.utcnow() + timedelta(hours=cleanup_delay)
         app_data["cleanup_scheduled_at"] = cleanup_time.isoformat()
         
-        applications[str(member.id)] = app_data
-        await self.config.guild(ctx.guild).applications.set(applications)
+        async with self.config.guild(ctx.guild).applications() as apps:
+            if str(member.id) in apps:
+                apps[str(member.id)].update(app_data)
 
         # Log to log channel
         decision_maker = ctx.guild.get_member(ctx.author.id)
@@ -2773,7 +4124,9 @@ class Applications(commands.Cog):
         )
 
         # Execute configured denial action (DM before removal)
-        denial_action = await self.config.guild(ctx.guild).denial_action()
+        denial_action = self._normalize_member_action(
+            await self.config.guild(ctx.guild).denial_action(), allow_none=True
+        )
         denial_send_dm = await self.config.guild(ctx.guild).denial_send_dm()
         denial_tempban_seconds = (
             await self.config.guild(ctx.guild).denial_tempban_duration_seconds()
@@ -2791,26 +4144,8 @@ class Applications(commands.Cog):
             context="denial",
         )
 
-        # Notify in channel
-        channel_id = app_data.get("channel_id")
-        if channel_id:
-            channel = ctx.guild.get_channel(channel_id)
-            if channel:
-                embed = await self.create_review_embed(
-                    member, app_data.get("responses", {}), "denied"
-                )
-                if reason:
-                    embed.add_field(name="Reason", value=reason, inline=False)
-
-                try:
-                    await channel.send(
-                        f"❌ **Application Denied**\n\n"
-                        f"Sorry {member.mention}, your application has been denied. "
-                        f"You can appeal this decision by messaging an admin in this channel.",
-                        embed=embed,
-                    )
-                except discord.HTTPException:
-                    pass
+        # Update review channel message (new flow): remove buttons, show denied
+        await self._update_review_message_after_resolve(ctx.guild, app_data, member, "denied", reason=reason)
 
         await ctx.send(f"❌ Denied {member.mention}'s application.")
 
@@ -2870,8 +4205,9 @@ class Applications(commands.Cog):
         cleanup_time = datetime.utcnow() + timedelta(hours=cleanup_delay)
         app_data["cleanup_scheduled_at"] = cleanup_time.isoformat()
         
-        applications[str(member.id)] = app_data
-        await self.config.guild(interaction.guild).applications.set(applications)
+        async with self.config.guild(interaction.guild).applications() as apps:
+            if str(member.id) in apps:
+                apps[str(member.id)].update(app_data)
 
         # Log to log channel
         decision_maker = interaction.guild.get_member(interaction.user.id)
@@ -2879,29 +4215,17 @@ class Applications(commands.Cog):
             interaction.guild, member, "approved", decision_maker=decision_maker
         )
 
+        if await self.config.guild(interaction.guild).approval_send_dm():
+            await self._send_approval_dm(interaction.guild, member)
+
         # Respond to interaction
         if not interaction.response.is_done():
             await interaction.response.send_message(
                 f"✅ Approved {member.mention}'s application.", ephemeral=True
             )
 
-        # Send new message in application channel
-        channel_id = app_data.get("channel_id")
-        if channel_id:
-            channel = interaction.guild.get_channel(channel_id)
-            if channel:
-                embed = await self.create_review_embed(
-                    member, app_data.get("responses", {}), "approved"
-                )
-                try:
-                    await channel.send(
-                        f"✅ **Application Approved by {interaction.user.mention}**\n\n"
-                        f"Congratulations {member.mention}! Your application has been approved. "
-                        f"You now have full access to the server.",
-                        embed=embed,
-                    )
-                except discord.HTTPException:
-                    pass
+        # Update review channel message (new flow)
+        await self._update_review_message_after_resolve(interaction.guild, app_data, member, "approved")
 
         log.info(f"Application approved for {member.display_name} by {interaction.user.display_name}")
 
@@ -2937,8 +4261,9 @@ class Applications(commands.Cog):
         cleanup_time = datetime.utcnow() + timedelta(hours=cleanup_delay)
         app_data["cleanup_scheduled_at"] = cleanup_time.isoformat()
         
-        applications[str(member.id)] = app_data
-        await self.config.guild(interaction.guild).applications.set(applications)
+        async with self.config.guild(interaction.guild).applications() as apps:
+            if str(member.id) in apps:
+                apps[str(member.id)].update(app_data)
 
         # Log to log channel
         decision_maker = interaction.guild.get_member(interaction.user.id)
@@ -2947,7 +4272,9 @@ class Applications(commands.Cog):
         )
 
         # Execute configured denial action (DM before removal)
-        denial_action = await self.config.guild(interaction.guild).denial_action()
+        denial_action = self._normalize_member_action(
+            await self.config.guild(interaction.guild).denial_action(), allow_none=True
+        )
         denial_send_dm = await self.config.guild(interaction.guild).denial_send_dm()
         denial_tempban_seconds = (
             await self.config.guild(interaction.guild).denial_tempban_duration_seconds()
@@ -2970,49 +4297,10 @@ class Applications(commands.Cog):
             f"✅ Application denied. {member.mention} has been notified.", ephemeral=True
         )
 
-        # Try to find and update the original message with buttons
-        channel_id = app_data.get("channel_id")
-        if channel_id:
-            channel = interaction.guild.get_channel(channel_id)
-            if channel:
-                # Try to find the submission message and update it
-                try:
-                    async for message in channel.history(limit=50):
-                        if message.author == interaction.guild.me and message.embeds:
-                            embed = message.embeds[0]
-                            if embed.title and member.display_name in embed.title and "pending" in embed.title.lower():
-                                # Found the submission message, update it
-                                new_embed = await self.create_review_embed(
-                                    member, app_data.get("responses", {}), "denied"
-                                )
-                                new_embed.add_field(name="Reason", value=reason, inline=False)
-                                await message.edit(
-                                    content=(
-                                        f"❌ **Application Denied by {interaction.user.mention}**\n\n"
-                                        f"Sorry {member.mention}, your application has been denied. "
-                                        f"You can appeal this decision by messaging an admin in this channel."
-                                    ),
-                                    embed=new_embed,
-                                    view=None,
-                                )
-                                break
-                except discord.HTTPException:
-                    pass
-
-                # Also send a notification message
-                embed = await self.create_review_embed(
-                    member, app_data.get("responses", {}), "denied"
-                )
-                embed.add_field(name="Reason", value=reason, inline=False)
-                try:
-                    await channel.send(
-                        f"❌ **Application Denied**\n\n"
-                        f"Sorry {member.mention}, your application has been denied. "
-                        f"You can appeal this decision by messaging an admin in this channel.",
-                        embed=embed,
-                    )
-                except discord.HTTPException:
-                    pass
+        # Update review channel message (new flow): remove buttons, show denied
+        await self._update_review_message_after_resolve(
+            interaction.guild, app_data, member, "denied", reason=reason
+        )
 
         log.info(f"Application denied for {member.display_name} by {interaction.user.display_name}")
 
@@ -3030,7 +4318,7 @@ class Applications(commands.Cog):
         # Handle case where application hasn't been submitted yet
         if not responses:
             await ctx.send(
-                f"{member.mention} has an application channel but hasn't submitted the form yet."
+                f"{member.mention} has not submitted the application form yet."
             )
             return
 
@@ -3062,14 +4350,15 @@ class Applications(commands.Cog):
             color=await ctx.embed_color(),
         )
 
+        review_channel_id = await self.config.guild(ctx.guild).review_channel_id()
+        review_channel = ctx.guild.get_channel(review_channel_id) if review_channel_id else None
         for user_id, app_data in list(pending.items())[:10]:  # Limit to 10
             member = ctx.guild.get_member(int(user_id))
             if member:
-                channel_id = app_data.get("channel_id")
-                channel = ctx.guild.get_channel(channel_id) if channel_id else None
+                loc = f"**Location:** {review_channel.mention}" if review_channel else "**Location:** Review channel"
                 embed.add_field(
                     name=member.display_name,
-                    value=f"**Channel:** {channel.mention if channel else 'N/A'}\n**User:** {member.mention}",
+                    value=f"{loc}\n**User:** {member.mention}",
                     inline=True,
                 )
 
@@ -3080,28 +4369,28 @@ class Applications(commands.Cog):
 
     @_applications.command(name="close")
     async def _close(self, ctx: commands.Context, member: Optional[discord.Member] = None):
-        """Close/delete an application channel.
-        
-        If run in an application channel without specifying a member, 
-        it will close the current channel.
+        """Close an application and remove review/interview artifacts.
+
+        If run in an interview channel without specifying a member,
+        it will close that applicant's application.
         """
         # If no member specified, try to find from current channel
         if member is None:
             applications = await self.config.guild(ctx.guild).applications()
             current_channel_id = ctx.channel.id
-            
-            # Find application by channel ID
+
+            # Find application by interview channel ID
             found_member = None
             for user_id, app_data in applications.items():
-                if app_data.get("channel_id") == current_channel_id:
+                if app_data.get("interview_channel_id") == current_channel_id:
                     found_member = ctx.guild.get_member(int(user_id))
                     if found_member:
                         member = found_member
                         break
-            
+
             if not member:
                 await ctx.send(
-                    "❌ No member specified and this doesn't appear to be an application channel. "
+                    "❌ No member specified and this doesn't appear to be an interview channel. "
                     "Please specify a member: `[p]applications close @user`"
                 )
                 return
@@ -3112,13 +4401,12 @@ class Applications(commands.Cog):
             return
 
         app_data = applications[str(member.id)]
-        channel_id = app_data.get("channel_id")
         submitted = app_data.get("submitted_at") or app_data.get("responses")
         # Skip early_close action for users who were already approved (e.g. approved without submitting).
         run_early_close = not submitted and app_data.get("status") != "approved"
         if run_early_close:
             # Early close: user has not submitted. Execute configured action (DM before removal).
-            early_action = await self.config.guild(ctx.guild).early_close_action()
+            early_action = self._normalize_member_action(await self.config.guild(ctx.guild).early_close_action())
             early_send_dm = await self.config.guild(ctx.guild).early_close_send_dm()
             early_tempban_seconds = (
                 await self.config.guild(ctx.guild).early_close_tempban_duration_seconds()
@@ -3144,62 +4432,68 @@ class Applications(commands.Cog):
                 decision_maker=ctx.guild.get_member(ctx.author.id),
             )
 
-        if channel_id:
-            channel = ctx.guild.get_channel(channel_id)
-            if channel:
+        review_message_id = app_data.get("review_message_id")
+        review_channel_id = await self.config.guild(ctx.guild).review_channel_id()
+        if review_channel_id and review_message_id:
+            ch = ctx.guild.get_channel(review_channel_id)
+            if ch:
                 try:
-                    await channel.delete(reason=f"Application closed by {ctx.author.display_name}")
-                    if channel.id != ctx.channel.id:
-                        await ctx.send(f"✅ Closed application channel for {member.mention}.")
-                except discord.Forbidden:
-                    await ctx.send("❌ Permission denied deleting channel.")
-                except discord.HTTPException as e:
-                    await ctx.send(f"❌ Error deleting channel: {e}")
-            else:
-                await ctx.send("Channel not found.")
-        else:
-            await ctx.send("No channel associated with this application.")
+                    msg = await ch.fetch_message(review_message_id)
+                    await msg.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+        if await self.config.guild(ctx.guild).delete_interview_on_resolve():
+            interview_channel_id = app_data.get("interview_channel_id")
+            if interview_channel_id:
+                ich = ctx.guild.get_channel(interview_channel_id)
+                if ich:
+                    try:
+                        await ich.delete(reason="Application closed")
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+        await ctx.send(f"✅ Closed application for {member.mention}.")
 
         # Remove from applications
-        del applications[str(member.id)]
-        await self.config.guild(ctx.guild).applications.set(applications)
+        async with self.config.guild(ctx.guild).applications() as apps:
+            if str(member.id) in apps:
+                del apps[str(member.id)]
 
-    @_applications.command(name="clearorphaned")
+    @_maintenance.command(name="clearorphaned")
     async def _clear_orphaned(self, ctx: commands.Context):
-        """Remove application entries whose channel is missing or deleted.
-        
-        Use this when you have pending applications that cannot be closed normally
-        (e.g. the channel was deleted or the application is stuck with no channel).
-        """
+        """Remove application entries whose review/interview artifacts are missing."""
         applications = await self.config.guild(ctx.guild).applications()
-        to_remove = []
+        review_channel_id = await self.config.guild(ctx.guild).review_channel_id()
+        review_channel = ctx.guild.get_channel(review_channel_id) if review_channel_id else None
+        to_remove = set()
         for user_id, app_data in applications.items():
-            channel_id = app_data.get("channel_id")
-            if not channel_id:
-                to_remove.append(user_id)
+            if app_data.get("status") != "pending":
                 continue
-            channel = ctx.guild.get_channel(channel_id)
-            if channel is None:
-                to_remove.append(user_id)
+            review_message_id = app_data.get("review_message_id")
+            if review_channel and review_message_id:
+                try:
+                    await review_channel.fetch_message(review_message_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    to_remove.add(user_id)
+            elif review_message_id:
+                to_remove.add(user_id)
+            interview_channel_id = app_data.get("interview_channel_id")
+            if interview_channel_id and not ctx.guild.get_channel(interview_channel_id):
+                to_remove.add(user_id)
 
         if not to_remove:
             await ctx.send("No orphaned application entries found.")
             return
 
         async with self.config.guild(ctx.guild).applications() as apps:
-            for user_id in to_remove:
+            for user_id in sorted(to_remove):
                 if user_id in apps:
                     del apps[user_id]
 
-        await ctx.send(f"Removed {len(to_remove)} orphaned application entry(ies): user IDs `{', '.join(to_remove)}`.")
+        await ctx.send(f"Removed {len(to_remove)} orphaned application entry(ies): user IDs `{', '.join(sorted(to_remove))}`.")
 
-    @_applications.command(name="removeuser")
+    @_maintenance.command(name="removeuser")
     async def _remove_user(self, ctx: commands.Context, user_id: int):
-        """Remove an application by user ID (e.g. when the member left or the channel is gone).
-        
-        Use when you cannot use `applications close @member` because the member is no longer
-        in the server or the application channel no longer exists.
-        """
+        """Remove an application by user ID (e.g. when the member left)."""
         applications = await self.config.guild(ctx.guild).applications()
         user_id_str = str(user_id)
         if user_id_str not in applications:
@@ -3207,21 +4501,33 @@ class Applications(commands.Cog):
             return
 
         app_data = applications[user_id_str]
-        channel_id = app_data.get("channel_id")
-        if channel_id:
-            channel = ctx.guild.get_channel(channel_id)
-            if channel:
+        review_channel_id = await self.config.guild(ctx.guild).review_channel_id()
+        review_message_id = app_data.get("review_message_id")
+        if review_channel_id and review_message_id:
+            ch = ctx.guild.get_channel(review_channel_id)
+            if ch:
                 try:
-                    await channel.delete(reason=f"Application removed by {ctx.author.display_name}")
-                except (discord.Forbidden, discord.HTTPException):
-                    pass  # Channel may already be gone or no permission
+                    msg = await ch.fetch_message(review_message_id)
+                    await msg.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+        if await self.config.guild(ctx.guild).delete_interview_on_resolve():
+            interview_channel_id = app_data.get("interview_channel_id")
+            if interview_channel_id:
+                ich = ctx.guild.get_channel(interview_channel_id)
+                if ich:
+                    try:
+                        await ich.delete(reason="Application removed")
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
 
-        del applications[user_id_str]
-        await self.config.guild(ctx.guild).applications.set(applications)
+        async with self.config.guild(ctx.guild).applications() as apps:
+            if user_id_str in apps:
+                del apps[user_id_str]
         await ctx.send(f"Removed application record for user ID `{user_id}`.")
 
     async def cleanup_loop(self):
-        """Background task to periodically clean up expired application channels."""
+        """Background task to periodically clean up expired application artifacts."""
         await self.bot.wait_until_ready()
 
         while True:
@@ -3229,7 +4535,7 @@ class Applications(commands.Cog):
                 # Wait 1 hour before checking again
                 await asyncio.sleep(3600)
 
-                log.debug("Running application channel cleanup check")
+                log.debug("Running application cleanup check")
 
                 for guild in self.bot.guilds:
                     try:
@@ -3240,18 +4546,8 @@ class Applications(commands.Cog):
                         current_time = datetime.utcnow()
 
                         to_remove = []
-                        # Orphaned entries: no channel or channel was deleted
-                        for user_id, app_data in applications.items():
-                            channel_id = app_data.get("channel_id")
-                            if not channel_id:
-                                to_remove.append(user_id)
-                                continue
-                            if guild.get_channel(channel_id) is None:
-                                to_remove.append(user_id)
 
                         for user_id, app_data in applications.items():
-                            if user_id in to_remove:
-                                continue
                             cleanup_time_str = app_data.get("cleanup_scheduled_at")
                             if not cleanup_time_str:
                                 continue
@@ -3259,27 +4555,25 @@ class Applications(commands.Cog):
                             try:
                                 cleanup_time = datetime.fromisoformat(cleanup_time_str)
                                 if current_time >= cleanup_time:
-                                    # Time to clean up
-                                    channel_id = app_data.get("channel_id")
-                                    if channel_id:
-                                        channel = guild.get_channel(channel_id)
-                                        if channel:
+                                    review_message_id = app_data.get("review_message_id")
+                                    review_channel_id = await self.config.guild(guild).review_channel_id()
+                                    if review_channel_id and review_message_id:
+                                        ch = guild.get_channel(review_channel_id)
+                                        if ch:
                                             try:
-                                                await channel.delete(
-                                                    reason="Application channel cleanup (approved/denied)"
-                                                )
-                                                log.info(
-                                                    f"Cleaned up application channel {channel.name} for user {user_id} in {guild.name}"
-                                                )
-                                            except discord.Forbidden:
-                                                log.warning(
-                                                    f"Permission denied deleting channel {channel_id} in {guild.name}"
-                                                )
-                                            except discord.HTTPException as e:
-                                                log.error(f"Error deleting channel {channel_id}: {e}")
-                                        else:
-                                            # Channel already deleted
-                                            log.debug(f"Channel {channel_id} already deleted, removing from tracking")
+                                                msg = await ch.fetch_message(review_message_id)
+                                                await msg.delete()
+                                            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                                                pass
+                                        if await self.config.guild(guild).delete_interview_on_resolve():
+                                            interview_channel_id = app_data.get("interview_channel_id")
+                                            if interview_channel_id:
+                                                ich = guild.get_channel(interview_channel_id)
+                                                if ich:
+                                                    try:
+                                                        await ich.delete(reason="Application cleanup")
+                                                    except (discord.Forbidden, discord.HTTPException):
+                                                        pass
                                     to_remove.append(user_id)
                             except (ValueError, TypeError) as e:
                                 log.warning(f"Invalid cleanup_scheduled_at for user {user_id}: {e}")
@@ -3328,7 +4622,7 @@ class Applications(commands.Cog):
                 await asyncio.sleep(300)  # 5 minutes
 
     async def cleanup_channels(self, guild: discord.Guild) -> int:
-        """Manually trigger cleanup of expired channels. Returns number of channels cleaned."""
+        """Manually trigger cleanup of expired application artifacts. Returns number cleaned."""
         if not await self.config.guild(guild).enabled():
             return 0
 
@@ -3337,15 +4631,8 @@ class Applications(commands.Cog):
         cleaned = 0
 
         to_remove = []
-        # Orphaned entries: no channel or channel was deleted
-        for user_id, app_data in applications.items():
-            channel_id = app_data.get("channel_id")
-            if not channel_id or guild.get_channel(channel_id) is None:
-                to_remove.append(user_id)
 
         for user_id, app_data in applications.items():
-            if user_id in to_remove:
-                continue
             cleanup_time_str = app_data.get("cleanup_scheduled_at")
             if not cleanup_time_str:
                 continue
@@ -3353,27 +4640,27 @@ class Applications(commands.Cog):
             try:
                 cleanup_time = datetime.fromisoformat(cleanup_time_str)
                 if current_time >= cleanup_time:
-                    channel_id = app_data.get("channel_id")
-                    if channel_id:
-                        channel = guild.get_channel(channel_id)
-                        if channel:
+                    review_message_id = app_data.get("review_message_id")
+                    review_channel_id = await self.config.guild(guild).review_channel_id()
+                    if review_channel_id and review_message_id:
+                        ch = guild.get_channel(review_channel_id)
+                        if ch:
                             try:
-                                await channel.delete(
-                                    reason="Manual application channel cleanup"
-                                )
+                                msg = await ch.fetch_message(review_message_id)
+                                await msg.delete()
                                 cleaned += 1
-                                log.info(
-                                    f"Manually cleaned up application channel {channel.name} for user {user_id} in {guild.name}"
-                                )
-                            except discord.Forbidden:
-                                log.warning(
-                                    f"Permission denied deleting channel {channel_id} in {guild.name}"
-                                )
-                            except discord.HTTPException as e:
-                                log.error(f"Error deleting channel {channel_id}: {e}")
-                        else:
-                            # Channel already deleted
-                            cleaned += 1
+                            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                                pass
+                        if await self.config.guild(guild).delete_interview_on_resolve():
+                            interview_channel_id = app_data.get("interview_channel_id")
+                            if interview_channel_id:
+                                ich = guild.get_channel(interview_channel_id)
+                                if ich:
+                                    try:
+                                        await ich.delete(reason="Manual application cleanup")
+                                        cleaned += 1
+                                    except (discord.Forbidden, discord.HTTPException):
+                                        pass
                     to_remove.append(user_id)
             except (ValueError, TypeError) as e:
                 log.warning(f"Invalid cleanup_scheduled_at for user {user_id}: {e}")
