@@ -1951,6 +1951,58 @@ class Applications(commands.Cog):
         member_role_ids = [role.id for role in member.roles]
         return any(role_id in member_role_ids for role_id in bypass_roles)
 
+    async def _get_configured_access_roles(self, guild: discord.Guild) -> List[discord.Role]:
+        """Return configured access roles that still exist in the guild."""
+        access_role_ids = await self.config.guild(guild).access_roles()
+        if not access_role_ids:
+            return []
+        return [role for rid in access_role_ids if (role := guild.get_role(rid))]
+
+    @staticmethod
+    def _get_missing_access_roles(
+        member: discord.Member, access_roles: List[discord.Role]
+    ) -> List[discord.Role]:
+        """Return configured access roles the member does not currently have."""
+        member_role_ids = {role.id for role in member.roles}
+        return [role for role in access_roles if role.id not in member_role_ids]
+
+    async def _assign_missing_access_roles(
+        self,
+        member: discord.Member,
+        *,
+        reason: str,
+        access_roles: Optional[List[discord.Role]] = None,
+    ) -> Tuple[str, int]:
+        """Assign configured access roles the member does not have.
+
+        Returns:
+            Tuple[str, int]:
+                - ("no_access_roles", 0) when no valid access roles are configured
+                - ("already_has", 0) when member already has all access roles
+                - ("assigned", N) when N missing roles were added
+                - ("forbidden", N) when assignment failed due to permissions
+                - ("http_error", N) when assignment failed due to HTTP error
+        """
+        resolved_access_roles = (
+            access_roles
+            if access_roles is not None
+            else await self._get_configured_access_roles(member.guild)
+        )
+        if not resolved_access_roles:
+            return "no_access_roles", 0
+
+        missing_access_roles = self._get_missing_access_roles(member, resolved_access_roles)
+        if not missing_access_roles:
+            return "already_has", 0
+
+        try:
+            await member.add_roles(*missing_access_roles, reason=reason)
+            return "assigned", len(missing_access_roles)
+        except discord.Forbidden:
+            return "forbidden", len(missing_access_roles)
+        except discord.HTTPException:
+            return "http_error", len(missing_access_roles)
+
     async def _embed_from_lobby_data(
         self, guild: discord.Guild, embed_data: Optional[Dict]
     ) -> Optional[discord.Embed]:
@@ -2709,6 +2761,36 @@ class Applications(commands.Cog):
 
         # Check for bypass roles
         if await self.has_bypass_role(member):
+            access_assignment_status, assigned_count = await self._assign_missing_access_roles(
+                member,
+                reason="Bypass role on join",
+            )
+            if access_assignment_status == "assigned":
+                log.info(
+                    "Assigned %s access role(s) to bypass member %s on join",
+                    assigned_count,
+                    member.display_name,
+                )
+            elif access_assignment_status == "already_has":
+                log.info(
+                    "Bypass member %s already has all configured access roles on join",
+                    member.display_name,
+                )
+            elif access_assignment_status == "no_access_roles":
+                log.info(
+                    "Bypass member %s joined but no valid access roles are configured",
+                    member.display_name,
+                )
+            elif access_assignment_status == "forbidden":
+                log.error(
+                    "Permission denied assigning access roles to bypass member %s on join",
+                    member.display_name,
+                )
+            else:
+                log.error(
+                    "HTTP error assigning access roles to bypass member %s on join",
+                    member.display_name,
+                )
             log.info(f"Member {member.display_name} has bypass role, skipping application")
             return
 
@@ -2753,6 +2835,63 @@ class Applications(commands.Cog):
         self._start_application_timer(member.guild.id, member.id)
 
     @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        """Grant access roles when a member gains a bypass role."""
+        if after.bot:
+            return
+
+        if before.guild.id != after.guild.id or before.id != after.id:
+            return
+
+        if not await self.config.guild(after.guild).enabled():
+            return
+
+        bypass_role_ids = await self.config.guild(after.guild).bypass_roles()
+        if not bypass_role_ids:
+            return
+
+        before_role_ids = {role.id for role in before.roles}
+        after_role_ids = {role.id for role in after.roles}
+        if before_role_ids == after_role_ids:
+            return
+
+        had_bypass_before = any(role_id in before_role_ids for role_id in bypass_role_ids)
+        has_bypass_now = any(role_id in after_role_ids for role_id in bypass_role_ids)
+        if had_bypass_before or not has_bypass_now:
+            return
+
+        access_assignment_status, assigned_count = await self._assign_missing_access_roles(
+            after,
+            reason="Bypass role granted",
+        )
+        if access_assignment_status == "assigned":
+            log.info(
+                "Assigned %s access role(s) to %s after bypass role gain",
+                assigned_count,
+                after.display_name,
+            )
+        elif access_assignment_status == "already_has":
+            log.info(
+                "Member %s gained bypass role and already has access roles",
+                after.display_name,
+            )
+        elif access_assignment_status == "no_access_roles":
+            log.info(
+                "Member %s gained bypass role but no valid access roles are configured",
+                after.display_name,
+            )
+        elif access_assignment_status == "forbidden":
+            log.error(
+                "Permission denied assigning access roles to %s after bypass role gain",
+                after.display_name,
+            )
+        else:
+            log.error(
+                "HTTP error assigning access roles to %s after bypass role gain",
+                after.display_name,
+            )
+
+    @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
         """Clean up when member leaves."""
         applications = await self.config.guild(member.guild).applications()
@@ -2782,7 +2921,12 @@ class Applications(commands.Cog):
 
     @_applications.command(name="toggle")
     async def _toggle(self, ctx: commands.Context, on_off: Optional[bool] = None):
-        """Enable or disable the application system."""
+        """Enable/disable the application system, or toggle when omitted.
+
+        Options:
+        - `true` / `false`
+        - Omit value to invert current state
+        """
         if on_off is None:
             current = await self.config.guild(ctx.guild).enabled()
             await self.config.guild(ctx.guild).enabled.set(not current)
@@ -2841,6 +2985,7 @@ class Applications(commands.Cog):
 
         This role should be configured in Discord to deny view permissions
         for restricted areas until an application is approved.
+        Omit `role` to clear the configured restricted role.
         """
         if role is None:
             await self.config.guild(ctx.guild).restricted_role.set(None)
@@ -2859,6 +3004,8 @@ class Applications(commands.Cog):
         """Add or remove a bypass role.
 
         Members with bypass roles will skip the application process.
+        Available actions: `add`, `remove`.
+        Usage: `[p]applications role bypass <add|remove> @Role`
         """
         if action.lower() not in ["add", "remove"]:
             await ctx.send("Invalid action. Use `add` or `remove`.")
@@ -2891,6 +3038,8 @@ class Applications(commands.Cog):
         Access roles are granted to members when their application is approved.
         This is an alternative to using a restricted role system.
         Note: Use either restricted_role OR access_roles, not both.
+        Available actions: `add`, `remove`.
+        Usage: `[p]applications role access <add|remove> @Role`
         """
         if action.lower() not in ["add", "remove"]:
             await ctx.send("Invalid action. Use `add` or `remove`.")
@@ -2921,6 +3070,8 @@ class Applications(commands.Cog):
         """Add or remove a manager role.
 
         Members with manager roles can approve/deny applications.
+        Available actions: `add`, `remove`.
+        Usage: `[p]applications role manager <add|remove> @Role`
         """
         if action.lower() not in ["add", "remove"]:
             await ctx.send("Invalid action. Use `add` or `remove`.")
@@ -2948,7 +3099,10 @@ class Applications(commands.Cog):
     async def _set_log_channel(
         self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None
     ):
-        """Set the channel for logging application events."""
+        """Set the log channel for application events.
+
+        Provide `#channel` to set it, or omit to clear.
+        """
         if channel is None:
             await self.config.guild(ctx.guild).log_channel.set(None)
             await ctx.send("Log channel cleared.")
@@ -2960,7 +3114,10 @@ class Applications(commands.Cog):
     async def _set_lobby_channel(
         self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None
     ):
-        """Set the lobby/welcome channel where the apply panel (embed + button) is sent."""
+        """Set the lobby/welcome channel for the apply panel.
+
+        Provide `#channel` to set it, or omit to clear.
+        """
         if channel is None:
             await self.config.guild(ctx.guild).lobby_channel_id.set(None)
             await self.config.guild(ctx.guild).lobby_panel_message_id.set(None)
@@ -2976,7 +3133,10 @@ class Applications(commands.Cog):
     async def _set_review_channel(
         self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None
     ):
-        """Set the channel where submitted applications are posted for admin review."""
+        """Set the channel where submitted applications are posted for review.
+
+        Provide `#channel` to set it, or omit to clear.
+        """
         if channel is None:
             await self.config.guild(ctx.guild).review_channel_id.set(None)
             await ctx.send("Review channel cleared.")
@@ -3041,7 +3201,10 @@ class Applications(commands.Cog):
     async def _set_notification_role(
         self, ctx: commands.Context, role: Optional[discord.Role] = None
     ):
-        """Set the role to ping when new applications are submitted."""
+        """Set the role to ping when new applications are submitted.
+
+        Provide `@Role` to set it, or omit to clear.
+        """
         if role is None:
             await self.config.guild(ctx.guild).notification_role.set(None)
             await ctx.send("Notification role cleared.")
@@ -3054,7 +3217,11 @@ class Applications(commands.Cog):
 
     @_policy.command(name="cleanupdelay")
     async def _set_cleanup_delay(self, ctx: commands.Context, hours: int):
-        """Set the delay in hours before deleting channels after approval/denial."""
+        """Set cleanup delay in hours after approval/denial.
+
+        Options:
+        - `hours` must be `0` or greater
+        """
         if hours < 0:
             await ctx.send("Delay must be a positive number.")
             return
@@ -3157,7 +3324,10 @@ class Applications(commands.Cog):
     ):
         """Set the invite link to send when kicking users who didn't submit within the configured time.
         
-        If no invite URL is provided, clears the configured invite link.
+        Options:
+        - Full invite URL (`https://discord.gg/CODE`)
+        - Invite code only (`CODE`)
+        - Omit value to clear the configured invite
         """
         import re
         
@@ -3219,7 +3389,9 @@ class Applications(commands.Cog):
     ):
         """Set whether to DM the user before kick/tempban/ban on denial.
         
-        If not set, shows current value.
+        Options:
+        - `true` / `false`
+        - Omit value to show current setting
         """
         if on_off is None:
             current = await self.config.guild(ctx.guild).denial_send_dm()
@@ -3237,7 +3409,9 @@ class Applications(commands.Cog):
     ):
         """Set whether to DM the user when an application is approved.
 
-        If not set, shows current value.
+        Options:
+        - `true` / `false`
+        - Omit value to show current setting
         """
         if on_off is None:
             current = await self.config.guild(ctx.guild).approval_send_dm()
@@ -3324,7 +3498,9 @@ class Applications(commands.Cog):
     ):
         """Set whether to DM the user before kick/tempban/ban when closing before submission.
         
-        If not set, shows current value.
+        Options:
+        - `true` / `false`
+        - Omit value to show current setting
         """
         if on_off is None:
             current = await self.config.guild(ctx.guild).early_close_send_dm()
@@ -3380,7 +3556,10 @@ class Applications(commands.Cog):
 
     @_applications.command(name="setup", aliases=["serversetup"])
     async def _setup(self, ctx: commands.Context):
-        """Interactive server setup: create category, channels, roles, and send the lobby panel."""
+        """Run interactive server setup for channels, roles, and lobby panel.
+
+        No options. Uses buttons to choose role mode and setup behavior.
+        """
         if not ctx.guild:
             await ctx.send("This command can only be used in a server.")
             return
@@ -3401,7 +3580,10 @@ class Applications(commands.Cog):
 
     @_applications.command(name="check", aliases=["configcheck"])
     async def _check(self, ctx: commands.Context):
-        """Run configuration checks and report issues. Optionally auto-fix fixable items."""
+        """Run configuration checks and report issues.
+
+        No options. Includes an Auto-fix button for fixable issues.
+        """
         if not await self.config.guild(ctx.guild).enabled():
             await ctx.send("Enable the application system first with `[p]applications toggle true`.")
             return
@@ -3467,7 +3649,10 @@ class Applications(commands.Cog):
 
     @_maintenance.command(name="cleanup")
     async def _cleanup(self, ctx: commands.Context):
-        """Manually trigger cleanup of expired application artifacts."""
+        """Manually trigger cleanup of expired application artifacts.
+
+        No options.
+        """
         await ctx.send("Cleaning up expired application artifacts...")
         cleaned = await self.cleanup_channels(ctx.guild)
         await ctx.send(f"✅ Cleaned up {cleaned} expired application artifact(s).")
@@ -3519,6 +3704,82 @@ class Applications(commands.Cog):
         await ctx.send(
             "Debug bypass enabled for "
             f"{member.mention}. This user can re-submit applications for testing."
+        )
+
+    @_maintenance.command(name="backfillbypassaccess")
+    async def _backfill_bypass_access(self, ctx: commands.Context):
+        """Backfill missing access roles for members that already have bypass roles.
+
+        No options. Scans guild members and reports a summary.
+        """
+        bypass_role_ids = await self.config.guild(ctx.guild).bypass_roles()
+        if not bypass_role_ids:
+            await ctx.send(
+                "No bypass roles are configured. Add one with "
+                f"`{ctx.clean_prefix}applications role bypass add @Role`."
+            )
+            return
+
+        access_roles = await self._get_configured_access_roles(ctx.guild)
+        if not access_roles:
+            await ctx.send(
+                "No valid access roles are configured. Add one with "
+                f"`{ctx.clean_prefix}applications role access add @Role`."
+            )
+            return
+
+        scanned = 0
+        eligible = 0
+        updated = 0
+        skipped = 0
+        failed = 0
+        roles_assigned = 0
+
+        await ctx.send("Backfilling access roles for bypass members...")
+
+        bypass_role_id_set = set(bypass_role_ids)
+        for member in ctx.guild.members:
+            if member.bot:
+                continue
+            scanned += 1
+            member_role_ids = {role.id for role in member.roles}
+            if not any(role_id in member_role_ids for role_id in bypass_role_id_set):
+                continue
+
+            eligible += 1
+            assignment_status, assigned_count = await self._assign_missing_access_roles(
+                member,
+                reason="Bypass access backfill",
+                access_roles=access_roles,
+            )
+            if assignment_status == "assigned":
+                updated += 1
+                roles_assigned += assigned_count
+            elif assignment_status == "already_has":
+                skipped += 1
+            else:
+                failed += 1
+                if assignment_status == "forbidden":
+                    log.error(
+                        "Permission denied backfilling access roles for %s in guild %s",
+                        member.display_name,
+                        ctx.guild.id,
+                    )
+                else:
+                    log.error(
+                        "HTTP error backfilling access roles for %s in guild %s",
+                        member.display_name,
+                        ctx.guild.id,
+                    )
+
+        await ctx.send(
+            "Bypass access backfill complete.\n"
+            f"Scanned: **{scanned}** member(s)\n"
+            f"Eligible (has bypass role): **{eligible}**\n"
+            f"Updated (new roles assigned): **{updated}**\n"
+            f"Skipped (already had access roles): **{skipped}**\n"
+            f"Failed: **{failed}**\n"
+            f"Total roles assigned: **{roles_assigned}**"
         )
 
     @_applications.group(name="field")
@@ -3596,7 +3857,10 @@ class Applications(commands.Cog):
 
     @_field.command(name="remove")
     async def _field_remove(self, ctx: commands.Context, name: str):
-        """Remove a form field."""
+        """Remove a form field by field name.
+
+        Usage: `[p]applications field remove <name>`
+        """
         async with self.config.guild(ctx.guild).form_fields() as fields:
             field_names = [f.get("name") for f in fields]
             if name not in field_names:
@@ -3609,7 +3873,10 @@ class Applications(commands.Cog):
 
     @_field.command(name="list")
     async def _field_list(self, ctx: commands.Context):
-        """List all form fields."""
+        """List all configured form fields.
+
+        No options.
+        """
         fields = await self.config.guild(ctx.guild).form_fields()
         if not fields:
             await ctx.send("No form fields configured.")
@@ -3642,7 +3909,10 @@ class Applications(commands.Cog):
 
     @_field.command(name="preview")
     async def _field_preview(self, ctx: commands.Context):
-        """Preview the current server application form (opens the real form; submitting does nothing)."""
+        """Preview the current application form.
+
+        No options. Opens the real modal, but submitting does not save data.
+        """
         fields = await self.config.guild(ctx.guild).form_fields()
         if not fields:
             await ctx.send(
@@ -3688,7 +3958,10 @@ class Applications(commands.Cog):
 
     @_field.command(name="manager", aliases=["ui"])
     async def _field_manager(self, ctx: commands.Context):
-        """Open the interactive field manager UI."""
+        """Open the interactive field manager UI.
+
+        No options.
+        """
         view = FieldManagerView(self)
         
         # Create initial embed
@@ -3728,7 +4001,10 @@ class Applications(commands.Cog):
 
     @_applications.command(name="settings")
     async def _settings(self, ctx: commands.Context):
-        """Show current application system settings."""
+        """Show current application system settings.
+
+        No options.
+        """
         g = self.config.guild(ctx.guild)
         restricted_role_id = await g.restricted_role()
         restricted_role = (
@@ -3947,6 +4223,7 @@ class Applications(commands.Cog):
         
         If run in an interview channel without specifying a member,
         it will approve the matching applicant.
+        Usage: `[p]applications approve [@member]`
         """
         # If no member specified, try to find from current channel
         if member is None:
@@ -4009,23 +4286,27 @@ class Applications(commands.Cog):
                         f"⚠️ Approved the application but encountered an error removing the restricted role: {e}"
                     )
         elif access_role_ids:
-            # Add access roles (new behavior)
-            access_roles = [ctx.guild.get_role(rid) for rid in access_role_ids if ctx.guild.get_role(rid)]
-            if access_roles:
-                try:
-                    await member.add_roles(*access_roles, reason="Application approved")
-                    log.info(f"Added access roles to {member.display_name}")
-                except discord.Forbidden:
-                    log.error(f"Permission denied adding access roles to {member.display_name}")
-                    await ctx.send(
-                        f"⚠️ Approved the application but couldn't add access roles. "
-                        f"Please add them manually to {member.mention}."
-                    )
-                except discord.HTTPException as e:
-                    log.error(f"Error adding access roles: {e}")
-                    await ctx.send(
-                        f"⚠️ Approved the application but encountered an error adding access roles: {e}"
-                    )
+            assignment_status, assigned_count = await self._assign_missing_access_roles(
+                member,
+                reason="Application approved",
+            )
+            if assignment_status == "assigned":
+                log.info(
+                    "Added %s access role(s) to %s",
+                    assigned_count,
+                    member.display_name,
+                )
+            elif assignment_status == "forbidden":
+                log.error(f"Permission denied adding access roles to {member.display_name}")
+                await ctx.send(
+                    f"⚠️ Approved the application but couldn't add access roles. "
+                    f"Please add them manually to {member.mention}."
+                )
+            elif assignment_status == "http_error":
+                log.error("HTTP error adding access roles to %s", member.display_name)
+                await ctx.send(
+                    "⚠️ Approved the application but encountered an error adding access roles."
+                )
 
         # Update status
         app_data["status"] = "approved"
@@ -4063,6 +4344,7 @@ class Applications(commands.Cog):
         
         If run in an interview channel without specifying a member,
         it will deny the matching applicant.
+        Usage: `[p]applications deny [@member] [reason]`
         """
         # If no member specified, try to find from current channel
         if member is None:
@@ -4184,16 +4466,20 @@ class Applications(commands.Cog):
                 except discord.HTTPException as e:
                     log.error(f"Error removing restricted role: {e}")
         elif access_role_ids:
-            # Add access roles (new behavior)
-            access_roles = [interaction.guild.get_role(rid) for rid in access_role_ids if interaction.guild.get_role(rid)]
-            if access_roles:
-                try:
-                    await member.add_roles(*access_roles, reason="Application approved")
-                    log.info(f"Added access roles to {member.display_name}")
-                except discord.Forbidden:
-                    log.error(f"Permission denied adding access roles to {member.display_name}")
-                except discord.HTTPException as e:
-                    log.error(f"Error adding access roles: {e}")
+            assignment_status, assigned_count = await self._assign_missing_access_roles(
+                member,
+                reason="Application approved",
+            )
+            if assignment_status == "assigned":
+                log.info(
+                    "Added %s access role(s) to %s",
+                    assigned_count,
+                    member.display_name,
+                )
+            elif assignment_status == "forbidden":
+                log.error(f"Permission denied adding access roles to {member.display_name}")
+            elif assignment_status == "http_error":
+                log.error("HTTP error adding access roles to %s", member.display_name)
 
         # Update status
         app_data["status"] = "approved"
@@ -4306,7 +4592,10 @@ class Applications(commands.Cog):
 
     @_applications.command(name="view")
     async def _view(self, ctx: commands.Context, member: discord.Member):
-        """View an application."""
+        """View a member's application and responses.
+
+        Usage: `[p]applications view @member`
+        """
         applications = await self.config.guild(ctx.guild).applications()
         if str(member.id) not in applications:
             await ctx.send(f"{member.mention} does not have an active application.")
@@ -4333,7 +4622,10 @@ class Applications(commands.Cog):
 
     @_applications.command(name="list")
     async def _list(self, ctx: commands.Context):
-        """List all pending applications."""
+        """List pending applications.
+
+        No options.
+        """
         applications = await self.config.guild(ctx.guild).applications()
         pending = {
             uid: app
@@ -4373,6 +4665,7 @@ class Applications(commands.Cog):
 
         If run in an interview channel without specifying a member,
         it will close that applicant's application.
+        Usage: `[p]applications close [@member]`
         """
         # If no member specified, try to find from current channel
         if member is None:
@@ -4460,7 +4753,10 @@ class Applications(commands.Cog):
 
     @_maintenance.command(name="clearorphaned")
     async def _clear_orphaned(self, ctx: commands.Context):
-        """Remove application entries whose review/interview artifacts are missing."""
+        """Remove orphaned pending application entries with missing artifacts.
+
+        No options.
+        """
         applications = await self.config.guild(ctx.guild).applications()
         review_channel_id = await self.config.guild(ctx.guild).review_channel_id()
         review_channel = ctx.guild.get_channel(review_channel_id) if review_channel_id else None
@@ -4493,7 +4789,10 @@ class Applications(commands.Cog):
 
     @_maintenance.command(name="removeuser")
     async def _remove_user(self, ctx: commands.Context, user_id: int):
-        """Remove an application by user ID (e.g. when the member left)."""
+        """Remove an application by user ID (e.g. when the member left).
+
+        Usage: `[p]applications maintenance removeuser <user_id>`
+        """
         applications = await self.config.guild(ctx.guild).applications()
         user_id_str = str(user_id)
         if user_id_str not in applications:

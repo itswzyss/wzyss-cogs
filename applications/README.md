@@ -100,7 +100,8 @@ Set the delay in hours before application channels are automatically deleted aft
 
 ### 3. Configure Bypass Roles (Optional)
 
-Members with bypass roles will skip the application process entirely:
+Members with bypass roles will skip the application process entirely.  
+If access roles are configured, the cog now auto-assigns missing access roles to bypass members:
 
 ```
 [p]applications bypassrole add @Patreon
@@ -111,6 +112,12 @@ To remove a bypass role:
 
 ```
 [p]applications bypassrole remove @Patreon
+```
+
+To backfill access roles for existing bypass members:
+
+```
+[p]applications maintenance backfillbypassaccess
 ```
 
 ### 4. Customize the Application Form
@@ -207,8 +214,9 @@ This will delete old welcome messages and send a fresh one with working buttons.
 ### How It Works
 
 1. **User Joins**: When a new member joins the server:
-   - If they have a bypass role → They gain full access immediately
+   - If they have a bypass role → They skip the application flow and receive any missing configured access roles automatically
    - If they don't → They receive the restricted role and a private application channel is created
+   - If an existing member later gains a bypass role → Missing configured access roles are auto-assigned
 
 2. **Application Process**:
    - User sees a welcome message in their private channel
