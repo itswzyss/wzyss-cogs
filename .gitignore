@@ -1,1 +1,2 @@
 *.mdc
+/applications/__pycache__
