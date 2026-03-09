@@ -46,6 +46,15 @@ Track booster custom roles and remove them when a user stops boosting. When a us
 
 ---
 
+### BoostUtils
+**Install:** `[p]cog install wzyss-cogs boostutils`
+
+Manage booster-dependent custom roles and boost notifications. Tracks configured custom roles that require booster status, removes/restores them on booster loss/regain, supports configurable boost announcements (text + embed), and optional status-change notifications with optional role ping.
+
+**Tags:** roles, utility, moderation, boosters
+
+---
+
 ### ChannelNotify
 **Install:** `[p]cog install wzyss-cogs channelnotify`
 

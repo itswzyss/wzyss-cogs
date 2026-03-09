@@ -9,6 +9,7 @@ Full documentation for each cog in the Wzyss-Cogs repository for Red-DiscordBot.
 | [Applications](applications.md) | Server application system for member screening. |
 | [AutoVC](autovc.md) | Automatically create voice channels when members join source VCs. |
 | [BoosterRole](boosterrole.md) | Track booster custom roles and remove them when a user stops boosting. |
+| [BoostUtils](boostutils.md) | Manage booster-dependent custom roles and configurable boost notifications. |
 | [ChannelNotify](channelnotify.md) | Automatically ping roles when messages are sent in configured channels. |
 | [Clear](clear.md) | Clear/purge messages in a channel (by count, after message, between messages, or by user). |
 | [Counting](counting.md) | Count upwards in channels with optional math expressions. |

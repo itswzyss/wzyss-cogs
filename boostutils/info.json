@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing BoostUtils! Use `[p]help boostutils` to see available commands.",
+    "name": "BoostUtils",
+    "short": "Manage booster-dependent custom roles and configurable boost notifications.",
+    "description": "Tracks configured custom roles that require the Server Booster role, removes them on booster loss, restores them when booster status returns, and provides configurable boost announcements and status-change notifications.",
+    "tags": ["roles", "utility", "moderation", "boosters"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
