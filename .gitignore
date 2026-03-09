@@ -1,2 +1,3 @@
 *.mdc
-/applications/__pycache__
+__pycache__/
+*.py[cod]
