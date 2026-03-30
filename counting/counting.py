@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import random
 import re
 import time
 from pathlib import Path
@@ -139,6 +140,87 @@ class CountingLeaderboardView(View):
         await interaction.response.edit_message(embed=self.pages[self.page_index], view=self)
 
 
+class SaveView(View):
+    """Button presented after a ruin; any user with a Save can click to undo the count reset."""
+
+    def __init__(
+        self,
+        cog: "Counting",
+        guild_id: int,
+        channel_id: int,
+        pre_ruin_count: int,
+        *,
+        timeout: float = 60.0,
+    ):
+        super().__init__(timeout=timeout)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.pre_ruin_count = pre_ruin_count
+        self.used = False
+        self.message: Optional[discord.Message] = None
+
+    async def on_timeout(self) -> None:
+        self.use_save_button.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except (discord.Forbidden, discord.NotFound):
+                pass
+
+    @discord.ui.button(label="Use a Save \U0001F6E1", style=discord.ButtonStyle.success)
+    async def use_save_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if self.used:
+            await interaction.response.send_message("A save has already been used!", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        member = interaction.user
+        inventory = await self.cog.config.member(member).inventory()
+        saves = inventory.get("save", 0)
+
+        if saves <= 0:
+            await interaction.response.send_message(
+                "You don't have any saves! Earn them by counting frequently.", ephemeral=True
+            )
+            return
+
+        self.used = True
+        inventory["save"] = saves - 1
+        await self.cog.config.member(member).inventory.set(inventory)
+
+        channels = await self.cog.config.guild(guild).channels()
+        cid_str = str(self.channel_id)
+        if cid_str in channels:
+            channels[cid_str]["current"] = self.pre_ruin_count
+            channels[cid_str]["last_user"] = None
+            channels[cid_str]["consecutive_count"] = 0
+            channels[cid_str]["consecutive_user"] = None
+            _sync_goal_announcement_to_current(channels[cid_str])
+            await self.cog.config.guild(guild).channels.set(channels)
+
+        button.disabled = True
+        button.label = f"Save used by {member.display_name}"
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+        channel = guild.get_channel(self.channel_id)
+        if channel:
+            try:
+                embed = discord.Embed(
+                    description=(
+                        f"\U0001F6E1 {member.mention} used a **Save**! The count has been restored to "
+                        f"**{self.pre_ruin_count}**. Next count: **{self.pre_ruin_count + 1}**."
+                    ),
+                    color=discord.Color.green(),
+                )
+                await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=True))
+            except (discord.Forbidden, discord.NotFound):
+                pass
+
+
 class Counting(commands.Cog):
     """Count upwards in channels with optional math expressions."""
 
@@ -151,9 +233,18 @@ class Counting(commands.Cog):
         default_guild = {
             "channels": {},  # channel_id -> config incl. segment_contributions, show_milestone_contributors, etc.
             "global_contributor_counts": {},  # str user_id -> lifetime valid counts (all counting channels in guild)
+            "saves_enabled": False,
+            "saves_max_per_user": 3,
+            "saves_drop_chance": 0.01,  # 1% per valid count
+            "saves_participation_threshold": 100,  # lifetime counts needed to be eligible for drops
         }
-        
+
+        default_member = {
+            "inventory": {},  # item_type -> count, e.g. {"save": 2}
+        }
+
         self.config.register_guild(**default_guild)
+        self.config.register_member(**default_member)
         
         # Reaction queue system for handling rate limits
         # Format: {channel_id: [(message, emoji, timestamp), ...]}
@@ -430,6 +521,90 @@ class Counting(commands.Cog):
                 log.error(f"Error in channel description update task: {e}", exc_info=True)
                 await asyncio.sleep(60)  # Wait a minute before retrying on unexpected errors
     
+    async def _handle_ruin(
+        self,
+        guild: discord.Guild,
+        channel: discord.TextChannel,
+        channels: dict,
+        cid_str: str,
+        ch_cfg: dict,
+        ruiner: discord.Member,
+        pre_ruin_count: int,
+        ruin_msg_template: str,
+    ) -> None:
+        """Update record, reset count state, send ruin message with optional Save button."""
+        highest_record = ch_cfg.get("highest_record", 0)
+        if pre_ruin_count > highest_record:
+            channels[cid_str]["highest_record"] = pre_ruin_count
+
+        channels[cid_str]["current"] = 0
+        channels[cid_str]["last_user"] = None
+        channels[cid_str]["consecutive_count"] = 0
+        channels[cid_str]["consecutive_user"] = None
+        _clear_goal_announcement_state(channels[cid_str])
+        channels[cid_str]["segment_contributions"] = {}
+        await self.config.guild(guild).channels.set(channels)
+
+        if pre_ruin_count > highest_record:
+            await self._update_channel_description(channel, pre_ruin_count)
+
+        formatted = ruin_msg_template.replace("{user}", ruiner.mention).replace("{count}", str(pre_ruin_count))
+
+        guild_data = await self.config.guild(guild).all()
+        saves_enabled = guild_data.get("saves_enabled", False)
+
+        try:
+            color = discord.Color.red()
+            embed = discord.Embed(description=formatted, color=color)
+            embed.set_footer(text=f"Count reached: {pre_ruin_count}")
+
+            if saves_enabled and pre_ruin_count > 0:
+                view = SaveView(self, guild.id, channel.id, pre_ruin_count)
+                msg = await channel.send(
+                    embed=embed, view=view, allowed_mentions=discord.AllowedMentions(users=True)
+                )
+                view.message = msg
+            else:
+                await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=True))
+        except discord.Forbidden:
+            pass
+
+    async def _award_save(self, guild: discord.Guild, member: discord.Member) -> None:
+        """Potentially award a save to a member after a valid count."""
+        guild_data = await self.config.guild(guild).all()
+        if not guild_data.get("saves_enabled", False):
+            return
+
+        drop_chance = guild_data.get("saves_drop_chance", 0.01)
+        max_saves = guild_data.get("saves_max_per_user", 3)
+        threshold = guild_data.get("saves_participation_threshold", 100)
+
+        global_counts = await self.config.guild(guild).global_contributor_counts()
+        if global_counts.get(str(member.id), 0) < threshold:
+            return
+
+        inventory = await self.config.member(member).inventory()
+        current_saves = inventory.get("save", 0)
+        if current_saves >= max_saves:
+            return
+
+        if random.random() < drop_chance:
+            inventory["save"] = current_saves + 1
+            await self.config.member(member).inventory.set(inventory)
+            try:
+                new_total = inventory["save"]
+                embed = discord.Embed(
+                    description=(
+                        f"\U0001F6E1 You earned a **Save** in **{guild.name}**! "
+                        f"You now have **{new_total}** save{'s' if new_total != 1 else ''}. "
+                        f"If the count gets ruined, click the button to restore it!"
+                    ),
+                    color=discord.Color.green(),
+                )
+                await member.send(embed=embed)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
     @commands.group(name="countingset", aliases=["countset"])
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
@@ -474,7 +649,8 @@ class Counting(commands.Cog):
             channels[str(channel_id)]["enabled"] = True
         
         await self.config.guild(guild).channels.set(channels)
-        await ctx.send(f"Counting enabled in {channel.mention}. The count will start at 1.")
+        color = await ctx.embed_color()
+        await ctx.send(embed=discord.Embed(description=f"Counting enabled in {channel.mention}. The count will start at 1.", color=color))
     
     @_countingset.command(name="disable")
     async def _disable_channel(self, ctx: commands.Context, channel: discord.TextChannel):
@@ -483,13 +659,14 @@ class Counting(commands.Cog):
         channel_id = channel.id
         
         channels = await self.config.guild(guild).channels()
+        color = await ctx.embed_color()
         if str(channel_id) not in channels:
-            await ctx.send(f"{channel.mention} is not configured for counting.")
+            await ctx.send(embed=discord.Embed(description=f"{channel.mention} is not configured for counting.", color=color))
             return
-        
+
         channels[str(channel_id)]["enabled"] = False
         await self.config.guild(guild).channels.set(channels)
-        await ctx.send(f"Counting disabled in {channel.mention}.")
+        await ctx.send(embed=discord.Embed(description=f"Counting disabled in {channel.mention}.", color=color))
     
     @_countingset.command(name="milestone")
     async def _set_goal(self, ctx: commands.Context, channel: discord.TextChannel, goal: Optional[int] = None):
@@ -501,20 +678,22 @@ class Counting(commands.Cog):
         [p]countingset milestone #counting 100
         [p]countingset milestone #counting 0  (sets infinite)
         """
+        color = await ctx.embed_color()
         if goal is not None and goal < 0:
-            await ctx.send("Milestone cannot be negative.")
+            await ctx.send(embed=discord.Embed(description="Milestone cannot be negative.", color=color))
             return
-        
+
         guild = ctx.guild
         channel_id = channel.id
-        
+
         channels = await self.config.guild(guild).channels()
         if str(channel_id) not in channels:
-            await ctx.send(
-                f"{channel.mention} is not configured for counting. Use `{ctx.prefix}countingset channel` first."
-            )
+            await ctx.send(embed=discord.Embed(
+                description=f"{channel.mention} is not configured for counting. Use `{ctx.prefix}countingset channel` first.",
+                color=color,
+            ))
             return
-        
+
         # 0 means infinite (None)
         goal_value = None if goal == 0 else goal
         ch = channels[str(channel_id)]
@@ -522,11 +701,9 @@ class Counting(commands.Cog):
         ch["segment_contributions"] = {}
         _sync_goal_announcement_to_current(ch)
         await self.config.guild(guild).channels.set(channels)
-        
-        if goal_value is None:
-            await ctx.send(f"Counting milestone for {channel.mention} set to infinite.")
-        else:
-            await ctx.send(f"Counting milestone for {channel.mention} set to {goal_value}.")
+
+        desc = f"Counting milestone for {channel.mention} set to {'infinite' if goal_value is None else goal_value}."
+        await ctx.send(embed=discord.Embed(description=desc, color=color))
     
     @_countingset.command(name="milestoneinterval")
     async def _set_goal_interval(self, ctx: commands.Context, channel: discord.TextChannel, interval: Optional[int] = None):
@@ -538,20 +715,22 @@ class Counting(commands.Cog):
         [p]countingset milestoneinterval #counting 100  (milestones at 100, 200, 300...)
         [p]countingset milestoneinterval #counting 0  (disables consecutive milestones)
         """
+        color = await ctx.embed_color()
         if interval is not None and interval < 0:
-            await ctx.send("Milestone interval cannot be negative.")
+            await ctx.send(embed=discord.Embed(description="Milestone interval cannot be negative.", color=color))
             return
-        
+
         guild = ctx.guild
         channel_id = channel.id
-        
+
         channels = await self.config.guild(guild).channels()
         if str(channel_id) not in channels:
-            await ctx.send(
-                f"{channel.mention} is not configured for counting. Use `{ctx.prefix}countingset channel` first."
-            )
+            await ctx.send(embed=discord.Embed(
+                description=f"{channel.mention} is not configured for counting. Use `{ctx.prefix}countingset channel` first.",
+                color=color,
+            ))
             return
-        
+
         # 0 means disabled (None)
         interval_value = None if interval == 0 else interval
         ch = channels[str(channel_id)]
@@ -559,11 +738,15 @@ class Counting(commands.Cog):
         ch["segment_contributions"] = {}
         _sync_goal_announcement_to_current(ch)
         await self.config.guild(guild).channels.set(channels)
-        
+
         if interval_value is None:
-            await ctx.send(f"Consecutive milestones disabled for {channel.mention}.")
+            desc = f"Consecutive milestones disabled for {channel.mention}."
         else:
-            await ctx.send(f"Consecutive milestones for {channel.mention} set to every {interval_value} (milestones at {interval_value}, {interval_value * 2}, {interval_value * 3}...).")
+            desc = (
+                f"Consecutive milestones for {channel.mention} set to every {interval_value} "
+                f"(milestones at {interval_value}, {interval_value * 2}, {interval_value * 3}...)."
+            )
+        await ctx.send(embed=discord.Embed(description=desc, color=color))
     
     @_countingset.command(name="reset")
     async def _reset_count(self, ctx: commands.Context, channel: discord.TextChannel):
@@ -572,10 +755,11 @@ class Counting(commands.Cog):
         channel_id = channel.id
         
         channels = await self.config.guild(guild).channels()
+        color = await ctx.embed_color()
         if str(channel_id) not in channels:
-            await ctx.send(f"{channel.mention} is not configured for counting.")
+            await ctx.send(embed=discord.Embed(description=f"{channel.mention} is not configured for counting.", color=color))
             return
-        
+
         channels[str(channel_id)]["current"] = 0
         channels[str(channel_id)]["last_user"] = None
         channels[str(channel_id)]["consecutive_count"] = 0
@@ -583,7 +767,7 @@ class Counting(commands.Cog):
         _clear_goal_announcement_state(channels[str(channel_id)])
         channels[str(channel_id)]["segment_contributions"] = {}
         await self.config.guild(guild).channels.set(channels)
-        await ctx.send(f"Count reset in {channel.mention}. Next count will be 1.")
+        await ctx.send(embed=discord.Embed(description=f"Count reset in {channel.mention}. Next count will be 1.", color=color))
     
     @_countingset.command(name="setnext", aliases=["setcount", "nextnumber"])
     async def _set_next_number(self, ctx: commands.Context, channel: discord.TextChannel, next_number: int):
@@ -594,18 +778,19 @@ class Counting(commands.Cog):
         Example: [p]countingset setnext #counting 50
         (Sets the current count to 49, so the next count will be 50)
         """
+        color = await ctx.embed_color()
         if next_number < 1:
-            await ctx.send("Next number must be at least 1.")
+            await ctx.send(embed=discord.Embed(description="Next number must be at least 1.", color=color))
             return
-        
+
         guild = ctx.guild
         channel_id = channel.id
-        
+
         channels = await self.config.guild(guild).channels()
         if str(channel_id) not in channels:
-            await ctx.send(f"{channel.mention} is not configured for counting.")
+            await ctx.send(embed=discord.Embed(description=f"{channel.mention} is not configured for counting.", color=color))
             return
-        
+
         # Set current to next_number - 1 so the next count will be next_number
         channels[str(channel_id)]["current"] = next_number - 1
         # Reset tracking to allow anyone to count next
@@ -615,7 +800,10 @@ class Counting(commands.Cog):
         _clear_goal_announcement_state(channels[str(channel_id)])
         channels[str(channel_id)]["segment_contributions"] = {}
         await self.config.guild(guild).channels.set(channels)
-        await ctx.send(f"Next number for {channel.mention} set to {next_number}. Current count is {next_number - 1}.")
+        await ctx.send(embed=discord.Embed(
+            description=f"Next number for {channel.mention} set to {next_number}. Current count is {next_number - 1}.",
+            color=color,
+        ))
     
     @_countingset.command(name="status")
     async def _status(self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
@@ -628,10 +816,11 @@ class Counting(commands.Cog):
             channels = await self.config.guild(guild).channels()
             channel_config = channels.get(str(channel_id))
             
+            color = await ctx.embed_color()
             if not channel_config:
-                await ctx.send(f"{channel.mention} is not configured for counting.")
+                await ctx.send(embed=discord.Embed(description=f"{channel.mention} is not configured for counting.", color=color))
                 return
-            
+
             current = channel_config.get("current", 0)
             goal = channel_config.get("goal")
             goal_interval = channel_config.get("goal_interval")
@@ -639,57 +828,53 @@ class Counting(commands.Cog):
             max_consecutive = channel_config.get("max_consecutive", 1)
             ruin_enabled = channel_config.get("ruin_enabled", False)
             reactions_enabled = channel_config.get("reactions_enabled", True)
-            next_count = current + 1
-            
-            status_msg = f"**Counting Status for {channel.mention}:**\n"
-            status_msg += f"Current count: {current}\n"
-            status_msg += f"Next count: {next_count}\n"
-            status_msg += f"Milestone: {goal if goal else 'Infinite'}\n"
-            if goal_interval:
-                status_msg += f"Consecutive milestones: Every {goal_interval} (next at {((current // goal_interval) + 1) * goal_interval})\n"
-            status_msg += f"Status: {'Enabled' if enabled else 'Disabled'}\n"
-            if max_consecutive == 1:
-                status_msg += f"Same user counting: Disabled\n"
-            else:
-                status_msg += f"Same user counting: Enabled (max {max_consecutive} consecutive)\n"
-            status_msg += f"Ruin mode: {'Enabled' if ruin_enabled else 'Disabled'}\n"
-            status_msg += f"Reactions: {'Enabled' if reactions_enabled else 'Disabled'}\n"
             show_mc = channel_config.get("show_milestone_contributors", True)
-            status_msg += f"Milestone contributor list: {'On' if show_mc else 'Off'}"
-            
+            next_count = current + 1
+
+            embed = discord.Embed(title=f"Counting Status — {channel.name}", color=color)
+            embed.add_field(name="Current count", value=str(current), inline=True)
+            embed.add_field(name="Next count", value=str(next_count), inline=True)
+            embed.add_field(name="Status", value="Enabled" if enabled else "Disabled", inline=True)
+            milestone_val = str(goal) if goal else "Infinite"
             if goal and current >= goal:
-                status_msg += f"\n✅ Milestone reached!"
-            
-            await ctx.send(status_msg)
+                milestone_val += " ✅"
+            embed.add_field(name="Milestone", value=milestone_val, inline=True)
+            if goal_interval:
+                next_interval = ((current // goal_interval) + 1) * goal_interval
+                embed.add_field(name="Milestone interval", value=f"Every {goal_interval} (next: {next_interval})", inline=True)
+            embed.add_field(name="Same user counting", value="Disabled" if max_consecutive == 1 else f"Max {max_consecutive} consecutive", inline=True)
+            embed.add_field(name="Ruin mode", value="Enabled" if ruin_enabled else "Disabled", inline=True)
+            embed.add_field(name="Reactions", value="Enabled" if reactions_enabled else "Disabled", inline=True)
+            embed.add_field(name="Milestone contributors", value="On" if show_mc else "Off", inline=True)
+            await ctx.send(embed=embed)
         else:
             # Show status for all channels
             channels = await self.config.guild(guild).channels()
-            
+            color = await ctx.embed_color()
+
             if not channels:
-                await ctx.send("No channels are configured for counting.")
+                await ctx.send(embed=discord.Embed(description="No channels are configured for counting.", color=color))
                 return
-            
-            status_msg = "**Counting Status:**\n\n"
+
+            embed = discord.Embed(title="Counting Status", color=color)
             for channel_id_str, channel_config in channels.items():
                 try:
                     channel_id = int(channel_id_str)
                     channel_obj = guild.get_channel(channel_id)
-                    if not channel_obj:
-                        status_msg += f"❌ Channel ID `{channel_id}` (channel not found)\n"
-                        continue
-                    
                     current = channel_config.get("current", 0)
                     goal = channel_config.get("goal")
                     enabled = channel_config.get("enabled", False)
-                    next_count = current + 1
-                    
-                    status_msg += f"{channel_obj.mention}:\n"
-                    status_msg += f"  Current: {current} | Next: {next_count} | Milestone: {goal if goal else 'Infinite'} | {'✅' if enabled else '❌'}\n"
+                    name = channel_obj.mention if channel_obj else f"ID `{channel_id}` (not found)"
+                    value = (
+                        f"Current: {current} | Next: {current + 1} | "
+                        f"Milestone: {goal if goal else 'Infinite'} | {'✅ Enabled' if enabled else '❌ Disabled'}"
+                    )
+                    embed.add_field(name=name, value=value, inline=False)
                 except (ValueError, KeyError) as e:
                     log.error(f"Error processing channel config: {e}")
                     continue
-            
-            await ctx.send(status_msg)
+
+            await ctx.send(embed=embed)
     
     @_countingset.command(name="consecutive")
     async def _set_consecutive(self, ctx: commands.Context, channel: discord.TextChannel, max_count: int):
@@ -701,24 +886,25 @@ class Counting(commands.Cog):
         [p]countingset consecutive #counting 1  (disables same user counting)
         [p]countingset consecutive #counting 3  (allows a user to count up to 3 times in a row)
         """
+        color = await ctx.embed_color()
         if max_count < 1:
-            await ctx.send("Maximum consecutive count must be at least 1.")
+            await ctx.send(embed=discord.Embed(description="Maximum consecutive count must be at least 1.", color=color))
             return
-        
+
         guild = ctx.guild
         channel_id = channel.id
-        
+
         channels = await self.config.guild(guild).channels()
         if str(channel_id) not in channels:
-            await ctx.send(
-                f"{channel.mention} is not configured for counting. Use `{ctx.prefix}countingset channel` first."
-            )
+            await ctx.send(embed=discord.Embed(
+                description=f"{channel.mention} is not configured for counting. Use `{ctx.prefix}countingset channel` first.",
+                color=color,
+            ))
             return
-        
+
         channels[str(channel_id)]["max_consecutive"] = max_count
         await self.config.guild(guild).channels.set(channels)
-        
-        await ctx.send(f"Maximum consecutive counts for {channel.mention} set to {max_count}.")
+        await ctx.send(embed=discord.Embed(description=f"Maximum consecutive counts for {channel.mention} set to {max_count}.", color=color))
     
     @_countingset.command(name="ruin")
     async def _set_ruin(self, ctx: commands.Context, channel: discord.TextChannel, enable: bool):
@@ -734,17 +920,18 @@ class Counting(commands.Cog):
         channel_id = channel.id
         
         channels = await self.config.guild(guild).channels()
+        color = await ctx.embed_color()
         if str(channel_id) not in channels:
-            await ctx.send(
-                f"{channel.mention} is not configured for counting. Use `{ctx.prefix}countingset channel` first."
-            )
+            await ctx.send(embed=discord.Embed(
+                description=f"{channel.mention} is not configured for counting. Use `{ctx.prefix}countingset channel` first.",
+                color=color,
+            ))
             return
-        
+
         channels[str(channel_id)]["ruin_enabled"] = enable
         await self.config.guild(guild).channels.set(channels)
-        
         status = "enabled" if enable else "disabled"
-        await ctx.send(f"Ruin mode {status} for {channel.mention}.")
+        await ctx.send(embed=discord.Embed(description=f"Ruin mode {status} for {channel.mention}.", color=color))
     
     @_countingset.command(name="ruinmessage")
     async def _set_ruin_message(self, ctx: commands.Context, channel: discord.TextChannel, *, message: str):
@@ -758,24 +945,25 @@ class Counting(commands.Cog):
         - {user} - The user who ruined the count
         - {count} - The count that was reached before ruin
         """
+        color = await ctx.embed_color()
         if len(message) > 2000:
-            await ctx.send("Ruin message cannot exceed 2000 characters.")
+            await ctx.send(embed=discord.Embed(description="Ruin message cannot exceed 2000 characters.", color=color))
             return
-        
+
         guild = ctx.guild
         channel_id = channel.id
-        
+
         channels = await self.config.guild(guild).channels()
         if str(channel_id) not in channels:
-            await ctx.send(
-                f"{channel.mention} is not configured for counting. Use `{ctx.prefix}countingset channel` first."
-            )
+            await ctx.send(embed=discord.Embed(
+                description=f"{channel.mention} is not configured for counting. Use `{ctx.prefix}countingset channel` first.",
+                color=color,
+            ))
             return
-        
+
         channels[str(channel_id)]["ruin_message"] = message
         await self.config.guild(guild).channels.set(channels)
-        
-        await ctx.send(f"Ruin message for {channel.mention} updated.")
+        await ctx.send(embed=discord.Embed(description=f"Ruin message for {channel.mention} updated.", color=color))
     
     @_countingset.command(name="reactions")
     async def _set_reactions(self, ctx: commands.Context, channel: discord.TextChannel, enable: bool):
@@ -791,17 +979,18 @@ class Counting(commands.Cog):
         channel_id = channel.id
         
         channels = await self.config.guild(guild).channels()
+        color = await ctx.embed_color()
         if str(channel_id) not in channels:
-            await ctx.send(
-                f"{channel.mention} is not configured for counting. Use `{ctx.prefix}countingset channel` first."
-            )
+            await ctx.send(embed=discord.Embed(
+                description=f"{channel.mention} is not configured for counting. Use `{ctx.prefix}countingset channel` first.",
+                color=color,
+            ))
             return
-        
+
         channels[str(channel_id)]["reactions_enabled"] = enable
         await self.config.guild(guild).channels.set(channels)
-        
         status = "enabled" if enable else "disabled"
-        await ctx.send(f"Reactions {status} for {channel.mention}.")
+        await ctx.send(embed=discord.Embed(description=f"Reactions {status} for {channel.mention}.", color=color))
 
     @_countingset.command(name="milestonecontributors")
     async def _set_milestone_contributors(
@@ -818,17 +1007,18 @@ class Counting(commands.Cog):
         channel_id = channel.id
 
         channels = await self.config.guild(guild).channels()
+        color = await ctx.embed_color()
         if str(channel_id) not in channels:
-            await ctx.send(
-                f"{channel.mention} is not configured for counting. Use `{ctx.prefix}countingset channel` first."
-            )
+            await ctx.send(embed=discord.Embed(
+                description=f"{channel.mention} is not configured for counting. Use `{ctx.prefix}countingset channel` first.",
+                color=color,
+            ))
             return
 
         channels[str(channel_id)]["show_milestone_contributors"] = enable
         await self.config.guild(guild).channels.set(channels)
-
         status = "enabled" if enable else "disabled"
-        await ctx.send(f"Milestone contributor list {status} for {channel.mention}.")
+        await ctx.send(embed=discord.Embed(description=f"Milestone contributor list {status} for {channel.mention}.", color=color))
     
     @_countingset.command(name="setrecord")
     async def _set_record(self, ctx: commands.Context, channel: discord.TextChannel, record: int):
@@ -838,25 +1028,25 @@ class Counting(commands.Cog):
         
         Example: [p]countingset setrecord #counting 1000
         """
+        color = await ctx.embed_color()
         if record < 0:
-            await ctx.send("Record cannot be negative.")
+            await ctx.send(embed=discord.Embed(description="Record cannot be negative.", color=color))
             return
-        
+
         guild = ctx.guild
         channel_id = channel.id
-        
+
         channels = await self.config.guild(guild).channels()
         if str(channel_id) not in channels:
-            await ctx.send(f"{channel.mention} is not configured for counting.")
+            await ctx.send(embed=discord.Embed(description=f"{channel.mention} is not configured for counting.", color=color))
             return
-        
+
         channels[str(channel_id)]["highest_record"] = record
         await self.config.guild(guild).channels.set(channels)
-        
+
         # Update channel description immediately
         await self._update_channel_description(channel, record)
-        
-        await ctx.send(f"Record for {channel.mention} set to {record}.")
+        await ctx.send(embed=discord.Embed(description=f"Record for {channel.mention} set to {record}.", color=color))
     
     @_countingset.command(name="removerecord", aliases=["resetrecord"])
     async def _remove_record(self, ctx: commands.Context, channel: discord.TextChannel):
@@ -870,20 +1060,171 @@ class Counting(commands.Cog):
         channel_id = channel.id
         
         channels = await self.config.guild(guild).channels()
+        color = await ctx.embed_color()
         if str(channel_id) not in channels:
-            await ctx.send(f"{channel.mention} is not configured for counting.")
+            await ctx.send(embed=discord.Embed(description=f"{channel.mention} is not configured for counting.", color=color))
             return
-        
+
         channels[str(channel_id)]["highest_record"] = 0
         await self.config.guild(guild).channels.set(channels)
-        
+
         # Clear channel description (set to empty or None)
         try:
             await channel.edit(topic=None)
         except (discord.Forbidden, discord.HTTPException):
             pass  # Ignore if we can't edit
-        
-        await ctx.send(f"Record for {channel.mention} has been removed.")
+
+        await ctx.send(embed=discord.Embed(description=f"Record for {channel.mention} has been removed.", color=color))
+
+    @_countingset.group(name="saves")
+    async def _saves(self, ctx: commands.Context):
+        """Manage the save item system for counting."""
+        pass
+
+    @_saves.command(name="enable")
+    async def _saves_enable(self, ctx: commands.Context):
+        """Enable the save item system for this server."""
+        await self.config.guild(ctx.guild).saves_enabled.set(True)
+        color = await ctx.embed_color()
+        await ctx.send(embed=discord.Embed(
+            description="Save system enabled. Users can earn saves by counting and use them when the count is ruined.",
+            color=color,
+        ))
+
+    @_saves.command(name="disable")
+    async def _saves_disable(self, ctx: commands.Context):
+        """Disable the save item system for this server."""
+        await self.config.guild(ctx.guild).saves_enabled.set(False)
+        color = await ctx.embed_color()
+        await ctx.send(embed=discord.Embed(description="Save system disabled.", color=color))
+
+    @_saves.command(name="maxsaves")
+    async def _saves_maxsaves(self, ctx: commands.Context, amount: int):
+        """Set the maximum number of saves a user can hold.
+
+        Usage: [p]countingset saves maxsaves <amount>
+
+        Example: [p]countingset saves maxsaves 5
+        """
+        color = await ctx.embed_color()
+        if amount < 1:
+            await ctx.send(embed=discord.Embed(description="Maximum saves must be at least 1.", color=color))
+            return
+        await self.config.guild(ctx.guild).saves_max_per_user.set(amount)
+        await ctx.send(embed=discord.Embed(description=f"Maximum saves per user set to {amount}.", color=color))
+
+    @_saves.command(name="dropchance")
+    async def _saves_dropchance(self, ctx: commands.Context, chance: float):
+        """Set the probability of earning a save per valid count (0.0–1.0).
+
+        Usage: [p]countingset saves dropchance <chance>
+
+        Examples:
+        [p]countingset saves dropchance 0.01  (1% per count)
+        [p]countingset saves dropchance 0.005  (0.5% per count)
+        """
+        color = await ctx.embed_color()
+        if not (0.0 < chance <= 1.0):
+            await ctx.send(embed=discord.Embed(description="Drop chance must be between 0.0 (exclusive) and 1.0 (inclusive).", color=color))
+            return
+        await self.config.guild(ctx.guild).saves_drop_chance.set(chance)
+        await ctx.send(embed=discord.Embed(description=f"Save drop chance set to {chance:.2%} per valid count.", color=color))
+
+    @_saves.command(name="threshold")
+    async def _saves_threshold(self, ctx: commands.Context, threshold: int):
+        """Set the minimum lifetime count required before a user can earn saves.
+
+        Higher values require more participation before saves become earnable.
+
+        Usage: [p]countingset saves threshold <count>
+
+        Example: [p]countingset saves threshold 100
+        """
+        color = await ctx.embed_color()
+        if threshold < 0:
+            await ctx.send(embed=discord.Embed(description="Threshold cannot be negative.", color=color))
+            return
+        await self.config.guild(ctx.guild).saves_participation_threshold.set(threshold)
+        await ctx.send(embed=discord.Embed(description=f"Participation threshold set to {threshold} lifetime counts.", color=color))
+
+    @_saves.command(name="give")
+    async def _saves_give(self, ctx: commands.Context, user: discord.Member, amount: int = 1):
+        """Give saves to a user.
+
+        Usage: [p]countingset saves give <user> [amount]
+
+        Example: [p]countingset saves give @User 2
+        """
+        color = await ctx.embed_color()
+        if amount < 1:
+            await ctx.send(embed=discord.Embed(description="Amount must be at least 1.", color=color))
+            return
+        max_saves = await self.config.guild(ctx.guild).saves_max_per_user()
+        inventory = await self.config.member(user).inventory()
+        current = inventory.get("save", 0)
+        new_total = min(current + amount, max_saves)
+        actual_given = new_total - current
+        inventory["save"] = new_total
+        await self.config.member(user).inventory.set(inventory)
+        if actual_given < amount:
+            desc = f"Gave {actual_given} save(s) to {user.mention} (capped at max {max_saves}). They now have {new_total}."
+        else:
+            desc = f"Gave {actual_given} save(s) to {user.mention}. They now have {new_total}."
+        await ctx.send(embed=discord.Embed(description=desc, color=color), allowed_mentions=discord.AllowedMentions(users=True))
+
+    @_saves.command(name="take")
+    async def _saves_take(self, ctx: commands.Context, user: discord.Member, amount: int = 1):
+        """Remove saves from a user.
+
+        Usage: [p]countingset saves take <user> [amount]
+
+        Example: [p]countingset saves take @User 1
+        """
+        color = await ctx.embed_color()
+        if amount < 1:
+            await ctx.send(embed=discord.Embed(description="Amount must be at least 1.", color=color))
+            return
+        inventory = await self.config.member(user).inventory()
+        current = inventory.get("save", 0)
+        new_total = max(current - amount, 0)
+        inventory["save"] = new_total
+        await self.config.member(user).inventory.set(inventory)
+        await ctx.send(
+            embed=discord.Embed(description=f"Removed saves from {user.mention}. They now have {new_total}.", color=color),
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+
+    @_saves.command(name="status")
+    async def _saves_status(self, ctx: commands.Context):
+        """Show the current save system settings."""
+        guild_data = await self.config.guild(ctx.guild).all()
+        enabled = guild_data.get("saves_enabled", False)
+        max_saves = guild_data.get("saves_max_per_user", 3)
+        drop_chance = guild_data.get("saves_drop_chance", 0.01)
+        threshold = guild_data.get("saves_participation_threshold", 100)
+        color = await ctx.embed_color()
+        embed = discord.Embed(title="Save System Settings", color=color)
+        embed.add_field(name="Status", value="Enabled" if enabled else "Disabled", inline=True)
+        embed.add_field(name="Max saves per user", value=str(max_saves), inline=True)
+        embed.add_field(name="Drop chance", value=f"{drop_chance:.2%} per valid count", inline=True)
+        embed.add_field(name="Participation threshold", value=f"{threshold} lifetime counts", inline=True)
+        await ctx.send(embed=embed)
+
+    @commands.command(name="countinginventory", aliases=["cinv", "mysaves"])
+    @commands.guild_only()
+    async def counting_inventory(self, ctx: commands.Context):
+        """View your counting inventory (saves and other items)."""
+        guild_data = await self.config.guild(ctx.guild).all()
+        color = await ctx.embed_color()
+        if not guild_data.get("saves_enabled", False):
+            await ctx.send(embed=discord.Embed(description="The save system is not enabled on this server.", color=color))
+            return
+        inventory = await self.config.member(ctx.author).inventory()
+        saves = inventory.get("save", 0)
+        max_saves = guild_data.get("saves_max_per_user", 3)
+        embed = discord.Embed(title="Your Counting Inventory", color=color)
+        embed.add_field(name="\U0001F6E1 Saves", value=f"{saves} / {max_saves}", inline=True)
+        await ctx.send(embed=embed)
 
     @commands.command(name="countingleaderboard", aliases=["clb"])
     @commands.guild_only()
@@ -1025,30 +1366,12 @@ class Counting(commands.Cog):
         
         if parsed_value is None:
             # Not a valid number or expression
-            # Always update record if current count exceeds it (before resetting)
-            if current > highest_record:
-                channels[str(channel_id)]["highest_record"] = current
-                await self.config.guild(guild).channels.set(channels)
-                # Update channel description immediately
-                await self._update_channel_description(channel, current)
-            
             if ruin_enabled:
-                # Reset count and send ruin message
-                channels[str(channel_id)]["current"] = 0
-                channels[str(channel_id)]["last_user"] = None
-                channels[str(channel_id)]["consecutive_count"] = 0
-                channels[str(channel_id)]["consecutive_user"] = None
-                _clear_goal_announcement_state(channels[str(channel_id)])
-                channels[str(channel_id)]["segment_contributions"] = {}
-                await self.config.guild(guild).channels.set(channels)
-                
-                # Format ruin message - tag the user who ruined it
-                formatted_message = ruin_message.replace("{user}", message.author.mention).replace("{count}", str(current))
-                try:
-                    await channel.send(formatted_message, allowed_mentions=discord.AllowedMentions(users=True))
-                except discord.Forbidden:
-                    pass
-            
+                await self._handle_ruin(
+                    guild, channel, channels, str(channel_id), channel_config,
+                    message.author, current, ruin_message,
+                )
+
             # Delete the invalid message
             try:
                 await message.delete()
@@ -1062,30 +1385,12 @@ class Counting(commands.Cog):
         # Allow small floating point differences (for division results, etc.)
         if abs(parsed_value - expected) > 0.0001:
             # Wrong number
-            # Always update record if current count exceeds it (before resetting)
-            if current > highest_record:
-                channels[str(channel_id)]["highest_record"] = current
-                await self.config.guild(guild).channels.set(channels)
-                # Update channel description immediately
-                await self._update_channel_description(channel, current)
-            
             if ruin_enabled:
-                # Reset count and send ruin message
-                channels[str(channel_id)]["current"] = 0
-                channels[str(channel_id)]["last_user"] = None
-                channels[str(channel_id)]["consecutive_count"] = 0
-                channels[str(channel_id)]["consecutive_user"] = None
-                _clear_goal_announcement_state(channels[str(channel_id)])
-                channels[str(channel_id)]["segment_contributions"] = {}
-                await self.config.guild(guild).channels.set(channels)
-                
-                # Format ruin message - tag the user who ruined it
-                formatted_message = ruin_message.replace("{user}", message.author.mention).replace("{count}", str(current))
-                try:
-                    await channel.send(formatted_message, allowed_mentions=discord.AllowedMentions(users=True))
-                except discord.Forbidden:
-                    pass
-            
+                await self._handle_ruin(
+                    guild, channel, channels, str(channel_id), channel_config,
+                    message.author, current, ruin_message,
+                )
+
             # Delete the wrong message
             try:
                 await message.delete()
@@ -1101,29 +1406,11 @@ class Counting(commands.Cog):
             if last_user == message.author.id:
                 # Same user tried to count again - ruin the count if ruin mode is enabled
                 if ruin_enabled:
-                    # Always update record if current count exceeds it (before resetting)
-                    if current > highest_record:
-                        channels[str(channel_id)]["highest_record"] = current
-                        await self.config.guild(guild).channels.set(channels)
-                        # Update channel description immediately
-                        await self._update_channel_description(channel, current)
-                    
-                    # Reset count and send ruin message
-                    channels[str(channel_id)]["current"] = 0
-                    channels[str(channel_id)]["last_user"] = None
-                    channels[str(channel_id)]["consecutive_count"] = 0
-                    channels[str(channel_id)]["consecutive_user"] = None
-                    _clear_goal_announcement_state(channels[str(channel_id)])
-                    channels[str(channel_id)]["segment_contributions"] = {}
-                    await self.config.guild(guild).channels.set(channels)
-                    
-                    # Format ruin message - tag the user who ruined it
-                    formatted_message = ruin_message.replace("{user}", message.author.mention).replace("{count}", str(current))
-                    try:
-                        await channel.send(formatted_message, allowed_mentions=discord.AllowedMentions(users=True))
-                    except discord.Forbidden:
-                        pass
-                
+                    await self._handle_ruin(
+                        guild, channel, channels, str(channel_id), channel_config,
+                        message.author, current, ruin_message,
+                    )
+
                 # Delete the message
                 try:
                     await message.delete()
@@ -1178,7 +1465,9 @@ class Counting(commands.Cog):
         gc = dict(global_counts)
         gc[uid_str] = gc.get(uid_str, 0) + 1
         await self.config.guild(guild).global_contributor_counts.set(gc)
-        
+
+        asyncio.create_task(self._award_save(guild, message.author))
+
         # Queue reaction for background processing (handles rate limits) if reactions are enabled
         if reactions_enabled:
             async with self._queue_lock:
