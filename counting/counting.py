@@ -491,18 +491,18 @@ class Counting(commands.Cog):
         await self.config.guild(guild).channels.set(channels)
         await ctx.send(f"Counting disabled in {channel.mention}.")
     
-    @_countingset.command(name="goal")
+    @_countingset.command(name="milestone")
     async def _set_goal(self, ctx: commands.Context, channel: discord.TextChannel, goal: Optional[int] = None):
-        """Set a counting goal for a channel. Use 0 or omit to set infinite.
-        
-        Usage: [p]countingset goal <channel> [goal]
-        
+        """Set a counting milestone for a channel. Use 0 or omit to set infinite.
+
+        Usage: [p]countingset milestone <channel> [milestone]
+
         Examples:
-        [p]countingset goal #counting 100
-        [p]countingset goal #counting 0  (sets infinite)
+        [p]countingset milestone #counting 100
+        [p]countingset milestone #counting 0  (sets infinite)
         """
         if goal is not None and goal < 0:
-            await ctx.send("Goal cannot be negative.")
+            await ctx.send("Milestone cannot be negative.")
             return
         
         guild = ctx.guild
@@ -524,22 +524,22 @@ class Counting(commands.Cog):
         await self.config.guild(guild).channels.set(channels)
         
         if goal_value is None:
-            await ctx.send(f"Counting goal for {channel.mention} set to infinite.")
+            await ctx.send(f"Counting milestone for {channel.mention} set to infinite.")
         else:
-            await ctx.send(f"Counting goal for {channel.mention} set to {goal_value}.")
+            await ctx.send(f"Counting milestone for {channel.mention} set to {goal_value}.")
     
-    @_countingset.command(name="goalinterval")
+    @_countingset.command(name="milestoneinterval")
     async def _set_goal_interval(self, ctx: commands.Context, channel: discord.TextChannel, interval: Optional[int] = None):
-        """Set consecutive goals for a channel (e.g., every 100 = goals at 100, 200, 300...). Use 0 or omit to disable.
-        
-        Usage: [p]countingset goalinterval <channel> [interval]
-        
+        """Set consecutive milestones for a channel (e.g., every 100 = milestones at 100, 200, 300...). Use 0 or omit to disable.
+
+        Usage: [p]countingset milestoneinterval <channel> [interval]
+
         Examples:
-        [p]countingset goalinterval #counting 100  (goals at 100, 200, 300...)
-        [p]countingset goalinterval #counting 0  (disables consecutive goals)
+        [p]countingset milestoneinterval #counting 100  (milestones at 100, 200, 300...)
+        [p]countingset milestoneinterval #counting 0  (disables consecutive milestones)
         """
         if interval is not None and interval < 0:
-            await ctx.send("Goal interval cannot be negative.")
+            await ctx.send("Milestone interval cannot be negative.")
             return
         
         guild = ctx.guild
@@ -561,9 +561,9 @@ class Counting(commands.Cog):
         await self.config.guild(guild).channels.set(channels)
         
         if interval_value is None:
-            await ctx.send(f"Consecutive goals disabled for {channel.mention}.")
+            await ctx.send(f"Consecutive milestones disabled for {channel.mention}.")
         else:
-            await ctx.send(f"Consecutive goals for {channel.mention} set to every {interval_value} (goals at {interval_value}, {interval_value * 2}, {interval_value * 3}...).")
+            await ctx.send(f"Consecutive milestones for {channel.mention} set to every {interval_value} (milestones at {interval_value}, {interval_value * 2}, {interval_value * 3}...).")
     
     @_countingset.command(name="reset")
     async def _reset_count(self, ctx: commands.Context, channel: discord.TextChannel):
@@ -644,9 +644,9 @@ class Counting(commands.Cog):
             status_msg = f"**Counting Status for {channel.mention}:**\n"
             status_msg += f"Current count: {current}\n"
             status_msg += f"Next count: {next_count}\n"
-            status_msg += f"Goal: {goal if goal else 'Infinite'}\n"
+            status_msg += f"Milestone: {goal if goal else 'Infinite'}\n"
             if goal_interval:
-                status_msg += f"Consecutive goals: Every {goal_interval} (next at {((current // goal_interval) + 1) * goal_interval})\n"
+                status_msg += f"Consecutive milestones: Every {goal_interval} (next at {((current // goal_interval) + 1) * goal_interval})\n"
             status_msg += f"Status: {'Enabled' if enabled else 'Disabled'}\n"
             if max_consecutive == 1:
                 status_msg += f"Same user counting: Disabled\n"
@@ -658,7 +658,7 @@ class Counting(commands.Cog):
             status_msg += f"Milestone contributor list: {'On' if show_mc else 'Off'}"
             
             if goal and current >= goal:
-                status_msg += f"\n✅ Goal reached!"
+                status_msg += f"\n✅ Milestone reached!"
             
             await ctx.send(status_msg)
         else:
@@ -684,7 +684,7 @@ class Counting(commands.Cog):
                     next_count = current + 1
                     
                     status_msg += f"{channel_obj.mention}:\n"
-                    status_msg += f"  Current: {current} | Next: {next_count} | Goal: {goal if goal else 'Infinite'} | {'✅' if enabled else '❌'}\n"
+                    status_msg += f"  Current: {current} | Next: {next_count} | Milestone: {goal if goal else 'Infinite'} | {'✅' if enabled else '❌'}\n"
                 except (ValueError, KeyError) as e:
                     log.error(f"Error processing channel config: {e}")
                     continue
@@ -807,10 +807,10 @@ class Counting(commands.Cog):
     async def _set_milestone_contributors(
         self, ctx: commands.Context, channel: discord.TextChannel, enable: bool
     ):
-        """Toggle top contributor lines on milestone goal messages for a channel.
+        """Toggle top contributor lines on milestone messages for a channel.
 
         When enabled, the bot lists the top 5 participants for the milestone segment
-        (between goal announcements or count resets) on each goal message.
+        (between milestone announcements or count resets) on each milestone message.
 
         Usage: [p]countingset milestonecontributors <channel> <true/false>
         """
@@ -1198,14 +1198,14 @@ class Counting(commands.Cog):
             milestone = (new_current // goal_interval) * goal_interval
             if milestone > 0 and milestone != last_interval:
                 goal_reached = milestone
-                goal_message = f"🎉 **Goal reached!** The count reached {milestone}!"
+                goal_message = f"🎉 **Milestone reached!** The count reached {milestone}!"
                 interval_fired = True
 
         if goal and new_current >= goal and not interval_fired:
             g = _int_from_config(goal)
             if g is not None and last_cap != g:
                 goal_reached = g
-                goal_message = f"🎉 **Goal reached!** The count reached {g}!"
+                goal_message = f"🎉 **Milestone reached!** The count reached {g}!"
 
         # #region agent log
         _milestone_dbg = (
@@ -1263,7 +1263,7 @@ class Counting(commands.Cog):
                 color = await self.bot.get_embed_color(guild)
                 desc = f"The count reached **{goal_reached}**!{contributor_block}"
                 embed = discord.Embed(
-                    title="🎉 Goal reached!",
+                    title="🎉 Milestone reached!",
                     description=desc,
                     color=color,
                 )
