@@ -265,6 +265,7 @@ class Counting(commands.Cog):
             contributions.items(),
             key=lambda x: (-x[1], int(x[0])),
         )
+        _medals = {1: "🥇", 2: "🥈", 3: "🥉"}
         lines: List[str] = []
         rank = 0
         for uid_str, count in ranked:
@@ -275,7 +276,8 @@ class Counting(commands.Cog):
             rank += 1
             member = guild.get_member(uid)
             who = member.mention if member else f"<@{uid}>"
-            lines.append(f"{rank}. {who} — {count} count{'s' if count != 1 else ''}")
+            prefix = _medals.get(rank, f"{rank}.")
+            lines.append(f"{prefix} {who} — {count} count{'s' if count != 1 else ''}")
         return lines
 
     def _format_top_contributors(
