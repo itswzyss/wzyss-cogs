@@ -256,7 +256,7 @@ class Counting(commands.Cog):
         self.description_update_task: Optional[asyncio.Task] = None
 
     def _contributor_rank_lines(
-        self, guild: discord.Guild, contributions: Dict[str, int]
+        self, guild: discord.Guild, contributions: Dict[str, int], label: str = "count"
     ) -> List[str]:
         """Full ranked display lines; sort by (-count, user_id)."""
         if not contributions:
@@ -277,7 +277,7 @@ class Counting(commands.Cog):
             member = guild.get_member(uid)
             who = member.mention if member else f"<@{uid}>"
             prefix = _medals.get(rank, f"{rank}.")
-            lines.append(f"{prefix} {who} — {count} count{'s' if count != 1 else ''}")
+            lines.append(f"{prefix} {who} — {count} {label}{'s' if count != 1 else ''}")
         return lines
 
     def _format_top_contributors(
@@ -545,6 +545,10 @@ class Counting(commands.Cog):
         channels[cid_str]["consecutive_user"] = None
         _clear_goal_announcement_state(channels[cid_str])
         channels[cid_str]["segment_contributions"] = {}
+        uid_str = str(ruiner.id)
+        ruin_counts = dict(ch_cfg.get("channel_ruin_counts") or {})
+        ruin_counts[uid_str] = ruin_counts.get(uid_str, 0) + 1
+        channels[cid_str]["channel_ruin_counts"] = ruin_counts
         await self.config.guild(guild).channels.set(channels)
 
         if pre_ruin_count > highest_record:
@@ -646,6 +650,7 @@ class Counting(commands.Cog):
                 "segment_contributions": {},  # user_id str -> valid counts this milestone segment
                 "show_milestone_contributors": True,  # append top contributors to goal messages
                 "channel_contributor_counts": {},  # user_id str -> lifetime valid counts in this channel
+                "channel_ruin_counts": {},  # user_id str -> lifetime ruins in this channel
             }
         else:
             channels[str(channel_id)]["enabled"] = True
@@ -1316,6 +1321,105 @@ class Counting(commands.Cog):
                 emb.add_field(name=name, value=value, inline=False)
             emb.set_footer(
                 text=f"Page {bi + 1}/{len(batches)} \u00b7 {total_ch} channels"
+            )
+            pages_multi.append(emb)
+
+        if len(pages_multi) == 1:
+            await ctx.send(embed=pages_multi[0], allowed_mentions=mention_policy)
+            return
+
+        view = CountingLeaderboardView(pages_multi)
+        message = await ctx.send(
+            embed=pages_multi[0],
+            view=view,
+            allowed_mentions=mention_policy,
+        )
+        view.message = message
+
+    @commands.command(name="countingruins", aliases=["crl"])
+    @commands.guild_only()
+    async def counting_ruins(self, ctx: commands.Context):
+        """Show who has ruined the count the most per enabled channel."""
+        guild = ctx.guild
+        channels_data = await self.config.guild(guild).channels()
+        enabled = self._enabled_counting_text_channels(guild, channels_data)
+        if not enabled:
+            await ctx.send("No enabled counting channels in this server.")
+            return
+
+        color = await ctx.embed_color()
+        mention_policy = discord.AllowedMentions(users=True)
+
+        if len(enabled) == 1:
+            text_ch, cfg = enabled[0]
+            ruins = cfg.get("channel_ruin_counts") or {}
+            lines = self._contributor_rank_lines(guild, ruins, label="ruin")
+            if not lines:
+                emb = discord.Embed(
+                    title="Ruin leaderboard",
+                    description=(
+                        f"{text_ch.mention}\n\n"
+                        "No ruins recorded yet."
+                    ),
+                    color=color,
+                )
+                await ctx.send(embed=emb, allowed_mentions=mention_policy)
+                return
+
+            total = len(lines)
+            num_pages = (total + LEADERBOARD_PAGE_SIZE - 1) // LEADERBOARD_PAGE_SIZE
+            pages: List[discord.Embed] = []
+            for p in range(num_pages):
+                start = p * LEADERBOARD_PAGE_SIZE
+                chunk = lines[start : start + LEADERBOARD_PAGE_SIZE]
+                emb = discord.Embed(
+                    title="Ruin leaderboard",
+                    description=f"{text_ch.mention}\n\n" + "\n".join(chunk),
+                    color=color,
+                )
+                emb.set_footer(
+                    text=f"Page {p + 1}/{num_pages} · {total} ruiners · #{text_ch.name}"
+                )
+                pages.append(emb)
+
+            if num_pages == 1:
+                await ctx.send(embed=pages[0], allowed_mentions=mention_policy)
+                return
+
+            view = CountingLeaderboardView(pages)
+            message = await ctx.send(
+                embed=pages[0],
+                view=view,
+                allowed_mentions=mention_policy,
+            )
+            view.message = message
+            return
+
+        batches: List[List[Tuple[discord.TextChannel, dict]]] = []
+        batch: List[Tuple[discord.TextChannel, dict]] = []
+        for pair in enabled:
+            batch.append(pair)
+            if len(batch) >= LEADERBOARD_MAX_FIELDS_PER_EMBED:
+                batches.append(batch)
+                batch = []
+        if batch:
+            batches.append(batch)
+
+        pages_multi: List[discord.Embed] = []
+        total_ch = len(enabled)
+        for bi, bch in enumerate(batches):
+            emb = discord.Embed(
+                title="Ruin leaderboards",
+                description=f"{total_ch} counting channels · top {LEADERBOARD_MULTI_TOP} per channel",
+                color=color,
+            )
+            for text_ch, cfg in bch:
+                ruins = cfg.get("channel_ruin_counts") or {}
+                lines = self._contributor_rank_lines(guild, ruins, label="ruin")[:LEADERBOARD_MULTI_TOP]
+                body = "\n".join(lines) if lines else "No ruins yet."
+                emb.add_field(name=text_ch.mention[:256], value=body, inline=False)
+            emb.set_footer(
+                text=f"Page {bi + 1}/{len(batches)} · {total_ch} channels"
             )
             pages_multi.append(emb)
 
