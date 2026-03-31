@@ -15,7 +15,7 @@ from redbot.core.utils.chat_formatting import box
 
 log = logging.getLogger("red.wzyss-cogs.counting")
 
-LEADERBOARD_PAGE_SIZE = 20
+LEADERBOARD_PAGE_SIZE = 10
 LEADERBOARD_MULTI_TOP = 10
 LEADERBOARD_MAX_FIELDS_PER_EMBED = 25
 
