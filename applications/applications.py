@@ -1,7 +1,8 @@
 import asyncio
 import logging
+import re
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord.ui import Button, Modal, Select, TextInput, View
@@ -1548,14 +1549,7 @@ class FieldSelectMenu(Select):
         for i, field in enumerate(fields):
             field_type = field.get("type", "text")
             label = field.get("label", field.get("name", "Unknown"))
-            
-            # Disable options that can't be moved
-            disabled = False
-            if action == "move_up" and i == 0:
-                disabled = True
-            elif action == "move_down" and i == len(fields) - 1:
-                disabled = True
-            
+
             options.append(
                 discord.SelectOption(
                     label=f"{i+1}. {label[:80]}",
@@ -1877,6 +1871,7 @@ class Applications(commands.Cog):
         self.config.register_guild(**default_guild)
         self.cleanup_task: Optional[asyncio.Task] = None
         self.timer_tasks: Dict[int, Dict[int, asyncio.Task]] = {}  # {guild_id: {user_id: task}}
+        self._lobby_panel_locks: Dict[int, asyncio.Lock] = {}
         self._lobby_embed_builder_states: Dict[int, Dict] = {}  # user_id -> {embed_data}
         log.info("Applications cog initialized")
 
@@ -1929,6 +1924,38 @@ class Applications(commands.Cog):
                         await msg.edit(view=view)
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                     pass
+
+        # Re-start submission timers for members who haven't submitted yet
+        kick_timeout_seconds = await self.config.guild(guild).kick_timeout_seconds()
+        if kick_timeout_seconds is None:
+            kick_timeout_seconds = 86400
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        for user_id_str, app_data in applications.items():
+            if not isinstance(app_data, dict):
+                continue
+            if app_data.get("submitted_at") is not None:
+                continue
+            if app_data.get("status") != "pending":
+                continue
+            try:
+                user_id = int(user_id_str)
+            except (ValueError, TypeError):
+                continue
+            # Skip if timer already running
+            if guild.id in self.timer_tasks and user_id in self.timer_tasks[guild.id]:
+                continue
+            joined_at_str = app_data.get("joined_at")
+            remaining = float(kick_timeout_seconds)
+            if joined_at_str:
+                try:
+                    joined_at = datetime.fromisoformat(joined_at_str)
+                    if joined_at.tzinfo is not None:
+                        joined_at = joined_at.replace(tzinfo=None)
+                    elapsed = (now - joined_at).total_seconds()
+                    remaining = max(0.0, kick_timeout_seconds - elapsed)
+                except (ValueError, TypeError):
+                    pass
+            self._start_application_timer(guild.id, user_id, delay_override=remaining)
 
     async def cog_unload(self):
         """Called when the cog is unloaded."""
@@ -2137,25 +2164,28 @@ class Applications(commands.Cog):
 
     async def ensure_lobby_panel(self, guild: discord.Guild) -> bool:
         """Ensure the lobby panel message exists. If missing or invalid, send a new one and save message ID. Returns True if panel is now valid."""
-        lobby_channel_id = await self.config.guild(guild).lobby_channel_id()
-        panel_message_id = await self.config.guild(guild).lobby_panel_message_id()
-        if not lobby_channel_id:
+        if guild.id not in self._lobby_panel_locks:
+            self._lobby_panel_locks[guild.id] = asyncio.Lock()
+        async with self._lobby_panel_locks[guild.id]:
+            lobby_channel_id = await self.config.guild(guild).lobby_channel_id()
+            panel_message_id = await self.config.guild(guild).lobby_panel_message_id()
+            if not lobby_channel_id:
+                return False
+            channel = guild.get_channel(lobby_channel_id)
+            if not channel or not isinstance(channel, discord.TextChannel):
+                return False
+            if panel_message_id:
+                try:
+                    msg = await channel.fetch_message(panel_message_id)
+                    if msg and msg.author == self.bot.user:
+                        return True
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+            msg = await self.send_lobby_panel(channel)
+            if msg:
+                await self.config.guild(guild).lobby_panel_message_id.set(msg.id)
+                return True
             return False
-        channel = guild.get_channel(lobby_channel_id)
-        if not channel or not isinstance(channel, discord.TextChannel):
-            return False
-        if panel_message_id:
-            try:
-                msg = await channel.fetch_message(panel_message_id)
-                if msg and msg.author == self.bot.user:
-                    return True
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
-        msg = await self.send_lobby_panel(channel)
-        if msg:
-            await self.config.guild(guild).lobby_panel_message_id.set(msg.id)
-            return True
-        return False
 
     def _format_timeout(self, seconds: int) -> str:
         """Format a duration in seconds as a human-readable string (e.g. '24 hours', '30 minutes')."""
@@ -2270,7 +2300,7 @@ class Applications(commands.Cog):
                 duration = self.TEMPBAN_MAX_SECONDS
             try:
                 await guild.ban(member, reason=reason)
-                unban_at = datetime.utcnow() + timedelta(seconds=duration)
+                unban_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=duration)
                 async with self.config.guild(guild).pending_unbans() as pending:
                     pending.append({"user_id": member.id, "unban_at": unban_at.isoformat()})
                 log.info(
@@ -2284,7 +2314,7 @@ class Applications(commands.Cog):
 
         log.warning("Unknown member action '%s' in %s; no moderation action executed", action, context)
 
-    def _start_application_timer(self, guild_id: int, user_id: int):
+    def _start_application_timer(self, guild_id: int, user_id: int, delay_override: Optional[float] = None):
         """Start a timer for a user to submit their application (duration from config)."""
         async def timer_task():
             try:
@@ -2293,9 +2323,12 @@ class Applications(commands.Cog):
                 if not guild:
                     log.warning(f"Guild {guild_id} not found when starting timer")
                     return
-                timeout_seconds = await self.config.guild(guild).kick_timeout_seconds()
-                if timeout_seconds is None:
-                    timeout_seconds = 86400
+                if delay_override is not None:
+                    timeout_seconds = delay_override
+                else:
+                    timeout_seconds = await self.config.guild(guild).kick_timeout_seconds()
+                    if timeout_seconds is None:
+                        timeout_seconds = 86400
                 # Wait for the configured duration
                 await asyncio.sleep(timeout_seconds)
                 
@@ -2411,7 +2444,7 @@ class Applications(commands.Cog):
         user_id = member.id
         app_record = {
             "status": "pending",
-            "submitted_at": datetime.utcnow().isoformat(),
+            "submitted_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
             "responses": responses,
             "review_message_id": None,
             "interview_channel_id": None,
@@ -2437,7 +2470,7 @@ class Applications(commands.Cog):
                 # Reset stale moderation/cleanup fields so repeated test runs behave like a fresh submission.
                 existing_joined_at = existing.get("joined_at") if isinstance(existing, dict) else None
                 applications[str(member.id)] = {
-                    "joined_at": existing_joined_at or datetime.utcnow().isoformat(),
+                    "joined_at": existing_joined_at or datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                     **app_record,
                 }
             else:
@@ -2830,7 +2863,7 @@ class Applications(commands.Cog):
                 "status": "pending",
                 "submitted_at": None,
                 "responses": {},
-                "joined_at": datetime.utcnow().isoformat(),
+                "joined_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
             }
         self._start_application_timer(member.guild.id, member.id)
 
@@ -3329,8 +3362,6 @@ class Applications(commands.Cog):
         - Invite code only (`CODE`)
         - Omit value to clear the configured invite
         """
-        import re
-        
         if invite_url is None:
             await self.config.guild(ctx.guild).rejoin_invite.set(None)
             await ctx.send("Rejoin invite link cleared.")
@@ -3354,7 +3385,7 @@ class Applications(commands.Cog):
         await ctx.send(f"Rejoin invite link set to: {invite_url}")
 
     _DENIAL_ACTION_CHOICES = ("none", "kick", "tempban", "ban")
-    _EARLY_CLOSE_ACTION_CHOICES = ("kick", "tempban", "ban")
+    _EARLY_CLOSE_ACTION_CHOICES = ("none", "kick", "tempban", "ban")
 
     @_policy_denial.command(name="action")
     async def _denial_action(
@@ -3469,8 +3500,8 @@ class Applications(commands.Cog):
     async def _early_close_action(
         self, ctx: commands.Context, action: Optional[str] = None
     ):
-        """Set what happens when an application is closed before the user submitted: kick, tempban, or ban.
-        
+        """Set what happens when an application is closed before the user submitted: none, kick, tempban, or ban.
+
         If no action is given, shows the current setting.
         """
         if action is None:
@@ -4217,6 +4248,48 @@ class Applications(commands.Cog):
 
         await ctx.send(embed=embed)
 
+    async def _apply_approval_roles(
+        self, guild: discord.Guild, member: discord.Member
+    ) -> Optional[str]:
+        """Remove restricted role or add access roles on approval.
+
+        Returns a warning message string if a permission error occurred, else None.
+        """
+        restricted_role_id = await self.config.guild(guild).restricted_role()
+        access_role_ids = await self.config.guild(guild).access_roles()
+
+        if restricted_role_id:
+            restricted_role = guild.get_role(restricted_role_id)
+            if restricted_role and restricted_role in member.roles:
+                try:
+                    await member.remove_roles(restricted_role, reason="Application approved")
+                    log.info("Removed restricted role from %s", member.display_name)
+                except discord.Forbidden:
+                    log.error("Permission denied removing restricted role from %s", member.display_name)
+                    return (
+                        f"⚠️ Approved the application but couldn't remove the restricted role. "
+                        f"Please remove it manually from {member.mention}."
+                    )
+                except discord.HTTPException as e:
+                    log.error("Error removing restricted role: %s", e)
+                    return f"⚠️ Approved the application but encountered an error removing the restricted role: {e}"
+        elif access_role_ids:
+            assignment_status, assigned_count = await self._assign_missing_access_roles(
+                member, reason="Application approved"
+            )
+            if assignment_status == "assigned":
+                log.info("Added %s access role(s) to %s", assigned_count, member.display_name)
+            elif assignment_status == "forbidden":
+                log.error("Permission denied adding access roles to %s", member.display_name)
+                return (
+                    f"⚠️ Approved the application but couldn't add access roles. "
+                    f"Please add them manually to {member.mention}."
+                )
+            elif assignment_status == "http_error":
+                log.error("HTTP error adding access roles to %s", member.display_name)
+                return "⚠️ Approved the application but encountered an error adding access roles."
+        return None
+
     @_applications.command(name="approve", aliases=["a"])
     async def _approve(self, ctx: commands.Context, member: Optional[discord.Member] = None):
         """Approve an application.
@@ -4263,59 +4336,18 @@ class Applications(commands.Cog):
             return
 
         # Handle role changes on approval
-        # Either remove restricted role OR add access roles (not both)
-        restricted_role_id = await self.config.guild(ctx.guild).restricted_role()
-        access_role_ids = await self.config.guild(ctx.guild).access_roles()
-        
-        if restricted_role_id:
-            # Remove restricted role (existing behavior)
-            restricted_role = ctx.guild.get_role(restricted_role_id)
-            if restricted_role and restricted_role in member.roles:
-                try:
-                    await member.remove_roles(restricted_role, reason="Application approved")
-                    log.info(f"Removed restricted role from {member.display_name}")
-                except discord.Forbidden:
-                    log.error(f"Permission denied removing restricted role from {member.display_name}")
-                    await ctx.send(
-                        f"⚠️ Approved the application but couldn't remove the restricted role. "
-                        f"Please remove it manually from {member.mention}."
-                    )
-                except discord.HTTPException as e:
-                    log.error(f"Error removing restricted role: {e}")
-                    await ctx.send(
-                        f"⚠️ Approved the application but encountered an error removing the restricted role: {e}"
-                    )
-        elif access_role_ids:
-            assignment_status, assigned_count = await self._assign_missing_access_roles(
-                member,
-                reason="Application approved",
-            )
-            if assignment_status == "assigned":
-                log.info(
-                    "Added %s access role(s) to %s",
-                    assigned_count,
-                    member.display_name,
-                )
-            elif assignment_status == "forbidden":
-                log.error(f"Permission denied adding access roles to {member.display_name}")
-                await ctx.send(
-                    f"⚠️ Approved the application but couldn't add access roles. "
-                    f"Please add them manually to {member.mention}."
-                )
-            elif assignment_status == "http_error":
-                log.error("HTTP error adding access roles to %s", member.display_name)
-                await ctx.send(
-                    "⚠️ Approved the application but encountered an error adding access roles."
-                )
+        warning = await self._apply_approval_roles(ctx.guild, member)
+        if warning:
+            await ctx.send(warning)
 
         # Update status
         app_data["status"] = "approved"
         app_data["approved_by"] = ctx.author.id
-        app_data["approved_at"] = datetime.utcnow().isoformat()
+        app_data["approved_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         
         # Schedule cleanup
         cleanup_delay = await self.config.guild(ctx.guild).cleanup_delay()
-        cleanup_time = datetime.utcnow() + timedelta(hours=cleanup_delay)
+        cleanup_time = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=cleanup_delay)
         app_data["cleanup_scheduled_at"] = cleanup_time.isoformat()
         
         async with self.config.guild(ctx.guild).applications() as apps:
@@ -4386,13 +4418,13 @@ class Applications(commands.Cog):
         # Update status
         app_data["status"] = "denied"
         app_data["denied_by"] = ctx.author.id
-        app_data["denied_at"] = datetime.utcnow().isoformat()
+        app_data["denied_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         if reason:
             app_data["denial_reason"] = reason
         
         # Schedule cleanup
         cleanup_delay = await self.config.guild(ctx.guild).cleanup_delay()
-        cleanup_time = datetime.utcnow() + timedelta(hours=cleanup_delay)
+        cleanup_time = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=cleanup_delay)
         app_data["cleanup_scheduled_at"] = cleanup_time.isoformat()
         
         async with self.config.guild(ctx.guild).applications() as apps:
@@ -4450,45 +4482,16 @@ class Applications(commands.Cog):
             return
 
         # Handle role changes on approval
-        # Either remove restricted role OR add access roles (not both)
-        restricted_role_id = await self.config.guild(interaction.guild).restricted_role()
-        access_role_ids = await self.config.guild(interaction.guild).access_roles()
-        
-        if restricted_role_id:
-            # Remove restricted role (existing behavior)
-            restricted_role = interaction.guild.get_role(restricted_role_id)
-            if restricted_role and restricted_role in member.roles:
-                try:
-                    await member.remove_roles(restricted_role, reason="Application approved")
-                    log.info(f"Removed restricted role from {member.display_name}")
-                except discord.Forbidden:
-                    log.error(f"Permission denied removing restricted role from {member.display_name}")
-                except discord.HTTPException as e:
-                    log.error(f"Error removing restricted role: {e}")
-        elif access_role_ids:
-            assignment_status, assigned_count = await self._assign_missing_access_roles(
-                member,
-                reason="Application approved",
-            )
-            if assignment_status == "assigned":
-                log.info(
-                    "Added %s access role(s) to %s",
-                    assigned_count,
-                    member.display_name,
-                )
-            elif assignment_status == "forbidden":
-                log.error(f"Permission denied adding access roles to {member.display_name}")
-            elif assignment_status == "http_error":
-                log.error("HTTP error adding access roles to %s", member.display_name)
+        await self._apply_approval_roles(interaction.guild, member)
 
         # Update status
         app_data["status"] = "approved"
         app_data["approved_by"] = interaction.user.id
-        app_data["approved_at"] = datetime.utcnow().isoformat()
+        app_data["approved_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         
         # Schedule cleanup
         cleanup_delay = await self.config.guild(interaction.guild).cleanup_delay()
-        cleanup_time = datetime.utcnow() + timedelta(hours=cleanup_delay)
+        cleanup_time = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=cleanup_delay)
         app_data["cleanup_scheduled_at"] = cleanup_time.isoformat()
         
         async with self.config.guild(interaction.guild).applications() as apps:
@@ -4539,12 +4542,12 @@ class Applications(commands.Cog):
         # Update status
         app_data["status"] = "denied"
         app_data["denied_by"] = interaction.user.id
-        app_data["denied_at"] = datetime.utcnow().isoformat()
+        app_data["denied_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         app_data["denial_reason"] = reason
         
         # Schedule cleanup
         cleanup_delay = await self.config.guild(interaction.guild).cleanup_delay()
-        cleanup_time = datetime.utcnow() + timedelta(hours=cleanup_delay)
+        cleanup_time = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=cleanup_delay)
         app_data["cleanup_scheduled_at"] = cleanup_time.isoformat()
         
         async with self.config.guild(interaction.guild).applications() as apps:
@@ -4842,7 +4845,7 @@ class Applications(commands.Cog):
                             continue
 
                         applications = await self.config.guild(guild).applications()
-                        current_time = datetime.utcnow()
+                        current_time = datetime.now(timezone.utc).replace(tzinfo=None)
 
                         to_remove = []
 
@@ -4853,6 +4856,8 @@ class Applications(commands.Cog):
 
                             try:
                                 cleanup_time = datetime.fromisoformat(cleanup_time_str)
+                                if cleanup_time.tzinfo is not None:
+                                    cleanup_time = cleanup_time.replace(tzinfo=None)
                                 if current_time >= cleanup_time:
                                     review_message_id = app_data.get("review_message_id")
                                     review_channel_id = await self.config.guild(guild).review_channel_id()
@@ -4864,15 +4869,15 @@ class Applications(commands.Cog):
                                                 await msg.delete()
                                             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                                                 pass
-                                        if await self.config.guild(guild).delete_interview_on_resolve():
-                                            interview_channel_id = app_data.get("interview_channel_id")
-                                            if interview_channel_id:
-                                                ich = guild.get_channel(interview_channel_id)
-                                                if ich:
-                                                    try:
-                                                        await ich.delete(reason="Application cleanup")
-                                                    except (discord.Forbidden, discord.HTTPException):
-                                                        pass
+                                    if await self.config.guild(guild).delete_interview_on_resolve():
+                                        interview_channel_id = app_data.get("interview_channel_id")
+                                        if interview_channel_id:
+                                            ich = guild.get_channel(interview_channel_id)
+                                            if ich:
+                                                try:
+                                                    await ich.delete(reason="Application cleanup")
+                                                except (discord.Forbidden, discord.HTTPException):
+                                                    pass
                                     to_remove.append(user_id)
                             except (ValueError, TypeError) as e:
                                 log.warning(f"Invalid cleanup_scheduled_at for user {user_id}: {e}")
@@ -4926,7 +4931,7 @@ class Applications(commands.Cog):
             return 0
 
         applications = await self.config.guild(guild).applications()
-        current_time = datetime.utcnow()
+        current_time = datetime.now(timezone.utc).replace(tzinfo=None)
         cleaned = 0
 
         to_remove = []
@@ -4938,6 +4943,8 @@ class Applications(commands.Cog):
 
             try:
                 cleanup_time = datetime.fromisoformat(cleanup_time_str)
+                if cleanup_time.tzinfo is not None:
+                    cleanup_time = cleanup_time.replace(tzinfo=None)
                 if current_time >= cleanup_time:
                     review_message_id = app_data.get("review_message_id")
                     review_channel_id = await self.config.guild(guild).review_channel_id()
@@ -4950,16 +4957,16 @@ class Applications(commands.Cog):
                                 cleaned += 1
                             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                                 pass
-                        if await self.config.guild(guild).delete_interview_on_resolve():
-                            interview_channel_id = app_data.get("interview_channel_id")
-                            if interview_channel_id:
-                                ich = guild.get_channel(interview_channel_id)
-                                if ich:
-                                    try:
-                                        await ich.delete(reason="Manual application cleanup")
-                                        cleaned += 1
-                                    except (discord.Forbidden, discord.HTTPException):
-                                        pass
+                    if await self.config.guild(guild).delete_interview_on_resolve():
+                        interview_channel_id = app_data.get("interview_channel_id")
+                        if interview_channel_id:
+                            ich = guild.get_channel(interview_channel_id)
+                            if ich:
+                                try:
+                                    await ich.delete(reason="Manual application cleanup")
+                                    cleaned += 1
+                                except (discord.Forbidden, discord.HTTPException):
+                                    pass
                     to_remove.append(user_id)
             except (ValueError, TypeError) as e:
                 log.warning(f"Invalid cleanup_scheduled_at for user {user_id}: {e}")
