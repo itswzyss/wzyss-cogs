@@ -21,6 +21,69 @@ RANK_VALUES: Dict[str, int] = {
     "7": 7, "8": 8, "9": 9, "10": 10, "J": 10, "Q": 10, "K": 10,
 }
 
+_SUIT_NAME: Dict[str, str] = {
+    "♠": "Spades", "♥": "Hearts", "♦": "Diamonds", "♣": "Clubs",
+}
+_CARD_EMOJI: Dict[str, str] = {
+    "cardClubsA":     "<:cardClubsA:1488932325013328034>",
+    "cardClubs2":     "<:cardClubs2:1488932315253051432>",
+    "cardClubs3":     "<:cardClubs3:1488932315999768757>",
+    "cardClubs4":     "<:cardClubs4:1488932316901282013>",
+    "cardClubs5":     "<:cardClubs5:1488932317924954184>",
+    "cardClubs6":     "<:cardClubs6:1488932319069999297>",
+    "cardClubs7":     "<:cardClubs7:1488932319833362562>",
+    "cardClubs8":     "<:cardClubs8:1488932321053905029>",
+    "cardClubs9":     "<:cardClubs9:1488932323318824981>",
+    "cardClubs10":    "<:cardClubs10:1488932324283387934>",
+    "cardClubsJ":     "<:cardClubsJ:1488932291882516702>",
+    "cardClubsQ":     "<:cardClubsQ:1488932293904040158>",
+    "cardClubsK":     "<:cardClubsK:1488932292968710317>",
+    "cardDiamondsA":  "<:cardDiamondsA:1488932335436169226>",
+    "cardDiamonds2":  "<:cardDiamonds2:1488932326116167771>",
+    "cardDiamonds3":  "<:cardDiamonds3:1488932327328579686>",
+    "cardDiamonds4":  "<:cardDiamonds4:1488932328159055922>",
+    "cardDiamonds5":  "<:cardDiamonds5:1488932329589051444>",
+    "cardDiamonds6":  "<:cardDiamonds6:1488932330528837722>",
+    "cardDiamonds7":  "<:cardDiamonds7:1488932331409641764>",
+    "cardDiamonds8":  "<:cardDiamonds8:1488932332294504508>",
+    "cardDiamonds9":  "<:cardDiamonds9:1488932333296812163>",
+    "cardDiamonds10": "<:cardDiamonds10:1488932334290866256>",
+    "cardDiamondsJ":  "<:cardDiamondsJ:1488932295116066866>",
+    "cardDiamondsQ":  "<:cardDiamondsQ:1488932297431580812>",
+    "cardDiamondsK":  "<:cardDiamondsK:1488932296525615379>",
+    "cardHeartsA":    "<:cardHeartsA:1488932337776591089>",
+    "cardHearts2":    "<:cardHearts2:1488932336505720992>",
+    "cardHearts3":    "<:cardHearts3:1488932307393056915>",
+    "cardHearts4":    "<:cardHearts4:1488932308386971819>",
+    "cardHearts5":    "<:cardHearts5:1488932309364248606>",
+    "cardHearts6":    "<:cardHearts6:1488932310958211092>",
+    "cardHearts7":    "<:cardHearts7:1488932311859859629>",
+    "cardHearts8":    "<:cardHearts8:1488932312820219914>",
+    "cardHearts9":    "<:cardHearts9:1488932313567072527>",
+    "cardHearts10":   "<:cardHearts10:1488932314476970097>",
+    "cardHeartsJ":    "<:cardHeartsJ:1488932298790277211>",
+    "cardHeartsQ":    "<:cardHeartsQ:1488932300736561475>",
+    "cardHeartsK":    "<:cardHeartsK:1488932299990110370>",
+    "cardSpadesA":    "<:cardSpadesA:1488932349482897621>",
+    "cardSpades2":    "<:cardSpades2:1488932339173036312>",
+    "cardSpades3":    "<:cardSpades3:1488932340695830579>",
+    "cardSpades4":    "<:cardSpades4:1488932341870231714>",
+    "cardSpades5":    "<:cardSpades5:1488932342998237194>",
+    "cardSpades6":    "<:cardSpades6:1488932344021909624>",
+    "cardSpades7":    "<:cardSpades7:1488932345158307910>",
+    "cardSpades8":    "<:cardSpades8:1488932346081186064>",
+    "cardSpades9":    "<:cardSpades9:1488932346953601076>",
+    "cardSpades10":   "<:cardSpades10:1488932348543107072>",
+    "cardSpadesJ":    "<:cardSpadesJ:1488932303458537595>",
+    "cardSpadesQ":    "<:cardSpadesQ:1488932306243813579>",
+    "cardSpadesK":    "<:cardSpadesK:1488932305144647900>",
+}
+_CARD_BACK = "<:cardBack_blue1:1488932272781398117>"
+
+
+def _card_emoji(rank: str, suit: str) -> str:
+    return _CARD_EMOJI.get(f"card{_SUIT_NAME[suit]}{rank}", f"[{rank}{suit}]")
+
 Card = Tuple[str, str]  # (rank, suit)
 
 # Hand outcome tokens
@@ -80,9 +143,9 @@ def value_label(cards: List[Card]) -> str:
 
 def fmt_hand(cards: List[Card], hide_second: bool = False) -> str:
     """Format a list of cards; optionally conceal the dealer's hole card."""
-    parts = ["[??]" if i == 1 and hide_second else f"[{rank}{suit}]"
+    parts = [_CARD_BACK if i == 1 and hide_second else _card_emoji(rank, suit)
              for i, (rank, suit) in enumerate(cards)]
-    return "  ".join(parts)
+    return " ".join(parts)
 
 
 def _classify_hand(hand: List[Card], is_only_hand: bool, dealer_hand: List[Card]) -> str:
@@ -355,32 +418,41 @@ def build_blackjack_embed(
         results = []
         color, title = discord.Color.blurple(), "🃏 Blackjack"
 
-    embed = discord.Embed(title=title, color=color)
-    embed.add_field(
-        name=f"Dealer  [{dealer_label}]",
-        value=fmt_hand(game.dealer_hand, hide_second=not reveal_dealer),
-        inline=False,
-    )
+    lines: List[str] = []
 
+    # Dealer row
+    dealer_cards = fmt_hand(game.dealer_hand, hide_second=not reveal_dealer)
+    lines.append(f"**Dealer  [{dealer_label}]**\n{dealer_cards}")
+
+    # Player hand(s)
     for i, hand in enumerate(game.player_hands):
         is_active = (i == game.current_hand) and not final
         marker = " ◀" if is_active and len(game.player_hands) > 1 else ""
         hand_label = f"Hand {i + 1}" if len(game.player_hands) > 1 else "Your Hand"
         result_suffix = f"  —  {results[i]}" if final else ""
-        embed.add_field(
-            name=f"{hand_label}{marker}  [{value_label(hand)}]{result_suffix}",
-            value=f"{fmt_hand(hand)}   Bet: {_credits_str(game.bets[i])}",
-            inline=False,
+        bet_str = _credits_str(game.bets[i])
+        player_cards = fmt_hand(hand)
+        lines.append(
+            f"**{hand_label}{marker}  [{value_label(hand)}]{result_suffix}**\n"
+            f"{player_cards}   Bet: {bet_str}"
         )
 
-    if game.insurance_bet:
-        embed.add_field(name="Insurance Bet", value=_credits_str(game.insurance_bet), inline=True)
+    description = "\n\n".join(lines)
 
+    # Extra info rows appended as plain lines at the end
+    extra_fields: List[Tuple[str, str]] = []
+    if game.insurance_bet:
+        extra_fields.append(("Insurance Bet", _credits_str(game.insurance_bet)))
     if final and net_change is not None:
         sign = "+" if net_change >= 0 else ""
-        embed.add_field(name="Net Result", value=f"{sign}{_credits_str(net_change)}", inline=True)
-        if game.outcome_message:
-            embed.set_footer(text=game.outcome_message)
+        extra_fields.append(("Net Result", f"{sign}{_credits_str(net_change)}"))
+
+    embed = discord.Embed(title=title, description=description, color=color)
+    for name, value in extra_fields:
+        embed.add_field(name=name, value=value, inline=True)
+
+    if final and net_change is not None and game.outcome_message:
+        embed.set_footer(text=game.outcome_message)
     elif game.phase == "insurance_offer":
         embed.set_footer(text="Dealer shows an Ace — take insurance? (½ your bet)")
     else:
