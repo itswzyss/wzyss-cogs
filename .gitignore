@@ -2,3 +2,5 @@
 __pycache__/
 *.py[cod]
 /.claude
+delete-app-emojis.py
+emoji_map.json
