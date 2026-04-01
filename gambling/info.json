@@ -1,0 +1,10 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thanks for installing the Gambling cog! Use `[p]gambling` to get started. All credits are virtual — no real money is involved.",
+    "name": "Gambling",
+    "short": "Virtual credits casino with Blackjack and leaderboards.",
+    "description": "A virtual gambling system with a credits economy and casino games. Supports per-member inventories, game statistics, and multiple leaderboard types. First game: Blackjack with standard casino rules. No real money involved.",
+    "tags": ["gambling", "casino", "blackjack", "credits", "economy", "fun", "games"],
+    "min_bot_version": "3.4.0",
+    "end_user_data_statement": "This cog stores per-member virtual credit balances and game statistics."
+}
