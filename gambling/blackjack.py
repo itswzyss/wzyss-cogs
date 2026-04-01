@@ -50,13 +50,6 @@ def value_label(cards: List[Card]) -> str:
     return str(v)
 
 
-def fmt_hand(cards: List[Card], hide_second: bool = False) -> str:
-    """Format a list of cards; optionally conceal the dealer's hole card."""
-    parts = [_CARD_BACK if i == 1 and hide_second else _card_emoji(rank, suit)
-             for i, (rank, suit) in enumerate(cards)]
-    return " ".join(parts)
-
-
 # ---------------------------------------------------------------------------
 # Hand outcome constants
 # ---------------------------------------------------------------------------
