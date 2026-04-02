@@ -3,15 +3,9 @@ Shared card primitives and emoji for the gambling cog.
 
 Any game that uses a standard 52-card deck should import from here.
 
-Emoji strings are loaded at import time from emoji_map.json (same directory).
-To refresh IDs, run get-ids.py then reload the cog.
+To refresh emoji IDs, run get-ids.py then reload the cog.
 """
-import json
-import logging
-from pathlib import Path
 from typing import Dict, List, Tuple
-
-log = logging.getLogger("red.wzyss-cogs.gambling")
 
 # ---------------------------------------------------------------------------
 # Deck constants
@@ -27,28 +21,80 @@ RANK_VALUES: Dict[str, int] = {
 Card = Tuple[str, str]  # (rank, suit)
 
 # ---------------------------------------------------------------------------
-# Card emoji — loaded from emoji_map.json at import time
+# Card emoji
 # ---------------------------------------------------------------------------
 
+# Maps internal rank/suit representations to emoji map key segments
+_RANK_NAME: Dict[str, str] = {
+    "A": "ace", "2": "2", "3": "3", "4": "4", "5": "5", "6": "6",
+    "7": "7", "8": "8", "9": "9", "10": "10", "J": "jack", "Q": "queen", "K": "king",
+}
 _SUIT_NAME: Dict[str, str] = {
-    "♠": "Spades", "♥": "Hearts", "♦": "Diamonds", "♣": "Clubs",
+    "♠": "spades", "♥": "hearts", "♦": "diamonds", "♣": "clubs",
 }
 
-_EMOJI_MAP_PATH = Path(__file__).parent / "emoji_map.json"
+CARD_EMOJI: Dict[str, str] = {
+    "2clubs":        "<:2clubs:1489027679855579426>",
+    "2diamonds":     "<:2diamonds:1489027680774127848>",
+    "2hearts":       "<:2hearts:1489027682057453630>",
+    "2spades":       "<:2spades:1489027683340779671>",
+    "3clubs":        "<:3clubs:1489027684297343110>",
+    "3diamonds":     "<:3diamonds:1489027685081677914>",
+    "3hearts":       "<:3hearts:1489027686209949866>",
+    "3spades":       "<:3spades:1489027687401132143>",
+    "4clubs":        "<:4clubs:1489027688479064205>",
+    "4diamonds":     "<:4diamonds:1489027689204682833>",
+    "4hearts":       "<:4hearts:1489027690672685056>",
+    "4spades":       "<:4spades:1489027691465281729>",
+    "5clubs":        "<:5clubs:1489027692614647929>",
+    "5diamonds":     "<:5diamonds:1489027693411303657>",
+    "5hearts":       "<:5hearts:1489027694497759403>",
+    "5spades":       "<:5spades:1489027695860912189>",
+    "6clubs":        "<:6clubs:1489027697303621632>",
+    "6diamonds":     "<:6diamonds:1489027698025304216>",
+    "6hearts":       "<:6hearts:1489027699040063569>",
+    "6spades":       "<:6spades:1489027700030181530>",
+    "7clubs":        "<:7clubs:1489027700789219428>",
+    "7diamonds":     "<:7diamonds:1489027701632401510>",
+    "7hearts":       "<:7hearts:1489027702605352971>",
+    "7spades":       "<:7spades:1489027703309861087>",
+    "8clubs":        "<:8clubs:1489027704169697491>",
+    "8diamonds":     "<:8diamonds:1489027704949837895>",
+    "8hearts":       "<:8hearts:1489027706753650688>",
+    "8spades":       "<:8spades:1489027708175515688>",
+    "9clubs":        "<:9clubs:1489027709047668958>",
+    "9diamonds":     "<:9diamonds:1489027711610654760>",
+    "9hearts":       "<:9hearts:1489027713275793661>",
+    "9spades":       "<:9spades:1489027718388387911>",
+    "10clubs":       "<:10clubs:1489027730732486797>",
+    "10diamonds":    "<:10diamonds:1489027731613024317>",
+    "10hearts":      "<:10hearts:1489027732271792322>",
+    "10spades":      "<:10spades:1489027733211316428>",
+    "aceclubs":      "<:aceclubs:1489027734863610057>",
+    "acediamonds":   "<:acediamonds:1489027736415633630>",
+    "acehearts":     "<:acehearts:1489027737199837395>",
+    "acespades":     "<:acespades:1489027738332561479>",
+    "jackclubs":     "<:jackclubs:1489027739033014322>",
+    "jackdiamonds":  "<:jackdiamonds:1489027742052782310>",
+    "jackhearts":    "<:jackhearts:1489027742728192099>",
+    "jackspades":    "<:jackspades:1489027743290101821>",
+    "kingclubs":     "<:kingclubs:1489027744875548693>",
+    "kingdiamonds":  "<:kingdiamonds:1489027745773256744>",
+    "kinghearts":    "<:kinghearts:1489027746704134315>",
+    "kingspades":    "<:kingspades:1489027748138717295>",
+    "queenclubs":    "<:queenclubs:1489027748973252869>",
+    "queendiamonds": "<:queendiamonds:1489027749661380731>",
+    "queenhearts":   "<:queenhearts:1489027750390923314>",
+    "queenspades":   "<:queenspades:1489027751401885746>",
+}
 
-try:
-    CARD_EMOJI: Dict[str, str] = json.loads(_EMOJI_MAP_PATH.read_text(encoding="utf-8"))
-    CARD_BACK: str = CARD_EMOJI.get("cardBack_blue1", "🂠")
-    log.debug("Loaded %d emoji from %s", len(CARD_EMOJI), _EMOJI_MAP_PATH)
-except FileNotFoundError:
-    log.warning("emoji_map.json not found at %s — card emoji will show as text", _EMOJI_MAP_PATH)
-    CARD_EMOJI = {}
-    CARD_BACK = "🂠"
+CARD_BACK: str = "<:cardback:1489028787151568989>"
 
 
 def card_emoji(rank: str, suit: str) -> str:
     """Return the Discord emoji string for a card, falling back to text."""
-    return CARD_EMOJI.get(f"card{_SUIT_NAME[suit]}{rank}", f"[{rank}{suit}]")
+    key = f"{_RANK_NAME[rank]}{_SUIT_NAME[suit]}"
+    return CARD_EMOJI.get(key, f"[{rank}{suit}]")
 
 
 def fmt_hand(cards: List[Card], hide_second: bool = False) -> str:

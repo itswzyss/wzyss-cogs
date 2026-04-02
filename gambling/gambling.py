@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 
 import discord
+from discord import app_commands
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 
@@ -126,7 +127,9 @@ class Gambling(commands.Cog):
         await self._adjust_credits(guild, member, winnings)
         net = winnings - game.total_wagered()
         await self._record_game_result(member, game, net)
-        embed = build_blackjack_embed(game, reveal_dealer=True, final=True, net_change=net)
+        embed = build_blackjack_embed(
+            game, reveal_dealer=True, final=True, net_change=net, player=member
+        )
         return embed, net
 
     async def _finish_game(
@@ -141,18 +144,16 @@ class Gambling(commands.Cog):
 
     # ---------------------------------------------------------------- commands
 
-    @commands.group(name="gambling", aliases=["casino", "gam"])
+    @commands.hybrid_group(name="gambling", aliases=["casino", "gam"])
     @commands.guild_only()
     async def _gambling(self, ctx: commands.Context):
         """Virtual casino — earn and spend credits. No real money involved."""
         pass
 
     @_gambling.command(name="balance", aliases=["bal", "credits"])
+    @app_commands.describe(member="Member to check (defaults to you)")
     async def _balance(self, ctx: commands.Context, member: Optional[discord.Member] = None):
-        """Check your credit balance (or another member's).
-
-        Usage: `[p]gambling balance [@member]`
-        """
+        """Check your credit balance (or another member's)."""
         target = member or ctx.author
         credits = await self._get_credits(ctx.guild, target)
         embed = discord.Embed(title="💰 Credit Balance", color=await ctx.embed_color())
@@ -191,11 +192,9 @@ class Gambling(commands.Cog):
         )
 
     @_gambling.command(name="stats")
+    @app_commands.describe(member="Member to view stats for (defaults to you)")
     async def _stats(self, ctx: commands.Context, member: Optional[discord.Member] = None):
-        """View game statistics.
-
-        Usage: `[p]gambling stats [@member]`
-        """
+        """View your game statistics."""
         target = member or ctx.author
         await self._ensure_initialized(ctx.guild, target)
         data = await self.config.member(target).all()
@@ -232,13 +231,17 @@ class Gambling(commands.Cog):
     }
 
     @_gambling.command(name="leaderboard", aliases=["lb", "top"])
+    @app_commands.describe(board="Which leaderboard to display")
+    @app_commands.choices(board=[
+        app_commands.Choice(name="Credits",      value="credits"),
+        app_commands.Choice(name="Most Won",     value="won"),
+        app_commands.Choice(name="Games Played", value="games"),
+        app_commands.Choice(name="Win Rate",     value="winrate"),
+        app_commands.Choice(name="BJ Naturals",  value="naturals"),
+        app_commands.Choice(name="Win Streak",   value="streak"),
+    ])
     async def _leaderboard(self, ctx: commands.Context, board: str = "credits"):
-        """Show a leaderboard.
-
-        Available boards: `credits`, `won`, `games`, `winrate`, `naturals`, `streak`
-
-        Usage: `[p]gambling leaderboard [board]`
-        """
+        """Show a leaderboard."""
         board = board.lower()
         if board not in self._LEADERBOARD_TYPES:
             valid = ", ".join(f"`{k}`" for k in self._LEADERBOARD_TYPES)
@@ -283,14 +286,9 @@ class Gambling(commands.Cog):
     # ---- blackjack
 
     @_gambling.command(name="blackjack", aliases=["bj"])
+    @app_commands.describe(bet="Amount of credits to wager")
     async def _blackjack(self, ctx: commands.Context, bet: int):
-        """Play a hand of Blackjack.
-
-        Standard casino rules (S17): dealer stands on all 17s, BJ pays 3:2,
-        double down and split available, insurance offered on dealer Ace.
-
-        Usage: `[p]gambling blackjack <bet>`
-        """
+        """Play a hand of Blackjack. S17 rules, BJ pays 3:2, split and double available."""
         key = (ctx.guild.id, ctx.author.id)
         if key in self._active_games:
             await ctx.send("❌ You already have an active game. Finish it first.")
@@ -322,7 +320,10 @@ class Gambling(commands.Cog):
 
         if game.phase == "insurance_offer":
             await ctx.send(
-                embeds=[build_insurance_embed(game), build_blackjack_embed(game)],
+                embeds=[
+                    build_insurance_embed(game, player=ctx.author),
+                    build_blackjack_embed(game, player=ctx.author),
+                ],
                 view=InsuranceView(self, game, credits),
             )
         elif game.phase == "done":
@@ -330,7 +331,7 @@ class Gambling(commands.Cog):
             await ctx.send(embed=embed)
         else:
             await ctx.send(
-                embed=build_blackjack_embed(game),
+                embed=build_blackjack_embed(game, player=ctx.author),
                 view=BlackjackView(self, game, credits),
             )
 
@@ -343,11 +344,9 @@ class Gambling(commands.Cog):
         pass
 
     @_admin.command(name="give")
+    @app_commands.describe(member="Member to give credits to", amount="Amount of credits to give")
     async def _admin_give(self, ctx: commands.Context, member: discord.Member, amount: int):
-        """Give a member credits.
-
-        Usage: `[p]gambling admin give @member <amount>`
-        """
+        """Give a member credits."""
         if amount <= 0:
             await ctx.send("❌ Amount must be positive.")
             return
@@ -355,11 +354,9 @@ class Gambling(commands.Cog):
         await ctx.send(f"✅ Gave {_credits_str(amount)} to {member.mention}. New balance: {_credits_str(new_bal)}.")
 
     @_admin.command(name="take")
+    @app_commands.describe(member="Member to take credits from", amount="Amount of credits to remove")
     async def _admin_take(self, ctx: commands.Context, member: discord.Member, amount: int):
-        """Remove credits from a member.
-
-        Usage: `[p]gambling admin take @member <amount>`
-        """
+        """Remove credits from a member."""
         if amount <= 0:
             await ctx.send("❌ Amount must be positive.")
             return
@@ -369,11 +366,9 @@ class Gambling(commands.Cog):
         await ctx.send(f"✅ Removed {_credits_str(removed)} from {member.mention}. New balance: {_credits_str(new_bal)}.")
 
     @_admin.command(name="set")
+    @app_commands.describe(member="Member to update", amount="Exact credit amount to set")
     async def _admin_set(self, ctx: commands.Context, member: discord.Member, amount: int):
-        """Set a member's credits to an exact amount.
-
-        Usage: `[p]gambling admin set @member <amount>`
-        """
+        """Set a member's credits to an exact amount."""
         if amount < 0:
             await ctx.send("❌ Amount cannot be negative.")
             return
@@ -382,11 +377,9 @@ class Gambling(commands.Cog):
         await ctx.send(f"✅ Set {member.mention}'s balance to {_credits_str(amount)}.")
 
     @_admin.command(name="reset")
+    @app_commands.describe(member="Member to reset")
     async def _admin_reset(self, ctx: commands.Context, member: discord.Member):
-        """Reset a member's credits to the server starting amount.
-
-        Usage: `[p]gambling admin reset @member`
-        """
+        """Reset a member's credits to the server starting amount."""
         starting = await self.config.guild(ctx.guild).starting_credits()
         await self.config.member(member).credits.set(starting)
         await self.config.member(member).initialized.set(True)
@@ -395,7 +388,7 @@ class Gambling(commands.Cog):
     @_gambling.group(name="settings", aliases=["config"])
     @commands.admin_or_permissions(manage_guild=True)
     async def _settings(self, ctx: commands.Context):
-        """Configure gambling system settings."""
+        """Configure gambling settings."""
         pass
 
     @_settings.command(name="show")
@@ -411,11 +404,9 @@ class Gambling(commands.Cog):
         await ctx.send(embed=embed)
 
     @_settings.command(name="startingcredits")
+    @app_commands.describe(amount="Credits granted to new players")
     async def _set_starting(self, ctx: commands.Context, amount: int):
-        """Set the starting credit amount for new players.
-
-        Usage: `[p]gambling settings startingcredits <amount>`
-        """
+        """Set the starting credit amount for new players."""
         if amount < 0:
             await ctx.send("❌ Amount cannot be negative.")
             return
@@ -423,11 +414,9 @@ class Gambling(commands.Cog):
         await ctx.send(f"✅ Starting credits set to {_credits_str(amount)}.")
 
     @_settings.command(name="dailybonus")
+    @app_commands.describe(amount="Credits awarded by the daily bonus")
     async def _set_daily(self, ctx: commands.Context, amount: int):
-        """Set the daily bonus credit amount.
-
-        Usage: `[p]gambling settings dailybonus <amount>`
-        """
+        """Set the daily bonus credit amount."""
         if amount < 0:
             await ctx.send("❌ Amount cannot be negative.")
             return
@@ -435,11 +424,9 @@ class Gambling(commands.Cog):
         await ctx.send(f"✅ Daily bonus set to {_credits_str(amount)}.")
 
     @_settings.command(name="minbet")
+    @app_commands.describe(amount="Minimum allowed bet")
     async def _set_minbet(self, ctx: commands.Context, amount: int):
-        """Set the minimum bet.
-
-        Usage: `[p]gambling settings minbet <amount>`
-        """
+        """Set the minimum bet."""
         if amount < 1:
             await ctx.send("❌ Minimum bet must be at least 1.")
             return
@@ -451,11 +438,9 @@ class Gambling(commands.Cog):
         await ctx.send(f"✅ Minimum bet set to {_credits_str(amount)}.")
 
     @_settings.command(name="maxbet")
+    @app_commands.describe(amount="Maximum allowed bet")
     async def _set_maxbet(self, ctx: commands.Context, amount: int):
-        """Set the maximum bet.
-
-        Usage: `[p]gambling settings maxbet <amount>`
-        """
+        """Set the maximum bet."""
         min_bet = await self.config.guild(ctx.guild).min_bet()
         if amount < min_bet:
             await ctx.send(f"❌ Max bet cannot be less than min bet ({_credits_str(min_bet)}).")

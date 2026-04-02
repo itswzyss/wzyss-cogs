@@ -305,11 +305,31 @@ def _credits_str(n: int) -> str:
     return f"{n:,} cr"
 
 
+def _set_game_embed_footer(
+    embed: discord.Embed,
+    player: Optional[discord.abc.User],
+    extra_line: Optional[str] = None,
+) -> None:
+    """Footer: player display name + avatar; optional second line (outcome, insurance hint)."""
+    if player is None:
+        if extra_line:
+            embed.set_footer(text=extra_line)
+        return
+    if isinstance(player, discord.Member):
+        name = player.display_name
+    else:
+        name = player.global_name or player.name
+    text = name if not extra_line else f"{name}\n{extra_line}"
+    embed.set_footer(text=text, icon_url=player.display_avatar.url)
+
+
 def build_blackjack_embed(
     game: BlackjackGame,
     reveal_dealer: bool = False,
     final: bool = False,
     net_change: Optional[int] = None,
+    *,
+    player: Optional[discord.abc.User] = None,
 ) -> discord.Embed:
     """Build the main blackjack game embed."""
     dealer_label = (
@@ -362,18 +382,22 @@ def build_blackjack_embed(
         embed.add_field(name=name, value=value, inline=True)
 
     if final and net_change is not None and game.outcome_message:
-        embed.set_footer(text=game.outcome_message)
+        _set_game_embed_footer(embed, player, game.outcome_message)
     elif game.phase == "insurance_offer":
-        embed.set_footer(text="Dealer shows an Ace — take insurance? (½ your bet)")
+        _set_game_embed_footer(
+            embed, player, "Dealer shows an Ace — take insurance? (½ your bet)"
+        )
     else:
-        embed.set_footer(text="🎰 Virtual credits only — gamble responsibly.")
+        _set_game_embed_footer(embed, player, None)
 
     return embed
 
 
-def build_insurance_embed(game: BlackjackGame) -> discord.Embed:
+def build_insurance_embed(
+    game: BlackjackGame, *, player: Optional[discord.abc.User] = None
+) -> discord.Embed:
     half = game.initial_bet // 2
-    return discord.Embed(
+    embed = discord.Embed(
         title="🛡️ Insurance Offer",
         description=(
             f"The dealer is showing **[A]**.\n\n"
@@ -383,6 +407,8 @@ def build_insurance_embed(game: BlackjackGame) -> discord.Embed:
         ),
         color=discord.Color.orange(),
     )
+    _set_game_embed_footer(embed, player, None)
+    return embed
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +432,7 @@ class InsuranceView(View):
             return False
         return True
 
-    @discord.ui.button(label="Yes — Take Insurance", style=discord.ButtonStyle.success, emoji="🛡️")
+    @discord.ui.button(label="Yes — Take Insurance", style=discord.ButtonStyle.success)
     async def take_insurance(self, interaction: discord.Interaction, button: Button):
         if not await self._guard(interaction):
             return
@@ -414,7 +440,7 @@ class InsuranceView(View):
         self.game.accept_insurance()
         await self._transition(interaction)
 
-    @discord.ui.button(label="No — Decline", style=discord.ButtonStyle.secondary, emoji="❌")
+    @discord.ui.button(label="No — Decline", style=discord.ButtonStyle.secondary)
     async def decline_insurance(self, interaction: discord.Interaction, button: Button):
         if not await self._guard(interaction):
             return
@@ -428,7 +454,9 @@ class InsuranceView(View):
         else:
             credits = await self.cog._get_credits(interaction.guild, interaction.user)
             view = BlackjackView(self.cog, self.game, credits)
-            await interaction.response.edit_message(embed=build_blackjack_embed(self.game), view=view)
+            await interaction.response.edit_message(
+                embed=build_blackjack_embed(self.game, player=interaction.user), view=view
+            )
 
     async def on_timeout(self):
         self.game.decline_insurance()
@@ -484,7 +512,9 @@ class BlackjackView(View):
 
         self.player_credits = await self.cog._get_credits(interaction.guild, interaction.user)
         self._sync_buttons()
-        await interaction.response.edit_message(embed=build_blackjack_embed(self.game), view=self)
+        await interaction.response.edit_message(
+            embed=build_blackjack_embed(self.game, player=interaction.user), view=self
+        )
 
     async def _run_dealer(self, interaction: discord.Interaction):
         self.stop()
@@ -494,19 +524,19 @@ class BlackjackView(View):
     async def on_timeout(self):
         self.cog._active_games.pop((self.game.guild_id, self.game.user_id), None)
 
-    @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary, emoji="👆", row=0)
+    @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary, row=0)
     async def hit(self, interaction: discord.Interaction, button: Button):
         if not await self._guard(interaction):
             return
         await self._after_action(interaction, self.game.hit())
 
-    @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary, emoji="✋", row=0)
+    @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary, row=0)
     async def stand(self, interaction: discord.Interaction, button: Button):
         if not await self._guard(interaction):
             return
         await self._after_action(interaction, self.game.stand())
 
-    @discord.ui.button(label="Double Down", style=discord.ButtonStyle.success, emoji="✌️", row=0)
+    @discord.ui.button(label="Double Down", style=discord.ButtonStyle.success, row=0)
     async def double_down(self, interaction: discord.Interaction, button: Button):
         if not await self._guard(interaction):
             return
@@ -514,7 +544,7 @@ class BlackjackView(View):
         self.player_credits -= self.game.active_bet
         await self._after_action(interaction, self.game.double_down())
 
-    @discord.ui.button(label="Split", style=discord.ButtonStyle.danger, emoji="✂️", row=0)
+    @discord.ui.button(label="Split", style=discord.ButtonStyle.danger, row=0)
     async def split(self, interaction: discord.Interaction, button: Button):
         if not await self._guard(interaction):
             return
