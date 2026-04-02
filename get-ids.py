@@ -20,11 +20,11 @@ def get_app_emojis():
             # Format: <:name:id> or <a:name:id>
             emoji_map[e['name']] = f"<{prefix}:{e['name']}:{e['id']}>"
         
-        # Save to a file so you don't have to call the API every time the bot starts
-        with open("emoji_map.json", "w") as f:
+        # Save inside the gambling cog so cards.py can load it at runtime
+        with open("gambling/emoji_map.json", "w") as f:
             json.dump(emoji_map, f, indent=4)
-            
-        print(f"Successfully mapped {len(emojis)} emojis to emoji_map.json")
+
+        print(f"Successfully mapped {len(emojis)} emojis to gambling/emoji_map.json")
     else:
         print(f"Error {response.status_code}: {response.text}")
 
