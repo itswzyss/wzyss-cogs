@@ -251,7 +251,8 @@ class Counting(commands.Cog):
         self.reaction_queue: Dict[int, List[Tuple[discord.Message, str, float]]] = {}
         self.reaction_task: Optional[asyncio.Task] = None
         self._queue_lock = asyncio.Lock()  # Lock for thread-safe queue operations
-        
+        self._channel_locks: Dict[int, asyncio.Lock] = {}  # Per-channel lock for on_message atomicity
+
         # Channel description update task
         self.description_update_task: Optional[asyncio.Task] = None
 
@@ -1445,11 +1446,24 @@ class Counting(commands.Cog):
         guild = message.guild
         channel = message.channel
         channel_id = channel.id
-        
+
+        if channel_id not in self._channel_locks:
+            self._channel_locks[channel_id] = asyncio.Lock()
+
+        async with self._channel_locks[channel_id]:
+            await self._process_counting_message(message, guild, channel, channel_id)
+
+    async def _process_counting_message(
+        self,
+        message: discord.Message,
+        guild: discord.Guild,
+        channel: discord.TextChannel,
+        channel_id: int,
+    ) -> None:
         # Check if this channel is configured for counting
         channels = await self.config.guild(guild).channels()
         channel_config = channels.get(str(channel_id))
-        
+
         if not channel_config or not channel_config.get("enabled", False):
             return
         
