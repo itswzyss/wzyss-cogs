@@ -237,6 +237,13 @@ class Counting(commands.Cog):
             "saves_max_per_user": 3,
             "saves_drop_chance": 0.01,  # 1% per valid count
             "saves_participation_threshold": 100,  # lifetime counts needed to be eligible for drops
+            "boosts_enabled": False,
+            "boosts_drop_chances": {
+                "25": 0.002,   # 0.2% per valid count
+                "50": 0.001,   # 0.1% per valid count
+                "100": 0.0005, # 0.05% per valid count
+                "200": 0.0002, # 0.02% per valid count
+            },
         }
 
         default_member = {
@@ -255,6 +262,9 @@ class Counting(commands.Cog):
 
         # Channel description update task
         self.description_update_task: Optional[asyncio.Task] = None
+
+        # Pending boost tasks per channel (only one boost at a time per channel)
+        self._pending_boosts: Dict[int, asyncio.Task] = {}
 
     def _contributor_rank_lines(
         self, guild: discord.Guild, contributions: Dict[str, int], label: str = "count"
@@ -611,6 +621,148 @@ class Counting(commands.Cog):
                 await member.send(embed=embed)
             except (discord.Forbidden, discord.HTTPException):
                 pass
+
+    async def _check_and_apply_boost(
+        self,
+        guild: discord.Guild,
+        channel: discord.TextChannel,
+        current_count: int,
+    ) -> None:
+        """Roll for a count boost; if one triggers, schedule the delayed application."""
+        guild_data = await self.config.guild(guild).all()
+        if not guild_data.get("boosts_enabled", False):
+            return
+
+        # Only one pending boost per channel at a time
+        if channel.id in self._pending_boosts:
+            return
+
+        drop_chances = guild_data.get("boosts_drop_chances", {})
+        # Check from rarest (200) to most common (25); first hit wins
+        boost_amount = None
+        for tier in (200, 100, 50, 25):
+            chance = drop_chances.get(str(tier), 0.0)
+            if chance > 0 and random.random() < chance:
+                boost_amount = tier
+                break
+
+        if boost_amount is None:
+            return
+
+        # Schedule boost; runs outside the channel lock so counting continues normally
+        task = asyncio.create_task(self._apply_boost_task(guild, channel, boost_amount))
+        self._pending_boosts[channel.id] = task
+
+    async def _apply_boost_task(
+        self,
+        guild: discord.Guild,
+        channel: discord.TextChannel,
+        boost_amount: int,
+        delay: int = 10,
+    ) -> None:
+        """Announce a pending boost with a countdown, then apply it after the delay."""
+        announcement_msg: Optional[discord.Message] = None
+        try:
+            # Send the announcement first, then compute fire_at from the actual
+            # send time so the Discord timestamp is accurate even if the send
+            # was briefly delayed by prior API calls.
+            try:
+                fire_at = int(time.time()) + delay
+                announcement_embed = discord.Embed(
+                    title=f"\u26a1 Boost Incoming! +{boost_amount}",
+                    description=(
+                        f"A **+{boost_amount}** count boost has been triggered!\n"
+                        f"It fires <t:{fire_at}:R> — keep counting! "
+                        f"The boost will be applied to whatever number we reach by then."
+                    ),
+                    color=discord.Color.gold(),
+                )
+                announcement_msg = await channel.send(
+                    embed=announcement_embed, allowed_mentions=discord.AllowedMentions.none()
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                announcement_msg = None
+
+            await asyncio.sleep(delay)
+
+            # Acquire the channel lock so no count can slip in while we read+write
+            if channel.id not in self._channel_locks:
+                self._channel_locks[channel.id] = asyncio.Lock()
+
+            current = 0
+            boosted_count = 0
+            new_record = False
+            cancelled = False
+
+            async with self._channel_locks[channel.id]:
+                channels = await self.config.guild(guild).channels()
+                cid_str = str(channel.id)
+                ch = channels.get(cid_str)
+                if ch is None or not ch.get("enabled", False):
+                    return
+
+                current = ch.get("current", 0)
+                if current <= 0:
+                    cancelled = True
+                else:
+                    boosted_count = current + boost_amount
+                    ch["current"] = boosted_count
+                    # Clear last_user so users counting back-and-forth aren't
+                    # blocked by the unexpected number jump — anyone can count next.
+                    ch["last_user"] = None
+                    ch["consecutive_count"] = 0
+                    ch["consecutive_user"] = None
+
+                    highest_record = ch.get("highest_record", 0)
+                    new_record = boosted_count > highest_record
+                    if new_record:
+                        ch["highest_record"] = boosted_count
+
+                    _sync_goal_announcement_to_current(ch)
+                    channels[cid_str] = ch
+                    await self.config.guild(guild).channels.set(channels)
+
+            if new_record:
+                await self._update_channel_description(channel, boosted_count)
+
+            # Edit the original announcement in-place so the result is visible
+            # regardless of rate limits on new messages.
+            if cancelled:
+                result_embed = discord.Embed(
+                    description=f"\u26a1 The **+{boost_amount}** boost was cancelled — the count was reset during the countdown.",
+                    color=discord.Color.dark_gray(),
+                )
+            else:
+                result_embed = discord.Embed(
+                    title=f"\u26a1 Boosted! +{boost_amount}",
+                    description=(
+                        f"The count jumped from **{current}** to **{boosted_count}**!\n"
+                        f"Next count: **{boosted_count + 1}**"
+                    ),
+                    color=discord.Color.gold(),
+                )
+
+            if announcement_msg:
+                try:
+                    await announcement_msg.edit(embed=result_embed)
+                except (discord.NotFound, discord.HTTPException):
+                    # Message was deleted; fall back to a new send
+                    try:
+                        await channel.send(embed=result_embed, allowed_mentions=discord.AllowedMentions.none())
+                    except discord.Forbidden:
+                        pass
+                except discord.Forbidden:
+                    pass
+            else:
+                try:
+                    await channel.send(embed=result_embed, allowed_mentions=discord.AllowedMentions.none())
+                except discord.Forbidden:
+                    pass
+
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._pending_boosts.pop(channel.id, None)
 
     @commands.group(name="countingset", aliases=["countset"])
     @commands.guild_only()
@@ -1218,6 +1370,78 @@ class Counting(commands.Cog):
         embed.add_field(name="Participation threshold", value=f"{threshold} lifetime counts", inline=True)
         await ctx.send(embed=embed)
 
+    @_countingset.group(name="boosts")
+    async def _boosts(self, ctx: commands.Context):
+        """Manage the count boost system."""
+        pass
+
+    @_boosts.command(name="enable")
+    async def _boosts_enable(self, ctx: commands.Context):
+        """Enable count boosts for this server."""
+        await self.config.guild(ctx.guild).boosts_enabled.set(True)
+        color = await ctx.embed_color()
+        await ctx.send(embed=discord.Embed(
+            description="Count boosts enabled. Rare boosts can now jump the count by 25, 50, 100, or 200.",
+            color=color,
+        ))
+
+    @_boosts.command(name="disable")
+    async def _boosts_disable(self, ctx: commands.Context):
+        """Disable count boosts for this server."""
+        await self.config.guild(ctx.guild).boosts_enabled.set(False)
+        color = await ctx.embed_color()
+        await ctx.send(embed=discord.Embed(description="Count boosts disabled.", color=color))
+
+    @_boosts.command(name="dropchance")
+    async def _boosts_dropchance(self, ctx: commands.Context, tier: int, chance: float):
+        """Set the drop chance for a boost tier (0.0–1.0).
+
+        Valid tiers: 25, 50, 100, 200
+
+        Usage: [p]countingset boosts dropchance <tier> <chance>
+
+        Examples:
+        [p]countingset boosts dropchance 25 0.002   (0.2% per count)
+        [p]countingset boosts dropchance 200 0.0001  (0.01% per count)
+        [p]countingset boosts dropchance 100 0       (disable this tier)
+        """
+        color = await ctx.embed_color()
+        if tier not in (25, 50, 100, 200):
+            await ctx.send(embed=discord.Embed(
+                description="Invalid tier. Valid tiers are: 25, 50, 100, 200.",
+                color=color,
+            ))
+            return
+        if not (0.0 <= chance <= 1.0):
+            await ctx.send(embed=discord.Embed(
+                description="Chance must be between 0.0 and 1.0.",
+                color=color,
+            ))
+            return
+        drop_chances = await self.config.guild(ctx.guild).boosts_drop_chances()
+        drop_chances[str(tier)] = chance
+        await self.config.guild(ctx.guild).boosts_drop_chances.set(drop_chances)
+        if chance == 0.0:
+            desc = f"Boost tier +{tier} disabled."
+        else:
+            desc = f"Boost tier +{tier} drop chance set to {chance:.3%} per valid count."
+        await ctx.send(embed=discord.Embed(description=desc, color=color))
+
+    @_boosts.command(name="status")
+    async def _boosts_status(self, ctx: commands.Context):
+        """Show the current boost system settings."""
+        guild_data = await self.config.guild(ctx.guild).all()
+        enabled = guild_data.get("boosts_enabled", False)
+        drop_chances = guild_data.get("boosts_drop_chances", {})
+        color = await ctx.embed_color()
+        embed = discord.Embed(title="Boost System Settings", color=color)
+        embed.add_field(name="Status", value="Enabled" if enabled else "Disabled", inline=False)
+        for tier in (25, 50, 100, 200):
+            chance = drop_chances.get(str(tier), 0.0)
+            val = f"{chance:.3%} per count" if chance > 0 else "Disabled"
+            embed.add_field(name=f"+{tier} boost", value=val, inline=True)
+        await ctx.send(embed=embed)
+
     @commands.command(name="countinginventory", aliases=["cinv", "mysaves"])
     @commands.guild_only()
     async def counting_inventory(self, ctx: commands.Context):
@@ -1682,13 +1906,20 @@ class Counting(commands.Cog):
                 )
             except discord.Forbidden:
                 pass
-    
+
+        # Check for a count boost (runs inside the channel lock — atomically safe)
+        await self._check_and_apply_boost(guild, channel, new_current)
+
     def cog_unload(self):
         """Cleanup when cog is unloaded."""
         if self.reaction_task and not self.reaction_task.done():
             self.reaction_task.cancel()
         if self.description_update_task and not self.description_update_task.done():
             self.description_update_task.cancel()
+        for task in self._pending_boosts.values():
+            if not task.done():
+                task.cancel()
+        self._pending_boosts.clear()
         log.info("Counting cog unloaded, background tasks stopped")
 
 
