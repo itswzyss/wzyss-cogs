@@ -1,6 +1,6 @@
 import re
 import json
-from typing import Dict, Optional, Pattern, Tuple, List
+from typing import Dict, Optional, Pattern, Tuple
 
 import discord
 from redbot.core import Config, checks, commands
@@ -421,7 +421,6 @@ class TextReplace(commands.Cog):
                 if cmd_content.startswith("textreplace "):
                     return
         
-        original_content = content
         modified = False
         
         # Apply all configured replacements

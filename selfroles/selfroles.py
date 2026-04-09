@@ -1,13 +1,11 @@
-import asyncio
 import logging
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import discord
 from discord.ui import Button, Modal, Select, TextInput, View
 from redbot.core import Config, commands
 from redbot.core.bot import Red
-from redbot.core.utils.chat_formatting import box, pagify
 
 log = logging.getLogger("red.wzyss-cogs.selfroles")
 
@@ -59,7 +57,6 @@ class RoleAssignmentView(View):
         if not message_config:
             return
 
-        assignments = message_config.get("assignments", [])
         user_role_ids = [role.id for role in user.roles]
 
         # Update button styles based on user's roles
@@ -1298,7 +1295,7 @@ class SelfRoles(commands.Cog):
 
         # Verify message exists
         try:
-            old_message = await channel.fetch_message(message_id)
+            await channel.fetch_message(message_id)
         except (discord.NotFound, discord.Forbidden):
             await ctx.send("❌ Original message not found. It may have been deleted.")
             return
@@ -1478,9 +1475,6 @@ class SelfRoles(commands.Cog):
 
         # Re-send message
         embed_data = config.get("embed_data", {})
-        assignments = config.get("assignments", [])
-        groups = config.get("groups", {})
-
         embed = await self._create_embed(embed_data, ctx.guild)
 
         view = RoleAssignmentView(self, 0)

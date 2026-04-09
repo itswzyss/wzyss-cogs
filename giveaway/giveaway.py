@@ -1523,7 +1523,6 @@ class Giveaway(commands.Cog):
                         for wid in new_winner_ids:
                             m = ctx.guild.get_member(wid)
                             winner_mentions.append(m.mention if m else f"<@{wid}>")
-                        claim_secs = data.get("claim_seconds", 0)
                         announcement = (
                             "Rerolled! New winner" + ("s" if len(new_winner_ids) != 1 else "") + ": "
                             + ", ".join(winner_mentions) + ". Claim your prize using the button on the giveaway message above."

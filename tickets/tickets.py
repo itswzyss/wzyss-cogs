@@ -6,15 +6,15 @@ import asyncio
 import logging
 import re
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import timedelta
+from typing import Dict, List, Optional, Tuple
 
 import discord
 from discord.ui import Button, Modal, TextInput, View
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 from redbot.core.commands.converter import parse_timedelta
-from redbot.core.utils.chat_formatting import box, humanize_timedelta
+from redbot.core.utils.chat_formatting import humanize_timedelta
 
 log = logging.getLogger("red.wzyss-cogs.tickets")
 
@@ -388,7 +388,6 @@ class Tickets(commands.Cog):
             except (ValueError, TypeError):
                 continue
             created_at = data.get("created_at") or 0
-            last_ts = data.get("last_message_ts") or created_at
             if delay_sec and created_at:
                 remaining = max(0, delay_sec - (now - created_at))
                 if remaining > 0:

@@ -1,4 +1,4 @@
-from .autovc import setup
+from .autovc import setup as setup
 
 __red_end_user_data_statement__ = (
     "This cog stores configured source voice channels, created voice channels, "

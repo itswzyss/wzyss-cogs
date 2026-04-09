@@ -1,4 +1,4 @@
-from .lfg import setup
+from .lfg import setup as setup
 
 __red_end_user_data_statement__ = (
     "This cog stores per-guild game lists, per-user availability and DM notify opt-in, "

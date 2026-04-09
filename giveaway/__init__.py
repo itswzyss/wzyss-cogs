@@ -1,4 +1,4 @@
-from .giveaway import setup
+from .giveaway import setup as setup
 
 __red_end_user_data_statement__ = (
     "This cog stores giveaway data including host, prize, end time, entries (user IDs), "

@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import discord
 from redbot.core import Config, commands
 from redbot.core.bot import Red
-from redbot.core.utils.chat_formatting import box, pagify
+from redbot.core.utils.chat_formatting import pagify
 
 log = logging.getLogger("red.wzyss-cogs.massrole")
 

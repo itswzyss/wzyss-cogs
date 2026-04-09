@@ -1,4 +1,4 @@
-from .applications import setup
+from .applications import setup as setup
 
 __red_end_user_data_statement__ = (
     "This cog stores application data including user responses to application forms, "

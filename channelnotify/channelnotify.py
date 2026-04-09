@@ -1,11 +1,10 @@
 import logging
-from typing import Dict, List, Optional
-from datetime import datetime, timedelta
+from typing import Dict
+from datetime import datetime
 
 import discord
 from redbot.core import Config, commands
 from redbot.core.bot import Red
-from redbot.core.utils.chat_formatting import box
 
 log = logging.getLogger("red.wzyss-cogs.channelnotify")
 

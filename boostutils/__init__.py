@@ -1,4 +1,4 @@
-from .boostutils import setup
+from .boostutils import setup as setup
 
 __red_end_user_data_statement__ = (
     "This cog stores per-guild configuration for tracked roles and boost notifications, "

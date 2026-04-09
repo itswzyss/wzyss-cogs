@@ -1,6 +1,6 @@
 import re
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List
 from datetime import datetime
 
 import discord

@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import random
-import re
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -11,7 +10,6 @@ import discord
 from discord.ui import View
 from redbot.core import Config, commands
 from redbot.core.bot import Red
-from redbot.core.utils.chat_formatting import box
 
 log = logging.getLogger("red.wzyss-cogs.counting")
 

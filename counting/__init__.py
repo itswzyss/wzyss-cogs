@@ -1,4 +1,4 @@
-from .counting import setup
+from .counting import setup as setup
 
 __red_end_user_data_statement__ = (
     "This cog stores counting channel configurations and current count state on a per-guild basis. "

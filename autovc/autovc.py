@@ -7,7 +7,6 @@ import discord
 from discord.ui import Button, Modal, TextInput, View
 from redbot.core import Config, commands
 from redbot.core.bot import Red
-from redbot.core.utils.chat_formatting import box, pagify
 
 log = logging.getLogger("red.wzyss-cogs.autovc")
 

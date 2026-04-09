@@ -1,4 +1,4 @@
-from .selfroles import setup
+from .selfroles import setup as setup
 
 __red_end_user_data_statement__ = (
     "This cog stores role assignment message configurations on a per-guild basis. "

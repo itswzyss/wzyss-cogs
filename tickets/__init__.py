@@ -1,4 +1,4 @@
-from .tickets import setup
+from .tickets import setup as setup
 
 __red_end_user_data_statement__ = (
     "This cog stores ticket configuration (panel channel, category, roles, embed settings) "

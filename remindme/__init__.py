@@ -1,4 +1,4 @@
-from .remindme import setup
+from .remindme import setup as setup
 
 __red_end_user_data_statement__ = (
     "This cog stores reminder timers (user id, channel/guild ids, end time, delivery preference, optional name), "

@@ -1,5 +1,5 @@
 import re
-from typing import Dict, Optional, Pattern, Tuple, List
+from typing import Dict, Optional, Pattern, Tuple
 
 import discord
 from redbot.core import Config, checks, commands
