@@ -354,6 +354,133 @@ class AddRoleModal(Modal):
             await self.builder_view.refresh(interaction)
 
 
+class EditRoleModal(Modal):
+    """Modal for editing an existing role assignment."""
+
+    def __init__(
+        self,
+        cog: "SelfRoles",
+        role: discord.Role,
+        assignment: Dict,
+        builder_view: "RoleBuilderView",
+    ):
+        super().__init__(title=f"Edit Role: {role.name[:40]}")
+        self.cog = cog
+        self.role = role
+        self.assignment = assignment
+        self.builder_view = builder_view
+
+        self.method_input = TextInput(
+            label="Method (button/reaction/both/command)",
+            default=assignment.get("method", "button"),
+            required=True,
+            max_length=20,
+        )
+        self.add_item(self.method_input)
+
+        self.label_input = TextInput(
+            label="Button Label (optional, for button/both)",
+            default=assignment.get("button_label", role.name),
+            required=False,
+            max_length=80,
+        )
+        self.add_item(self.label_input)
+
+        # Pre-fill with whichever emoji is set (button or reaction)
+        existing_emoji = (
+            assignment.get("button_emoji")
+            or assignment.get("reaction_emoji")
+            or ""
+        )
+        self.emoji_input = TextInput(
+            label="Emoji (optional)",
+            placeholder="😀 or <:name:123456789>",
+            default=existing_emoji,
+            required=False,
+            max_length=100,
+        )
+        self.add_item(self.emoji_input)
+
+        self.group_input = TextInput(
+            label="Group ID (optional, for exclusive groups)",
+            default=assignment.get("group_id", ""),
+            required=False,
+            max_length=50,
+        )
+        self.add_item(self.group_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        method = self.method_input.value.strip().lower()
+        if method not in ["button", "reaction", "both", "command"]:
+            await interaction.response.send_message(
+                "❌ Invalid method. Use: button, reaction, both, or command",
+                ephemeral=True,
+            )
+            return
+
+        label = self.label_input.value.strip() if self.label_input.value else None
+        emoji = self.emoji_input.value.strip() if self.emoji_input.value else None
+        group_id = self.group_input.value.strip() if self.group_input.value else None
+
+        user_id = interaction.user.id
+        state = self.cog._builder_states.get(user_id)
+        if not state:
+            await interaction.response.send_message(
+                "❌ No builder session found.", ephemeral=True
+            )
+            return
+
+        assignments = state.get("assignments", [])
+        idx = next(
+            (i for i, a in enumerate(assignments) if a.get("role_id") == self.role.id),
+            None,
+        )
+        if idx is None:
+            await interaction.response.send_message(
+                "❌ Assignment not found.", ephemeral=True
+            )
+            return
+
+        updated: Dict = {"role_id": self.role.id, "method": method}
+
+        if method in ["button", "both"]:
+            button_label = label or self.role.name
+            if len(button_label) > 80:
+                button_label = button_label[:77] + "..."
+            updated["button_label"] = button_label
+            updated["button_emoji"] = self.cog._parse_emoji(emoji) if emoji else None
+
+        if method in ["reaction", "both"]:
+            updated["reaction_emoji"] = self.cog._parse_emoji(emoji) if emoji else None
+
+        # Handle group membership changes
+        old_group = self.assignment.get("group_id")
+        groups = state.get("groups", {})
+        if old_group and old_group != group_id:
+            # Remove from old group
+            if old_group in groups and self.role.id in groups[old_group]:
+                groups[old_group].remove(self.role.id)
+                if not groups[old_group]:
+                    del groups[old_group]
+        if group_id:
+            updated["group_id"] = group_id
+            if group_id not in groups:
+                groups[group_id] = []
+            if self.role.id not in groups[group_id]:
+                groups[group_id].append(self.role.id)
+        state["groups"] = groups
+
+        assignments[idx] = updated
+        state["assignments"] = assignments
+
+        await interaction.response.send_message(
+            f"✅ Updated role {self.role.mention}.", ephemeral=True
+        )
+
+        if self.builder_view.message:
+            await self.builder_view.refresh(interaction)
+
+
 class RoleSelectMenu(Select):
     """Select menu for choosing a role to edit or delete."""
 
@@ -439,11 +566,9 @@ class RoleSelectMenu(Select):
                 f"✅ Removed role {role.mention}.", ephemeral=True
             )
             await self.builder_view.refresh(interaction)
-        else:
-            await interaction.response.send_message(
-                "❌ Edit action not yet implemented. Delete and re-add the role.",
-                ephemeral=True,
-            )
+        elif self.action == "edit":
+            modal = EditRoleModal(self.cog, role, assignment, self.builder_view)
+            await interaction.response.send_modal(modal)
 
 
 class RoleBuilderView(View):
@@ -592,6 +717,31 @@ class RoleBuilderView(View):
         modal = AddRoleModal(self.cog)
         modal.builder_view = self
         await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Edit Role", style=discord.ButtonStyle.secondary, emoji="✏️")
+    async def edit_role(self, interaction: discord.Interaction, button: Button):
+        """Open select menu to edit a role."""
+        user_id = interaction.user.id
+        if user_id not in self.cog._builder_states:
+            await interaction.response.send_message(
+                "❌ No builder session found. Add roles first.", ephemeral=True
+            )
+            return
+
+        state = self.cog._builder_states[user_id]
+        assignments = state.get("assignments", [])
+        if not assignments:
+            await interaction.response.send_message(
+                "❌ No roles to edit. Add roles first.", ephemeral=True
+            )
+            return
+
+        view = View(timeout=60)
+        select_menu = RoleSelectMenu(self.cog, assignments, "edit", self)
+        view.add_item(select_menu)
+        await interaction.response.send_message(
+            "Select a role to edit:", view=view, ephemeral=True
+        )
 
     @discord.ui.button(label="Remove Role", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def remove_role(self, interaction: discord.Interaction, button: Button):

@@ -197,7 +197,6 @@ class Announcer(commands.Cog):
             icon_url=message.author.display_avatar.url,
         )
         embed.add_field(name="Server", value=guild.name, inline=True)
-        embed.add_field(name="Channel", value=f"#{channel.name}", inline=True)
         if cfg["jump_link"]:
             embed.add_field(
                 name="Jump to message",
