@@ -2625,17 +2625,17 @@ class Applications(commands.Cog):
             content = ""
         elif event_type == "approved":
             embed = await self.create_log_embed(member, "approved", decision_maker=decision_maker)
-            content = f"✅ Application approved by {decision_maker.mention if decision_maker else 'Unknown'}"
+            content = f"✅ Application approved by {str(decision_maker) if decision_maker else 'Unknown'}"
         elif event_type == "denied":
             embed = await self.create_log_embed(
                 member, "denied", decision_maker=decision_maker, reason=reason
             )
-            content = f"❌ Application denied by {decision_maker.mention if decision_maker else 'Unknown'}"
+            content = f"❌ Application denied by {str(decision_maker) if decision_maker else 'Unknown'}"
         elif event_type == "early_closed":
             embed = await self.create_log_embed(
                 member, "early_closed", decision_maker=decision_maker, reason="Application closed before submission."
             )
-            content = f"📋 Application closed (no submission) by {decision_maker.mention if decision_maker else 'Unknown'}"
+            content = f"📋 Application closed (no submission) by {str(decision_maker) if decision_maker else 'Unknown'}"
         else:
             return
 
