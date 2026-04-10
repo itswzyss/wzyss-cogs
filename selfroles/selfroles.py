@@ -1477,6 +1477,7 @@ class SelfRoles(commands.Cog):
         embed_data = config.get("embed_data", {})
         embed = await self._create_embed(embed_data, ctx.guild)
 
+        assignments = config.get("assignments", [])
         view = RoleAssignmentView(self, 0)
         for assignment in assignments:
             role_id = assignment.get("role_id")
@@ -1521,6 +1522,102 @@ class SelfRoles(commands.Cog):
         view.message_id = message.id
 
         await ctx.send(f"✅ Refreshed role assignment message!")
+
+    @_selfroles.command(name="refreshall")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def _refreshall(self, ctx: commands.Context, channel: discord.TextChannel):
+        """Re-send all role assignment messages in a channel in order.
+
+        Deletes every configured panel in the channel and re-sends them
+        consecutively so they appear together with no timestamp gaps.
+        Panels are re-sent oldest-first (by original message ID).
+        """
+        all_messages = await self.config.guild(ctx.guild).messages()
+
+        # Collect entries belonging to the target channel, sorted oldest → newest
+        entries = sorted(
+            [
+                (int(mid), cfg)
+                for mid, cfg in all_messages.items()
+                if cfg.get("channel_id") == channel.id
+            ],
+            key=lambda x: x[0],
+        )
+
+        if not entries:
+            await ctx.send(f"No role assignment messages configured in {channel.mention}.")
+            return
+
+        status = await ctx.send(
+            f"Refreshing {len(entries)} panel(s) in {channel.mention}…"
+        )
+
+        id_remap: dict[int, int] = {}  # old_id -> new_id
+
+        for old_id, config in entries:
+            # Delete old message if it still exists
+            try:
+                old_msg = await channel.fetch_message(old_id)
+                await old_msg.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+            embed_data = config.get("embed_data", {})
+            assignments = config.get("assignments", [])
+
+            embed = await self._create_embed(embed_data, ctx.guild)
+
+            view = RoleAssignmentView(self, 0)
+            for assignment in assignments:
+                role_id = assignment.get("role_id")
+                role = ctx.guild.get_role(role_id)
+                if not role:
+                    continue
+                method = assignment.get("method", "button")
+                if method in ["button", "both"]:
+                    button_label = assignment.get("button_label", role.name)
+                    button_emoji = assignment.get("button_emoji")
+                    view.add_item(
+                        RoleButton(
+                            self,
+                            role_id,
+                            button_label,
+                            emoji=self._parse_emoji(button_emoji) if button_emoji else None,
+                        )
+                    )
+
+            try:
+                new_msg = await channel.send(
+                    embed=embed, view=view if view.children else None
+                )
+            except discord.HTTPException as e:
+                await ctx.send(f"❌ Error sending panel (old ID {old_id}): {e}")
+                continue
+
+            for assignment in assignments:
+                method = assignment.get("method", "button")
+                if method in ["reaction", "both"]:
+                    reaction_emoji = assignment.get("reaction_emoji")
+                    if reaction_emoji:
+                        try:
+                            await new_msg.add_reaction(reaction_emoji)
+                        except (discord.HTTPException, discord.InvalidArgument):
+                            pass
+
+            view.message_id = new_msg.id
+            id_remap[old_id] = new_msg.id
+
+        # Update config: swap old IDs for new IDs
+        for old_id, new_id in id_remap.items():
+            cfg = all_messages.pop(str(old_id))
+            cfg["channel_id"] = channel.id
+            all_messages[str(new_id)] = cfg
+
+        await self.config.guild(ctx.guild).messages.set(all_messages)
+
+        await status.edit(
+            content=f"✅ Re-sent {len(id_remap)} panel(s) in {channel.mention}."
+        )
 
     @commands.command(name="role")
     @commands.guild_only()

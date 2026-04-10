@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing Announcer! Use `[p]help announcer` to get started.",
+    "name": "Announcer",
+    "short": "Forward channel messages to subscribed role members via DM.",
+    "description": "When a message is posted in a configured channel, the bot reacts with 📢. The message author or any member with Manage Messages can click the reaction to broadcast the message as a DM to all members of the configured role. Supports multiple channel/role pairs.",
+    "tags": ["announcements", "dm", "notifications", "roles", "utility"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
