@@ -235,6 +235,8 @@ class Counting(commands.Cog):
             "saves_max_per_user": 3,
             "saves_drop_chance": 0.01,  # 1% per valid count
             "saves_participation_threshold": 100,  # lifetime counts needed to be eligible for drops
+            # channel_id -> previous @everyone send_messages value before shutdown lock (True/False/None)
+            "shutdown_lock_state": {},
         }
 
         default_member = {
@@ -253,6 +255,103 @@ class Counting(commands.Cog):
 
         # Channel description update task
         self.description_update_task: Optional[asyncio.Task] = None
+
+    async def _lock_counting_channels_for_shutdown(self) -> int:
+        """Set enabled counting channels to read-only and store previous send_messages state."""
+        total_locked = 0
+        for guild in self.bot.guilds:
+            channels_data = await self.config.guild(guild).channels()
+            enabled_channels = self._enabled_counting_text_channels(guild, channels_data)
+            if not enabled_channels:
+                continue
+
+            lock_state = dict(await self.config.guild(guild).shutdown_lock_state() or {})
+            lock_state_changed = False
+            everyone = guild.default_role
+            for channel, _ in enabled_channels:
+                overwrite = channel.overwrites_for(everyone)
+                prev_send_messages = overwrite.send_messages
+                cid_str = str(channel.id)
+
+                if cid_str not in lock_state:
+                    lock_state[cid_str] = prev_send_messages
+                    lock_state_changed = True
+
+                if prev_send_messages is False:
+                    continue
+
+                overwrite.send_messages = False
+                try:
+                    await channel.set_permissions(
+                        everyone,
+                        overwrite=overwrite,
+                        reason="Counting: lock channel during bot shutdown/restart",
+                    )
+                    total_locked += 1
+                except (discord.Forbidden, discord.HTTPException):
+                    log.warning(
+                        "Failed to lock counting channel %s in guild %s during shutdown",
+                        channel.id,
+                        guild.id,
+                    )
+
+            if lock_state_changed:
+                await self.config.guild(guild).shutdown_lock_state.set(lock_state)
+
+        return total_locked
+
+    async def _restore_counting_channels_after_startup(self) -> int:
+        """Restore counting channel send_messages permissions saved during shutdown lock."""
+        total_restored = 0
+        for guild in self.bot.guilds:
+            lock_state = dict(await self.config.guild(guild).shutdown_lock_state() or {})
+            if not lock_state:
+                continue
+
+            everyone = guild.default_role
+            for cid_str, previous_send_messages in lock_state.items():
+                try:
+                    cid = int(cid_str)
+                except (TypeError, ValueError):
+                    continue
+
+                channel = guild.get_channel(cid)
+                if not channel or not isinstance(channel, discord.TextChannel):
+                    continue
+
+                overwrite = channel.overwrites_for(everyone)
+                desired = (
+                    previous_send_messages
+                    if previous_send_messages in (True, False, None)
+                    else None
+                )
+                if overwrite.send_messages == desired:
+                    continue
+
+                overwrite.send_messages = desired
+                try:
+                    await channel.set_permissions(
+                        everyone,
+                        overwrite=overwrite,
+                        reason="Counting: restore channel permissions after startup",
+                    )
+                    total_restored += 1
+                except (discord.Forbidden, discord.HTTPException):
+                    log.warning(
+                        "Failed to restore counting channel %s in guild %s after startup",
+                        channel.id,
+                        guild.id,
+                    )
+
+            await self.config.guild(guild).shutdown_lock_state.set({})
+
+        return total_restored
+
+    async def cog_load(self):
+        """Restore counting channel permissions after bot startup/reload."""
+        restored = await self._restore_counting_channels_after_startup()
+        if restored:
+            log.info("Counting cog startup restored send permissions in %s channel(s)", restored)
 
     def _contributor_rank_lines(
         self, guild: discord.Guild, contributions: Dict[str, int], label: str = "count"
@@ -1681,13 +1780,17 @@ class Counting(commands.Cog):
             except discord.Forbidden:
                 pass
     
-    def cog_unload(self):
-        """Cleanup when cog is unloaded."""
+    async def cog_unload(self):
+        """Cleanup when cog is unloaded and lock counting channels."""
+        locked = await self._lock_counting_channels_for_shutdown()
         if self.reaction_task and not self.reaction_task.done():
             self.reaction_task.cancel()
         if self.description_update_task and not self.description_update_task.done():
             self.description_update_task.cancel()
-        log.info("Counting cog unloaded, background tasks stopped")
+        log.info(
+            "Counting cog unloaded, background tasks stopped, %s counting channel(s) locked",
+            locked,
+        )
 
 
 async def setup(bot: Red):
