@@ -255,6 +255,7 @@ class Counting(commands.Cog):
 
         # Channel description update task
         self.description_update_task: Optional[asyncio.Task] = None
+        self._startup_restore_task: Optional[asyncio.Task] = None
 
     async def _lock_counting_channels_for_shutdown(self) -> int:
         """Set enabled counting channels to read-only for roles that can access/send."""
@@ -336,6 +337,7 @@ class Counting(commands.Cog):
             if not lock_state:
                 continue
 
+            remaining_state: Dict[str, dict] = {}
             for cid_str, saved_channel_state in lock_state.items():
                 try:
                     cid = int(cid_str)
@@ -357,6 +359,7 @@ class Counting(commands.Cog):
                     # Compatibility with previous state format that only tracked @everyone.
                     role_state[str(guild.default_role.id)] = saved_channel_state
 
+                remaining_roles: Dict[str, Optional[bool]] = {}
                 for rid_str, previous_send_messages in role_state.items():
                     try:
                         rid = int(rid_str)
@@ -385,6 +388,7 @@ class Counting(commands.Cog):
                         )
                         total_restored += 1
                     except (discord.Forbidden, discord.HTTPException):
+                        remaining_roles[rid_str] = desired
                         log.warning(
                             "Failed to restore counting channel %s for role %s in guild %s after startup",
                             channel.id,
@@ -392,15 +396,24 @@ class Counting(commands.Cog):
                             guild.id,
                         )
 
-            await self.config.guild(guild).shutdown_lock_state.set({})
+                if remaining_roles:
+                    remaining_state[cid_str] = {"roles": remaining_roles}
+
+            await self.config.guild(guild).shutdown_lock_state.set(remaining_state)
 
         return total_restored
 
-    async def cog_load(self):
-        """Restore counting channel permissions after bot startup/reload."""
+    async def _restore_counting_channels_when_ready(self):
+        await self.bot.wait_until_ready()
         restored = await self._restore_counting_channels_after_startup()
         if restored:
             log.info("Counting cog startup restored send permissions in %s channel(s)", restored)
+
+    async def cog_load(self):
+        """Restore counting channel permissions after bot startup/reload."""
+        self._startup_restore_task = asyncio.create_task(
+            self._restore_counting_channels_when_ready()
+        )
 
     def _contributor_rank_lines(
         self, guild: discord.Guild, contributions: Dict[str, int], label: str = "count"
@@ -1831,6 +1844,8 @@ class Counting(commands.Cog):
     
     async def cog_unload(self):
         """Cleanup when cog is unloaded and lock counting channels."""
+        if self._startup_restore_task and not self._startup_restore_task.done():
+            self._startup_restore_task.cancel()
         locked = await self._lock_counting_channels_for_shutdown()
         if self.reaction_task and not self.reaction_task.done():
             self.reaction_task.cancel()
