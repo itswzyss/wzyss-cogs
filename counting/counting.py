@@ -235,7 +235,7 @@ class Counting(commands.Cog):
             "saves_max_per_user": 3,
             "saves_drop_chance": 0.01,  # 1% per valid count
             "saves_participation_threshold": 100,  # lifetime counts needed to be eligible for drops
-            # channel_id -> previous @everyone send_messages value before shutdown lock (True/False/None)
+            # channel_id -> {"roles": {role_id: previous send_messages value before shutdown lock}}
             "shutdown_lock_state": {},
         }
 
@@ -257,7 +257,7 @@ class Counting(commands.Cog):
         self.description_update_task: Optional[asyncio.Task] = None
 
     async def _lock_counting_channels_for_shutdown(self) -> int:
-        """Set enabled counting channels to read-only and store previous send_messages state."""
+        """Set enabled counting channels to read-only for roles that can access/send."""
         total_locked = 0
         for guild in self.bot.guilds:
             channels_data = await self.config.guild(guild).channels()
@@ -267,33 +267,61 @@ class Counting(commands.Cog):
 
             lock_state = dict(await self.config.guild(guild).shutdown_lock_state() or {})
             lock_state_changed = False
-            everyone = guild.default_role
             for channel, _ in enabled_channels:
-                overwrite = channel.overwrites_for(everyone)
-                prev_send_messages = overwrite.send_messages
                 cid_str = str(channel.id)
+                channel_state = lock_state.get(cid_str)
+                role_state: Dict[str, Optional[bool]] = {}
+                if isinstance(channel_state, dict):
+                    raw_roles = channel_state.get("roles", {})
+                    if isinstance(raw_roles, dict):
+                        for rid, value in raw_roles.items():
+                            if value in (True, False, None):
+                                role_state[str(rid)] = value
+                elif channel_state in (True, False, None):
+                    # Compatibility with previous state format that only tracked @everyone.
+                    role_state[str(guild.default_role.id)] = channel_state
 
-                if cid_str not in lock_state:
-                    lock_state[cid_str] = prev_send_messages
+                roles_to_check: Dict[int, discord.Role] = {guild.default_role.id: guild.default_role}
+                for target in channel.overwrites:
+                    if isinstance(target, discord.Role):
+                        roles_to_check[target.id] = target
+
+                for role in roles_to_check.values():
+                    perms = channel.permissions_for(role)
+                    if not (perms.view_channel and perms.send_messages):
+                        continue
+
+                    overwrite = channel.overwrites_for(role)
+                    prev_send_messages = overwrite.send_messages
+                    rid_str = str(role.id)
+
+                    if rid_str not in role_state:
+                        role_state[rid_str] = prev_send_messages
+                        lock_state_changed = True
+
+                    if prev_send_messages is False:
+                        continue
+
+                    overwrite.send_messages = False
+                    try:
+                        await channel.set_permissions(
+                            role,
+                            overwrite=overwrite,
+                            reason="Counting: lock channel during bot shutdown/restart",
+                        )
+                        total_locked += 1
+                    except (discord.Forbidden, discord.HTTPException):
+                        log.warning(
+                            "Failed to lock counting channel %s for role %s in guild %s during shutdown",
+                            channel.id,
+                            role.id,
+                            guild.id,
+                        )
+
+                new_channel_state = {"roles": role_state}
+                if lock_state.get(cid_str) != new_channel_state:
+                    lock_state[cid_str] = new_channel_state
                     lock_state_changed = True
-
-                if prev_send_messages is False:
-                    continue
-
-                overwrite.send_messages = False
-                try:
-                    await channel.set_permissions(
-                        everyone,
-                        overwrite=overwrite,
-                        reason="Counting: lock channel during bot shutdown/restart",
-                    )
-                    total_locked += 1
-                except (discord.Forbidden, discord.HTTPException):
-                    log.warning(
-                        "Failed to lock counting channel %s in guild %s during shutdown",
-                        channel.id,
-                        guild.id,
-                    )
 
             if lock_state_changed:
                 await self.config.guild(guild).shutdown_lock_state.set(lock_state)
@@ -308,8 +336,7 @@ class Counting(commands.Cog):
             if not lock_state:
                 continue
 
-            everyone = guild.default_role
-            for cid_str, previous_send_messages in lock_state.items():
+            for cid_str, saved_channel_state in lock_state.items():
                 try:
                     cid = int(cid_str)
                 except (TypeError, ValueError):
@@ -319,29 +346,51 @@ class Counting(commands.Cog):
                 if not channel or not isinstance(channel, discord.TextChannel):
                     continue
 
-                overwrite = channel.overwrites_for(everyone)
-                desired = (
-                    previous_send_messages
-                    if previous_send_messages in (True, False, None)
-                    else None
-                )
-                if overwrite.send_messages == desired:
-                    continue
+                role_state: Dict[str, Optional[bool]] = {}
+                if isinstance(saved_channel_state, dict):
+                    raw_roles = saved_channel_state.get("roles", {})
+                    if isinstance(raw_roles, dict):
+                        for rid, value in raw_roles.items():
+                            if value in (True, False, None):
+                                role_state[str(rid)] = value
+                elif saved_channel_state in (True, False, None):
+                    # Compatibility with previous state format that only tracked @everyone.
+                    role_state[str(guild.default_role.id)] = saved_channel_state
 
-                overwrite.send_messages = desired
-                try:
-                    await channel.set_permissions(
-                        everyone,
-                        overwrite=overwrite,
-                        reason="Counting: restore channel permissions after startup",
+                for rid_str, previous_send_messages in role_state.items():
+                    try:
+                        rid = int(rid_str)
+                    except (TypeError, ValueError):
+                        continue
+
+                    role = guild.get_role(rid)
+                    if not role:
+                        continue
+
+                    overwrite = channel.overwrites_for(role)
+                    desired = (
+                        previous_send_messages
+                        if previous_send_messages in (True, False, None)
+                        else None
                     )
-                    total_restored += 1
-                except (discord.Forbidden, discord.HTTPException):
-                    log.warning(
-                        "Failed to restore counting channel %s in guild %s after startup",
-                        channel.id,
-                        guild.id,
-                    )
+                    if overwrite.send_messages == desired:
+                        continue
+
+                    overwrite.send_messages = desired
+                    try:
+                        await channel.set_permissions(
+                            role,
+                            overwrite=overwrite,
+                            reason="Counting: restore channel permissions after startup",
+                        )
+                        total_restored += 1
+                    except (discord.Forbidden, discord.HTTPException):
+                        log.warning(
+                            "Failed to restore counting channel %s for role %s in guild %s after startup",
+                            channel.id,
+                            role.id,
+                            guild.id,
+                        )
 
             await self.config.guild(guild).shutdown_lock_state.set({})
 
