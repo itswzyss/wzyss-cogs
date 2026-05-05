@@ -4467,16 +4467,20 @@ class Applications(commands.Cog):
         self, interaction: discord.Interaction, member: discord.Member
     ):
         """Approve application from button interaction."""
+        # Acknowledge within Discord's 3s window, then do heavier work.
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+
         applications = await self.config.guild(interaction.guild).applications()
         if str(member.id) not in applications:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"❌ {member.mention} does not have an active application.", ephemeral=True
             )
             return
 
         app_data = applications[str(member.id)]
         if app_data.get("status") != "pending":
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"❌ This application is already {app_data.get('status')}.", ephemeral=True
             )
             return
@@ -4507,11 +4511,10 @@ class Applications(commands.Cog):
         if await self.config.guild(interaction.guild).approval_send_dm():
             await self._send_approval_dm(interaction.guild, member)
 
-        # Respond to interaction
-        if not interaction.response.is_done():
-            await interaction.response.send_message(
-                f"✅ Approved {member.mention}'s application.", ephemeral=True
-            )
+        # Send confirmation (interaction already deferred)
+        await interaction.followup.send(
+            f"✅ Approved {member.mention}'s application.", ephemeral=True
+        )
 
         # Update review channel message (new flow)
         await self._update_review_message_after_resolve(interaction.guild, app_data, member, "approved")
