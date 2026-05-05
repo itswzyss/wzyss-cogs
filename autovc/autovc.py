@@ -11,6 +11,7 @@ from redbot.core.bot import Red
 log = logging.getLogger("red.wzyss-cogs.autovc")
 
 PANEL_CUSTOM_ID_PREFIX = "autovc:panel:"
+ACCESS_CUSTOM_ID_PREFIX = "autovc:access:"
 
 
 class SetLimitModal(Modal, title="Set user limit"):
@@ -141,6 +142,205 @@ class VCPanelView(View):
         await self._dispatch(interaction, "rename")
 
 
+class UserSearchModal(Modal, title="Grant VC Access"):
+    search_input = TextInput(
+        label="Search for a user",
+        placeholder="Enter a username or display name",
+        required=True,
+        min_length=1,
+        max_length=100,
+    )
+
+    def __init__(self, cog: "AutoVC"):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+            return
+        vc = interaction.channel
+        if not isinstance(vc, discord.VoiceChannel):
+            vc = interaction.guild.get_channel(interaction.channel_id)
+        if not isinstance(vc, discord.VoiceChannel):
+            await interaction.response.send_message("Could not determine the voice channel.", ephemeral=True)
+            return
+
+        query = self.search_input.value.strip().lower()
+
+        def rank(m: discord.Member) -> int:
+            dn = m.display_name.lower()
+            un = m.name.lower()
+            if dn == query or un == query:
+                return 0
+            if dn.startswith(query) or un.startswith(query):
+                return 1
+            return 2
+
+        candidates = [
+            m for m in interaction.guild.members
+            if not m.bot
+            and m.id != interaction.user.id
+            and (query in m.display_name.lower() or query in m.name.lower())
+        ]
+        candidates.sort(key=rank)
+        truncated = len(candidates) > 25
+        results = candidates[:25]
+
+        if not results:
+            await interaction.response.send_message(
+                f"No members found matching **{discord.utils.escape_markdown(self.search_input.value.strip())}**.",
+                ephemeral=True,
+            )
+            return
+
+        note = "\n*Showing first 25 results — refine your search to narrow down.*" if truncated else ""
+        view = UserSearchResultView(self.cog, results, vc)
+        await interaction.response.send_message(
+            f"Select a user to grant access:{note}",
+            view=view,
+            ephemeral=True,
+        )
+
+
+class UserSearchResultView(View):
+    def __init__(self, cog: "AutoVC", members: List[discord.Member], vc: discord.VoiceChannel):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.vc = vc
+
+        options = [
+            discord.SelectOption(
+                label=m.display_name[:100],
+                value=str(m.id),
+                description=(f"@{m.name}" if m.display_name != m.name else None),
+            )
+            for m in members
+        ]
+        self._select = discord.ui.Select(
+            placeholder="Choose a user...",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
+        self._select.callback = self._on_select
+        self.add_item(self._select)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        if not interaction.guild:
+            return
+        member = interaction.guild.get_member(int(self._select.values[0]))
+        if not member:
+            await interaction.followup.send("User not found — they may have left the server.", ephemeral=True)
+            return
+        try:
+            overwrite = self.vc.overwrites_for(member)
+            overwrite.view_channel = True
+            overwrite.connect = True
+            await self.vc.set_permissions(member, overwrite=overwrite)
+            await interaction.followup.send(
+                f"Granted {member.mention} access to {self.vc.mention}.", ephemeral=True
+            )
+        except discord.HTTPException as e:
+            log.warning(f"Failed to grant VC access: {e}")
+            await interaction.followup.send("Failed to grant access. Check bot permissions.", ephemeral=True)
+
+
+class RevokeSelectView(View):
+    def __init__(self, cog: "AutoVC", members: List[discord.Member], vc: discord.VoiceChannel):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.vc = vc
+
+        options = [
+            discord.SelectOption(
+                label=m.display_name[:100],
+                value=str(m.id),
+                description=(f"@{m.name}" if m.display_name != m.name else None),
+            )
+            for m in members
+        ]
+        self._select = discord.ui.Select(
+            placeholder="Choose a user to remove...",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
+        self._select.callback = self._on_select
+        self.add_item(self._select)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        if not interaction.guild:
+            return
+        member = interaction.guild.get_member(int(self._select.values[0]))
+        if not member:
+            await interaction.followup.send("User not found — they may have left the server.", ephemeral=True)
+            return
+        try:
+            await self.vc.set_permissions(member, overwrite=None)
+            await interaction.followup.send(
+                f"Revoked {member.mention}'s access to {self.vc.mention}.", ephemeral=True
+            )
+        except discord.HTTPException as e:
+            log.warning(f"Failed to revoke VC access: {e}")
+            await interaction.followup.send("Failed to revoke access. Check bot permissions.", ephemeral=True)
+
+
+class AccessManagementView(View):
+    """Persistent view sent in VC chat on creation. Lets the owner grant/revoke user access."""
+
+    def __init__(self, cog: "AutoVC"):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(
+        label="Grant Access",
+        style=discord.ButtonStyle.success,
+        custom_id=f"{ACCESS_CUSTOM_ID_PREFIX}grant",
+    )
+    async def grant_btn(self, interaction: discord.Interaction, button: Button):
+        err = await self.cog._check_access_owner(interaction)
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        await interaction.response.send_modal(UserSearchModal(self.cog))
+
+    @discord.ui.button(
+        label="Revoke Access",
+        style=discord.ButtonStyle.danger,
+        custom_id=f"{ACCESS_CUSTOM_ID_PREFIX}revoke",
+    )
+    async def revoke_btn(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.defer(ephemeral=True)
+        err = await self.cog._check_access_owner(interaction)
+        if err:
+            await interaction.followup.send(err, ephemeral=True)
+            return
+
+        vc = interaction.channel
+        if not isinstance(vc, discord.VoiceChannel):
+            vc = interaction.guild.get_channel(interaction.channel_id)
+        if not isinstance(vc, discord.VoiceChannel):
+            await interaction.followup.send("Could not determine the voice channel.", ephemeral=True)
+            return
+
+        created_vcs = await self.cog.config.guild(interaction.guild).created_vcs()
+        vc_data = created_vcs.get(str(vc.id))
+        owner_id = vc_data.get("owner_id") if vc_data else 0
+
+        whitelisted = self.cog._get_whitelisted_members(vc, owner_id or 0)
+        if not whitelisted:
+            await interaction.followup.send(
+                "No users have been granted access to this VC.", ephemeral=True
+            )
+            return
+
+        view = RevokeSelectView(self.cog, whitelisted, vc)
+        await interaction.followup.send("Select a user to revoke access from:", view=view, ephemeral=True)
+
+
 class AutoVC(commands.Cog):
     """Automatically create voice channels when members join source VCs."""
 
@@ -236,11 +436,57 @@ class AutoVC(commands.Cog):
                 except (discord.HTTPException, discord.NotFound):
                     pass
 
+    async def _check_access_owner(self, interaction: discord.Interaction) -> Optional[str]:
+        """Return an error string if the user is not the AutoVC owner of the interaction's VC."""
+        if not interaction.guild:
+            return "This can only be used in a server."
+        vc = interaction.channel
+        if not isinstance(vc, discord.VoiceChannel):
+            vc = interaction.guild.get_channel(interaction.channel_id)
+        if not isinstance(vc, discord.VoiceChannel):
+            return "This can only be used in a voice channel's chat."
+        created_vcs = await self.config.guild(interaction.guild).created_vcs()
+        vc_data = created_vcs.get(str(vc.id))
+        if not vc_data:
+            return "This VC is not managed by AutoVC."
+        if vc_data.get("owner_id") != interaction.user.id:
+            return "You are not the owner of this VC."
+        return None
+
+    def _get_whitelisted_members(
+        self, vc: discord.VoiceChannel, owner_id: int
+    ) -> List[discord.Member]:
+        """Return members with an explicit connect=True overwrite, excluding the owner."""
+        return [
+            target
+            for target, overwrite in vc.overwrites.items()
+            if isinstance(target, discord.Member)
+            and target.id != owner_id
+            and overwrite.connect is True
+        ]
+
+    async def _send_vc_welcome(self, vc: discord.VoiceChannel) -> None:
+        """Send the access management embed and buttons to the VC's text chat."""
+        embed = discord.Embed(
+            title="Manage VC Access",
+            description=(
+                "Use **Grant Access** to let a specific user join this voice channel, "
+                "or **Revoke Access** to remove someone you previously invited."
+            ),
+            color=await self.bot.get_embed_color(vc.guild),
+        )
+        view = AccessManagementView(self)
+        try:
+            msg = await vc.send(embed=embed, view=view)
+            self.bot.add_view(view, message_id=msg.id)
+        except discord.HTTPException as e:
+            log.warning(f"Failed to send welcome message to VC {vc.id}: {e}")
+
     async def cog_load(self):
         """Called when the cog is loaded."""
         self.cleanup_task = self.bot.loop.create_task(self.cleanup_loop())
-        # Register one global persistent view so panel buttons work after cog reload / bot restart
         self.bot.add_view(VCPanelView(self))
+        self.bot.add_view(AccessManagementView(self))
 
     async def cog_unload(self):
         """Called when the cog is unloaded."""
@@ -1251,6 +1497,8 @@ class AutoVC(commands.Cog):
                         # Move user to new VC
                         try:
                             await member.move_to(new_vc, reason="AutoVC: Created new VC")
+                            if source_config.get("type") in ("personal", "private"):
+                                await self._send_vc_welcome(new_vc)
                         except discord.HTTPException as e:
                             log.error(f"Failed to move user to new VC: {e}")
                         finally:
