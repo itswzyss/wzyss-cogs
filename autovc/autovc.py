@@ -1388,6 +1388,10 @@ class AutoVC(commands.Cog):
             overwrites[base_role] = discord.PermissionOverwrite(
                 view_channel=True, connect=True, speak=True
             )
+            # Explicit owner overwrite so the text chat is always visible to them
+            overwrites[member] = discord.PermissionOverwrite(
+                view_channel=True, connect=True, speak=True
+            )
 
         elif vc_type == "private":
             # Private: hidden from everyone by default
@@ -1398,6 +1402,10 @@ class AutoVC(commands.Cog):
                 overwrites[member_role] = discord.PermissionOverwrite(
                     view_channel=False
                 )
+            # Owner must have an explicit allow or they inherit the deny above
+            overwrites[member] = discord.PermissionOverwrite(
+                view_channel=True, connect=True, speak=True
+            )
 
         # Create the VC
         try:
