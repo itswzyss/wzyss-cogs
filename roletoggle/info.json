@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing RoleToggle! Use `[p]help roletoggle` to see available commands.",
+    "name": "RoleToggle",
+    "short": "Post self-role toggle buttons when configured roles are pinged.",
+    "description": "Automatically posts a role toggle button in the same channel whenever a configured role is pinged. Members can click the button to assign or remove the mapped role.",
+    "tags": ["roles", "self-role", "utility", "automation"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
