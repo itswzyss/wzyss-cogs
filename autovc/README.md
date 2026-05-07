@@ -1,6 +1,6 @@
 # AutoVC
 
-Automatically creates voice channels when members join configured "source" voice channels. Supports three VC types: Public (anyone can join), Personal (owner-controlled, visible), and Private (owner-controlled, hidden). Features automatic cleanup, owner claiming, and temporary roles for channel management.
+Automatically creates voice channels when members join configured "source" voice channels. Supports three VC types: Public (anyone can join), Personal (owner-controlled, visible), and Private (owner-controlled, hidden). Features automatic cleanup, owner claiming, and owner controls through commands and VC chat buttons.
 
 ## Installation
 
@@ -16,9 +16,9 @@ To install this cog, run the following commands in your Red bot:
 
 - **Three VC Types**: Public, Personal, and Private
 - **Automatic VC Creation**: Creates VCs when users join source channels
-- **Owner Management**: Personal and Private VCs have owners; control is via bot commands and VC panel only (no Discord role, so 2FA-for-mods is not triggered)
-- **VC Commands**: Owners use `[p]autovc lock`, `[p]autovc name`, etc. (user commands); admins use `[p]autovcset add`, `[p]autovcset panel toggle`, etc. (admin commands)
-- **VC Panel**: Optional embed with buttons in designated channels for the same controls
+- **Owner Management**: Personal and Private VCs have owners; control is via bot commands and VC chat buttons only (no Discord role, so 2FA-for-mods is not triggered)
+- **VC Commands**: Owners use `[p]autovc lock`, `[p]autovc name`, etc. (user commands); admins use `[p]autovcset add`, etc. (admin commands)
+- **VC Chat Controls**: Auto-posted embeds with buttons in each personal/private VC text chat
 - **Automatic Cleanup**: Empty VCs are automatically deleted
 - **Owner Claiming**: Users can claim VCs after owner leaves (5-minute wait)
 - **Rate Limiting**: Prevents abuse (3 creations per 30 seconds per user)
@@ -101,14 +101,14 @@ Shows current configuration including source VCs count, active VCs, and member r
 
 - **Visibility**: Visible to everyone by default
 - **Owner**: Yes (the user who created it)
-- **Control**: Owner uses bot commands or the VC panel to lock/unlock, hide/show, and set user limit (no Discord role is assigned, so server 2FA-for-mods is not affected)
+- **Control**: Owner uses bot commands or VC chat buttons to lock/unlock, hide/show, set user limit, and rename (no Discord role is assigned, so server 2FA-for-mods is not affected)
 - **Use Case**: Personal voice channels where the owner controls who can join
 
 ### Private VCs
 
 - **Visibility**: Hidden from everyone by default
 - **Owner**: Yes (the user who created it)
-- **Control**: Same as Personal—owner uses bot commands or the VC panel
+- **Control**: Same as Personal—owner uses bot commands or VC chat buttons
 - **Use Case**: Private voice channels that are hidden until the owner invites people
 
 ## Owner Management
@@ -118,7 +118,7 @@ Shows current configuration including source VCs count, active VCs, and member r
 Owners of Personal or Private VCs do **not** receive a Discord role. Control is done only through:
 
 - **User commands** (`[p]autovc` or `/autovc`): lock, unlock, hide, show, limit, name, claim
-- **VC panel**: an embed with buttons in designated channel(s), toggled by admins via `[p]autovcset panel`
+- **VC chat controls**: embeds with buttons are posted automatically in each personal/private VC text chat
 
 This avoids triggering server-wide 2FA requirements for moderators.
 
@@ -133,14 +133,9 @@ You must be in your owned AutoVC (or specify it) to use these. All under `[p]aut
 - `[p]autovc limit <0-99> [vc]` – Set user limit (0 = no limit)
 - `[p]autovc name [new_name] [vc]` – Rename your VC (leave name blank to reset to default, e.g. YourName's VC)
 
-### VC panel (admin)
+### VC chat controls
 
-Admins can enable a **VC panel** in specific text channels: an embed with buttons (Lock VC, Unlock VC, Hide VC, Show VC, Set user limit, Rename VC). Only the owner of the VC they are currently in can use the buttons; the bot performs the action on their behalf.
-
-- `[p]autovcset panel toggle` – Enable or disable the panel (sends or removes panel messages in designated channels)
-- `[p]autovcset panel add <channel>` – Add a channel for the panel
-- `[p]autovcset panel remove <channel>` – Remove a channel from the panel
-- `[p]autovcset panel list` – List panel channels and whether the panel is enabled
+For personal/private VCs, AutoVC posts control embeds directly in that VC's text chat, including buttons for Lock VC, Unlock VC, Hide VC, Show VC, Set user limit, Rename VC, Grant Access, and Revoke Access. Only the owner of that VC can use these buttons; the bot performs the action on their behalf.
 
 ### Claiming VCs
 
@@ -174,7 +169,7 @@ To prevent abuse, users are limited to creating 3 VCs per 30 seconds. If exceede
 
 Commands are split into two groups:
 
-- **Admin** (`[p]autovcset` and `/autovcset`): source VCs, settings, member role, panel
+- **Admin** (`[p]autovcset` and `/autovcset`): source VCs, settings, member role
 - **User** (`[p]autovc` / `[p]avc` and `/autovc`): lock, unlock, hide, show, limit, name, claim
 
 When you use **slash commands** for user commands, AutoVC replies **ephemerally by default** (only you can see the response). Prefix command responses remain normal channel messages.
@@ -186,10 +181,6 @@ When you use **slash commands** for user commands, AutoVC replies **ephemerally 
 - `[p]autovcset list` - List all source VCs
 - `[p]autovcset settings` - Show current settings
 - `[p]autovcset memberrole [role]` - Set or clear member role
-- `[p]autovcset panel toggle` - Enable or disable the VC panel
-- `[p]autovcset panel add <channel>` - Add a panel channel
-- `[p]autovcset panel remove <channel>` - Remove a panel channel
-- `[p]autovcset panel list` - List panel channels
 
 ### User Commands (autovc)
 
@@ -211,7 +202,7 @@ When you use **slash commands** for user commands, AutoVC replies **ephemerally 
 
 ### User Permissions
 
-- `Manage Server` - Required for admin commands (`autovcset`: source VCs, settings, panel)
+- `Manage Server` - Required for admin commands (`autovcset`: source VCs, settings, member role)
 - No special permissions needed for user commands (`autovc`: lock, unlock, hide, show, limit, name, claim)
 
 ## How It Works
@@ -221,7 +212,7 @@ When you use **slash commands** for user commands, AutoVC replies **ephemerally 
 3. **VC creation** → Creates new VC based on source VC type
 4. **Permission setup** → Configures permissions based on VC type
 5. **User moved** → Moves user to newly created VC
-6. **Tracking** → VC is tracked in configuration (owner has no role; control is via commands/panel)
+6. **Tracking** → VC is tracked in configuration (owner has no role; control is via commands/chat buttons)
 7. **Cleanup** → When VC becomes empty, it's automatically deleted
 
 ## Member Role Handling
@@ -253,7 +244,7 @@ Some servers configure @everyone to deny "View Channels" and use a @Member role 
 
 1. Ensure you are the owner of the VC (personal or private type) and are in that VC (or specify it)
 2. Verify bot has `Manage Channels` permission
-3. Use `[p]autovc lock` and related commands, or the VC panel in a designated channel (configured via `[p]autovcset panel`)
+3. Use `[p]autovc lock` and related commands, or use the control buttons in the VC's text chat
 
 ### VCs not being deleted
 
@@ -289,6 +280,5 @@ The cog stores:
 - Created VC tracking (per-guild)
 - Claimable VC timers (per-guild)
 - Member role ID (per-guild)
-- Panel settings: panel_enabled, panel_channel_ids, panel_message_ids (per-guild)
 
 No personal user data is stored beyond channel ownership associations.

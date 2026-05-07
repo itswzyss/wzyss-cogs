@@ -355,9 +355,6 @@ class AutoVC(commands.Cog):
             "created_vcs": {},  # {vc_id: {"source_vc_id": int, "owner_id": int|None, "role_id": int|None, "type": str, "created_at": timestamp}}
             "claimable_vcs": {},  # {vc_id: {"owner_left_at": timestamp, "original_owner": int}}
             "member_role_id": None,  # Optional: role that grants member access (for @Member scenarios)
-            "panel_enabled": False,
-            "panel_channel_ids": [],
-            "panel_message_ids": {},  # {channel_id: message_id}
         }
 
         self.config.register_guild(**default_guild)
@@ -403,39 +400,6 @@ class AutoVC(commands.Cog):
         )
         return embed
 
-    async def _send_panel_to_channel(
-        self, guild: discord.Guild, channel: discord.TextChannel
-    ) -> Optional[discord.Message]:
-        """Send panel embed + view to channel. Store message_id. Return the message or None."""
-        try:
-            view = VCPanelView(self)
-            embed = await self._get_panel_embed(guild)
-            msg = await channel.send(embed=embed, view=view)
-            self.bot.add_view(view, message_id=msg.id)
-            ids = await self.config.guild(guild).panel_message_ids()
-            ids[str(channel.id)] = msg.id
-            await self.config.guild(guild).panel_message_ids.set(ids)
-            return msg
-        except discord.HTTPException as e:
-            log.warning(f"Failed to send panel to {channel.id}: {e}")
-            return None
-
-    async def _remove_panel_from_channel(
-        self, guild: discord.Guild, channel_id: int
-    ) -> None:
-        """Delete panel message from channel and clear stored message_id."""
-        ids = await self.config.guild(guild).panel_message_ids()
-        mid = ids.pop(str(channel_id), None)
-        await self.config.guild(guild).panel_message_ids.set(ids)
-        if mid and isinstance(mid, int):
-            ch = guild.get_channel(channel_id)
-            if isinstance(ch, discord.TextChannel):
-                try:
-                    msg = await ch.fetch_message(mid)
-                    await msg.delete()
-                except (discord.HTTPException, discord.NotFound):
-                    pass
-
     async def _check_access_owner(self, interaction: discord.Interaction) -> Optional[str]:
         """Return an error string if the user is not the AutoVC owner of the interaction's VC."""
         if not interaction.guild:
@@ -466,8 +430,11 @@ class AutoVC(commands.Cog):
         ]
 
     async def _send_vc_welcome(self, vc: discord.VoiceChannel) -> None:
-        """Send the access management embed and buttons to the VC's text chat."""
-        embed = discord.Embed(
+        """Send the owner control panel and access controls to the VC's text chat."""
+        panel_embed = await self._get_panel_embed(vc.guild)
+        panel_view = VCPanelView(self)
+
+        access_embed = discord.Embed(
             title="Manage VC Access",
             description=(
                 "Use **Grant Access** to let a specific user join this voice channel, "
@@ -475,10 +442,12 @@ class AutoVC(commands.Cog):
             ),
             color=await self.bot.get_embed_color(vc.guild),
         )
-        view = AccessManagementView(self)
+        access_view = AccessManagementView(self)
         try:
-            msg = await vc.send(embed=embed, view=view)
-            self.bot.add_view(view, message_id=msg.id)
+            panel_msg = await vc.send(embed=panel_embed, view=panel_view)
+            self.bot.add_view(panel_view, message_id=panel_msg.id)
+            access_msg = await vc.send(embed=access_embed, view=access_view)
+            self.bot.add_view(access_view, message_id=access_msg.id)
         except discord.HTTPException as e:
             log.warning(f"Failed to send welcome message to VC {vc.id}: {e}")
 
@@ -529,7 +498,7 @@ class AutoVC(commands.Cog):
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
     async def _autovcset(self, ctx: commands.Context):
-        """AutoVC admin: source VCs, settings, member role, panel."""
+        """AutoVC admin: source VCs, settings, member role."""
         pass
 
     @_autovcset.command(name="add")
@@ -689,123 +658,6 @@ class AutoVC(commands.Cog):
             )
 
         await ctx.send(embed=embed)
-
-    @_autovcset.group(name="panel")
-    @commands.admin_or_permissions(manage_guild=True)
-    async def _autovcset_panel(self, ctx: commands.Context):
-        """VC panel: embed with buttons for owners to control their VC."""
-        pass
-
-    @_autovcset_panel.command(name="toggle")
-    @commands.admin_or_permissions(manage_guild=True)
-    async def _panel_toggle(self, ctx: commands.Context):
-        """Enable or disable the VC panel in designated channels."""
-        guild = ctx.guild
-        enabled = await self.config.guild(guild).panel_enabled()
-        new_enabled = not enabled
-        await self.config.guild(guild).panel_enabled.set(new_enabled)
-
-        if new_enabled:
-            channel_ids = await self.config.guild(guild).panel_channel_ids()
-            ids = await self.config.guild(guild).panel_message_ids()
-            for cid in channel_ids or []:
-                ch = guild.get_channel(cid)
-                if not isinstance(ch, discord.TextChannel):
-                    continue
-                # Send only if no message or message was deleted; otherwise refresh to latest view
-                mid = ids.get(str(cid)) if ids else None
-                if mid:
-                    try:
-                        msg = await ch.fetch_message(int(mid))
-                        view = VCPanelView(self)
-                        embed = await self._get_panel_embed(guild)
-                        await msg.edit(embed=embed, view=view)
-                        self.bot.add_view(view, message_id=msg.id)
-                        continue
-                    except (discord.NotFound, ValueError, TypeError):
-                        pass
-                await self._send_panel_to_channel(guild, ch)
-            await ctx.send(
-                "VC panel is now **enabled**. Panel message(s) have been sent to the designated channel(s)."
-            )
-        else:
-            ids = await self.config.guild(guild).panel_message_ids()
-            for cid_str in list(ids.keys()):
-                await self._remove_panel_from_channel(guild, int(cid_str))
-            await ctx.send(
-                "VC panel is now **disabled**. Panel message(s) have been removed."
-            )
-
-    @_autovcset_panel.command(name="add")
-    @commands.admin_or_permissions(manage_guild=True)
-    async def _panel_channel_add(
-        self, ctx: commands.Context, channel: discord.TextChannel
-    ):
-        """Add a channel for the VC panel."""
-        guild = ctx.guild
-        channel_ids = await self.config.guild(guild).panel_channel_ids()
-        if channel_ids is None:
-            channel_ids = []
-        if channel.id in channel_ids:
-            await ctx.send(f"{channel.mention} is already a panel channel.")
-            return
-        channel_ids.append(channel.id)
-        await self.config.guild(guild).panel_channel_ids.set(channel_ids)
-        if await self.config.guild(guild).panel_enabled():
-            msg = await self._send_panel_to_channel(guild, channel)
-            if msg:
-                await ctx.send(
-                    f"Added {channel.mention} as a panel channel and sent the panel."
-                )
-            else:
-                await ctx.send(
-                    f"Added {channel.mention} as a panel channel but failed to send the panel. Check bot permissions."
-                )
-        else:
-            await ctx.send(
-                f"Added {channel.mention} as a panel channel. Use `{ctx.clean_prefix}autovcset panel toggle` to enable the panel."
-            )
-
-    @_autovcset_panel.command(name="remove")
-    @commands.admin_or_permissions(manage_guild=True)
-    async def _panel_channel_remove(
-        self, ctx: commands.Context, channel: discord.TextChannel
-    ):
-        """Remove a channel from the VC panel."""
-        guild = ctx.guild
-        channel_ids = await self.config.guild(guild).panel_channel_ids()
-        if channel_ids is None or channel.id not in channel_ids:
-            await ctx.send(f"{channel.mention} is not a panel channel.")
-            return
-        channel_ids = [x for x in channel_ids if x != channel.id]
-        await self.config.guild(guild).panel_channel_ids.set(channel_ids)
-        await self._remove_panel_from_channel(guild, channel.id)
-        await ctx.send(f"Removed {channel.mention} from panel channels.")
-
-    @_autovcset_panel.command(name="list")
-    @commands.admin_or_permissions(manage_guild=True)
-    async def _panel_channel_list(self, ctx: commands.Context):
-        """List channels designated for the VC panel."""
-        guild = ctx.guild
-        channel_ids = await self.config.guild(guild).panel_channel_ids()
-        enabled = await self.config.guild(guild).panel_enabled()
-        if not channel_ids:
-            await ctx.send(
-                "No panel channels are set. Use `autovcset panel add <channel>` to add one."
-            )
-            return
-        lines = [
-            f"Panel is **{'enabled' if enabled else 'disabled'}**.",
-            "",
-            "**Panel channels:**",
-        ]
-        for cid in channel_ids:
-            ch = guild.get_channel(cid)
-            if ch:
-                lines.append(f"- {ch.mention}")
-            else:
-                lines.append(f"- Channel ID `{cid}` (not found)")
-        await ctx.send("\n".join(lines))
 
     @_autovcset.command(name="memberrole")
     @commands.admin_or_permissions(manage_guild=True)
