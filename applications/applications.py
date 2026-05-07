@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -1813,6 +1813,864 @@ class FieldManagerView(View):
         await self.refresh(interaction)
 
 
+class DashboardValueModal(Modal):
+    """Generic modal used by the applications dashboard for setting values."""
+
+    def __init__(
+        self,
+        dashboard_view: "ApplicationsDashboardView",
+        title: str,
+        label: str,
+        placeholder: str,
+        default_value: str,
+        handler: Callable[[discord.Interaction, str], Awaitable[Tuple[bool, str]]],
+        *,
+        style: discord.TextStyle = discord.TextStyle.short,
+    ):
+        super().__init__(title=title)
+        self.dashboard_view = dashboard_view
+        self.handler = handler
+        self.value_input = TextInput(
+            label=label[:45],
+            placeholder=placeholder[:100] if placeholder else None,
+            default=default_value[:4000] if default_value else None,
+            required=True,
+            style=style,
+            max_length=4000,
+        )
+        self.add_item(self.value_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ok, message = await self.handler(interaction, self.value_input.value.strip())
+        if not ok:
+            await interaction.response.send_message(message, ephemeral=True)
+            return
+        await interaction.response.send_message(message, ephemeral=True)
+        await self.dashboard_view.refresh_message()
+
+
+class DMEmbedConfigModal(Modal):
+    """Modal for editing DM embed template fields."""
+
+    def __init__(
+        self,
+        builder_view: "DMEmbedBuilderView",
+        current_data: Dict[str, str],
+    ):
+        super().__init__(title="Configure DM Embed")
+        self.builder_view = builder_view
+        self.title_input = TextInput(
+            label="Embed Title",
+            placeholder="Use placeholders like {guild_name}",
+            default=(current_data.get("title") or "")[:256],
+            required=False,
+            style=discord.TextStyle.short,
+            max_length=256,
+        )
+        self.description_input = TextInput(
+            label="Embed Description",
+            placeholder="Main DM content. Supports placeholders.",
+            default=(current_data.get("description") or "")[:4000],
+            required=True,
+            style=discord.TextStyle.paragraph,
+            max_length=4000,
+        )
+        self.color_input = TextInput(
+            label="Color Hex (optional)",
+            placeholder="Example: #5865F2",
+            default=(current_data.get("color_hex") or "")[:7],
+            required=False,
+            style=discord.TextStyle.short,
+            max_length=7,
+        )
+        self.footer_input = TextInput(
+            label="Footer Text (optional)",
+            placeholder="Supports placeholders",
+            default=(current_data.get("footer") or "")[:2048],
+            required=False,
+            style=discord.TextStyle.short,
+            max_length=2048,
+        )
+        self.thumbnail_input = TextInput(
+            label="Thumbnail URL (optional)",
+            placeholder="https://example.com/image.png",
+            default=(current_data.get("thumbnail_url") or "")[:400],
+            required=False,
+            style=discord.TextStyle.short,
+            max_length=400,
+        )
+        self.add_item(self.title_input)
+        self.add_item(self.description_input)
+        self.add_item(self.color_input)
+        self.add_item(self.footer_input)
+        self.add_item(self.thumbnail_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        color_hex = (self.color_input.value or "").strip()
+        if color_hex and not re.match(r"^#?[0-9a-fA-F]{6}$", color_hex):
+            await interaction.response.send_message(
+                "Invalid color hex. Use format `#RRGGBB`.",
+                ephemeral=True,
+            )
+            return
+        if color_hex and not color_hex.startswith("#"):
+            color_hex = f"#{color_hex}"
+
+        thumbnail_url = (self.thumbnail_input.value or "").strip()
+        if thumbnail_url and not re.match(r"^https?://", thumbnail_url):
+            await interaction.response.send_message(
+                "Thumbnail URL must start with `http://` or `https://`.",
+                ephemeral=True,
+            )
+            return
+
+        self.builder_view.state.update(
+            {
+                "title": (self.title_input.value or "").strip(),
+                "description": (self.description_input.value or "").strip(),
+                "color_hex": color_hex,
+                "footer": (self.footer_input.value or "").strip(),
+                "thumbnail_url": thumbnail_url,
+            }
+        )
+        await interaction.response.send_message("DM embed template updated.", ephemeral=True)
+        await self.builder_view.refresh_message()
+
+
+class DMEmbedBuilderView(View):
+    """Interactive builder for DM embed templates."""
+
+    def __init__(
+        self,
+        cog: "Applications",
+        guild: discord.Guild,
+        owner_user_id: int,
+        template_key: str,
+        state: Dict[str, str],
+        placeholder_keys: List[str],
+        fallback_title: str,
+        fallback_color: str,
+    ):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.guild = guild
+        self.owner_user_id = owner_user_id
+        self.template_key = template_key
+        self.state = state
+        self.placeholder_keys = placeholder_keys
+        self.fallback_title = fallback_title
+        self.fallback_color = fallback_color
+        self.message: Optional[discord.Message] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_user_id:
+            await interaction.response.send_message(
+                "Only the builder owner can use these controls.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+    async def refresh_message(self):
+        if not self.message:
+            return
+        placeholder_text = ", ".join([f"`{{{k}}}`" for k in self.placeholder_keys])
+        embed = discord.Embed(
+            title="DM Embed Builder",
+            description=(
+                f"Template key: `{self.template_key}`\n"
+                f"Available placeholders: {placeholder_text}\n"
+                "Use **Configure** to edit fields, **Preview** to test render, and **Save** to apply."
+            ),
+            color=discord.Color.blurple(),
+        )
+        title_preview = self.state.get("title") or self.fallback_title
+        embed.add_field(name="Current Title", value=title_preview[:1024], inline=False)
+        embed.add_field(
+            name="Description",
+            value=(self.state.get("description") or "Not set")[:1024],
+            inline=False,
+        )
+        if self.state.get("footer"):
+            embed.add_field(name="Footer", value=self.state.get("footer")[:1024], inline=False)
+        try:
+            await self.message.edit(embed=embed, view=self)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    @discord.ui.button(label="Configure", style=discord.ButtonStyle.primary, row=0)
+    async def configure(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_modal(DMEmbedConfigModal(self, self.state))
+
+    @discord.ui.button(label="Preview", style=discord.ButtonStyle.secondary, row=0)
+    async def preview(self, interaction: discord.Interaction, button: Button):
+        sample_member = interaction.user
+        preview_embed = self.cog._build_dm_embed_from_state(
+            self.state,
+            values={
+                "guild_name": self.guild.name,
+                "member_name": sample_member.display_name,
+                "member_mention": sample_member.mention,
+                "user_id": str(sample_member.id),
+                "lobby_channel_mention": "#lobby",
+                "lobby_instructions": "Use the Start Application button in #lobby.",
+                "reason": "Example reason text",
+                "duration": "24 hours",
+                "rejoin_invite": "https://discord.gg/example",
+            },
+            fallback_title=self.fallback_title,
+            fallback_color=self.fallback_color,
+        )
+        await interaction.response.send_message(embed=preview_embed, ephemeral=True)
+
+    @discord.ui.button(label="Save", style=discord.ButtonStyle.success, row=0)
+    async def save(self, interaction: discord.Interaction, button: Button):
+        await getattr(self.cog.config.guild(self.guild), self.template_key).set(dict(self.state))
+        await interaction.response.send_message("DM embed template saved.", ephemeral=True)
+        await self.refresh_message()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, row=0)
+    async def cancel(self, interaction: discord.Interaction, button: Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+
+class DashboardActionButton(Button):
+    """Generic action button used by the paged applications dashboard."""
+
+    def __init__(
+        self,
+        action_id: str,
+        label: str,
+        *,
+        style: discord.ButtonStyle = discord.ButtonStyle.secondary,
+        row: int = 0,
+        disabled: bool = False,
+    ):
+        super().__init__(label=label, style=style, row=row, disabled=disabled)
+        self.action_id = action_id
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if not isinstance(view, ApplicationsDashboardView):
+            await interaction.response.send_message("Dashboard state is unavailable.", ephemeral=True)
+            return
+        await view.handle_action(interaction, self.action_id)
+
+
+class DashboardCategorySelect(Select):
+    """Dropdown selector for dashboard category navigation."""
+
+    def __init__(self, view: "ApplicationsDashboardView"):
+        options = []
+        for idx, name in enumerate(view.PAGE_NAMES):
+            options.append(
+                discord.SelectOption(
+                    label=name,
+                    value=str(idx),
+                    default=(idx == view.page_index),
+                )
+            )
+        super().__init__(
+            placeholder="Select a dashboard category...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=3,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if not isinstance(view, ApplicationsDashboardView):
+            await interaction.response.send_message(
+                "Dashboard state is unavailable.",
+                ephemeral=True,
+            )
+            return
+        selected_page = int(self.values[0])
+        if selected_page != view.page_index:
+            view.page_index = selected_page
+        await view.refresh_message(interaction=interaction)
+
+
+class ApplicationsDashboardView(View):
+    """Interactive dashboard with paged categories for settings management."""
+
+    PAGE_NAMES = [
+        "Overview",
+        "Channels & Panel",
+        "Policy Controls",
+        "Timeouts & Invites",
+        "Form Tools",
+        "DM Templates",
+    ]
+    PAGE_ACTIONS = {
+        0: [
+            ("refresh", "Refresh", discord.ButtonStyle.primary, 0),
+            ("toggle_system", "System", discord.ButtonStyle.secondary, 0),
+            ("toggle_approval_dm", "Approval DM", discord.ButtonStyle.secondary, 0),
+            ("toggle_denial_dm", "Denial DM", discord.ButtonStyle.secondary, 0),
+            ("toggle_early_close_dm", "Early Close DM", discord.ButtonStyle.secondary, 0),
+            ("toggle_delete_interview", "Delete Interview", discord.ButtonStyle.secondary, 1),
+            ("toggle_welcome_dm", "Welcome DM", discord.ButtonStyle.secondary, 1),
+        ],
+        1: [
+            ("set_log_channel", "Set Log Channel", discord.ButtonStyle.primary, 0),
+            ("set_lobby_channel", "Set Lobby Channel", discord.ButtonStyle.primary, 0),
+            ("set_review_channel", "Set Review Channel", discord.ButtonStyle.primary, 0),
+            ("manage_lobby_embed", "Manage Lobby Embed", discord.ButtonStyle.secondary, 1),
+            ("send_lobby_panel", "Send Lobby Panel", discord.ButtonStyle.success, 1),
+        ],
+        2: [
+            ("toggle_approval_dm", "Approval DM", discord.ButtonStyle.secondary, 0),
+            ("toggle_denial_dm", "Denial DM", discord.ButtonStyle.secondary, 0),
+            ("toggle_early_close_dm", "Early Close DM", discord.ButtonStyle.secondary, 0),
+            ("toggle_welcome_dm", "Welcome DM", discord.ButtonStyle.secondary, 0),
+            ("set_denial_action", "Set Denial Action", discord.ButtonStyle.primary, 1),
+            ("set_early_close_action", "Set Early Close Action", discord.ButtonStyle.primary, 1),
+            ("set_denial_tempban", "Set Denial Tempban", discord.ButtonStyle.primary, 2),
+            ("set_early_close_tempban", "Set Early Tempban", discord.ButtonStyle.primary, 2),
+        ],
+        3: [
+            ("set_cleanup_delay", "Set Cleanup Delay", discord.ButtonStyle.primary, 0),
+            ("set_kick_timeout", "Set Kick Timeout", discord.ButtonStyle.primary, 0),
+            ("set_rejoin_invite", "Set Rejoin Invite", discord.ButtonStyle.primary, 0),
+            ("toggle_delete_interview", "Delete Interview", discord.ButtonStyle.secondary, 1),
+        ],
+        4: [
+            ("open_field_manager", "Open Field Manager", discord.ButtonStyle.secondary, 0),
+            ("refresh", "Refresh", discord.ButtonStyle.primary, 0),
+        ],
+        5: [
+            ("set_welcome_dm_template", "Welcome DM Embed", discord.ButtonStyle.primary, 0),
+            ("set_approval_dm_template", "Approval DM Embed", discord.ButtonStyle.primary, 0),
+            ("set_denial_dm_template", "Denial DM Embed", discord.ButtonStyle.primary, 0),
+            ("set_early_close_dm_template", "Early Close DM Embed", discord.ButtonStyle.primary, 1),
+            ("set_rejoin_dm_template", "Rejoin DM Embed", discord.ButtonStyle.primary, 1),
+        ],
+    }
+    DM_TEMPLATE_ACTIONS = {
+        "set_welcome_dm_template": "welcome_dm_embed",
+        "set_approval_dm_template": "approval_dm_embed",
+        "set_denial_dm_template": "denial_dm_embed",
+        "set_early_close_dm_template": "early_close_dm_embed",
+        "set_rejoin_dm_template": "rejoin_dm_embed",
+    }
+    TOGGLE_ACTIONS = {
+        "toggle_system": ("enabled", "System: On", "System: Off", "Application system"),
+        "toggle_approval_dm": ("approval_send_dm", "Approval DM: On", "Approval DM: Off", "Approval DM"),
+        "toggle_denial_dm": ("denial_send_dm", "Denial DM: On", "Denial DM: Off", "Denial DM"),
+        "toggle_early_close_dm": (
+            "early_close_send_dm",
+            "Early Close DM: On",
+            "Early Close DM: Off",
+            "Early close DM",
+        ),
+        "toggle_delete_interview": (
+            "delete_interview_on_resolve",
+            "Delete Interview: On",
+            "Delete Interview: Off",
+            "Delete interview on resolve",
+        ),
+        "toggle_welcome_dm": (
+            "welcome_dm_enabled",
+            "Welcome DM: On",
+            "Welcome DM: Off",
+            "Welcome DM",
+        ),
+    }
+
+    def __init__(self, cog: "Applications", ctx: commands.Context):
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.ctx = ctx
+        self.guild = ctx.guild
+        self.owner_id = ctx.author.id
+        self.message: Optional[discord.Message] = None
+        self.embed_color = discord.Color.blurple()
+        self.page_index = 0
+        self.snapshot: Dict = {}
+
+    async def initialize(self):
+        self.snapshot = await self.cog._get_dashboard_snapshot(self.guild)
+        self._rebuild_items()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the dashboard owner can use these controls.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+    def _toggle_label_style(self, action_id: str) -> Tuple[str, discord.ButtonStyle]:
+        setting_key, on_label, off_label, _ = self.TOGGLE_ACTIONS[action_id]
+        current = bool(self.snapshot.get(setting_key))
+        return (
+            on_label if current else off_label,
+            discord.ButtonStyle.success if current else discord.ButtonStyle.secondary,
+        )
+
+    def _rebuild_items(self):
+        self.clear_items()
+        actions = self.PAGE_ACTIONS.get(self.page_index, [])
+        for action_id, label, style, row in actions:
+            btn_label = label
+            btn_style = style
+            if action_id in self.TOGGLE_ACTIONS:
+                btn_label, btn_style = self._toggle_label_style(action_id)
+            self.add_item(
+                DashboardActionButton(
+                    action_id,
+                    btn_label,
+                    style=btn_style,
+                    row=row,
+                )
+            )
+
+        self.add_item(DashboardCategorySelect(self))
+
+    def build_embed(self, notice: Optional[str] = None) -> discord.Embed:
+        embed = self.cog._build_dashboard_embed(self.guild, self.snapshot, color=self.embed_color)
+        embed.add_field(
+            name="Current Category",
+            value=self.PAGE_NAMES[self.page_index],
+            inline=False,
+        )
+        embed.set_footer(
+            text=(
+                notice
+                or "Use the category dropdown to navigate dashboard sections."
+            )[:2048]
+        )
+        return embed
+
+    async def refresh_message(
+        self,
+        *,
+        notice: Optional[str] = None,
+        interaction: Optional[discord.Interaction] = None,
+    ):
+        self.snapshot = await self.cog._get_dashboard_snapshot(self.guild)
+        self._rebuild_items()
+        embed = self.build_embed(notice=notice)
+
+        if interaction:
+            await interaction.response.edit_message(embed=embed, view=self)
+            return
+
+        if not self.message:
+            return
+        try:
+            await self.message.edit(embed=embed, view=self)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    async def _toggle_bool_setting(self, interaction: discord.Interaction, action_id: str):
+        setting_key, _, _, setting_label = self.TOGGLE_ACTIONS[action_id]
+        setting = getattr(self.cog.config.guild(self.guild), setting_key)
+        current = bool(await setting())
+        await setting.set(not current)
+        await self.refresh_message(
+            interaction=interaction,
+            notice=f"{setting_label} {'enabled' if not current else 'disabled'}.",
+        )
+
+    async def _open_cleanup_delay_modal(self, interaction: discord.Interaction):
+        current = await self.cog.config.guild(self.guild).cleanup_delay()
+
+        async def handle_submit(
+            modal_interaction: discord.Interaction, value: str
+        ) -> Tuple[bool, str]:
+            if not re.match(r"^\d+$", value):
+                return False, "Cleanup delay must be a whole number of hours."
+            hours = int(value)
+            await self.cog.config.guild(self.guild).cleanup_delay.set(hours)
+            return True, f"Cleanup delay set to {hours} hour(s)."
+
+        await interaction.response.send_modal(
+            DashboardValueModal(
+                self,
+                title="Set Cleanup Delay",
+                label="Hours",
+                placeholder="Example: 24",
+                default_value=str(current if current is not None else 24),
+                handler=handle_submit,
+            )
+        )
+
+    async def _open_kick_timeout_modal(self, interaction: discord.Interaction):
+        current = await self.cog.config.guild(self.guild).kick_timeout_seconds()
+        current = int(current if current is not None else 86400)
+
+        async def handle_submit(
+            modal_interaction: discord.Interaction, value: str
+        ) -> Tuple[bool, str]:
+            parsed_seconds = self.cog._parse_duration_to_seconds(value)
+            if parsed_seconds is None:
+                return False, "Invalid duration. Use formats like `30m`, `2h`, or `1d`."
+            if parsed_seconds > 7776000:
+                return False, "Kick timeout cannot exceed 90 days."
+            await self.cog.config.guild(self.guild).kick_timeout_seconds.set(parsed_seconds)
+            return True, f"Kick timeout set to {self.cog._format_timeout(parsed_seconds)}."
+
+        await interaction.response.send_modal(
+            DashboardValueModal(
+                self,
+                title="Set Kick Timeout",
+                label="Duration",
+                placeholder="Examples: 30m, 2h, 1d",
+                default_value=f"{current // 3600}h" if current % 3600 == 0 else str(current),
+                handler=handle_submit,
+            )
+        )
+
+    async def _open_rejoin_invite_modal(self, interaction: discord.Interaction):
+        current = await self.cog.config.guild(self.guild).rejoin_invite()
+
+        async def handle_submit(
+            modal_interaction: discord.Interaction, value: str
+        ) -> Tuple[bool, str]:
+            normalized, error = self.cog._normalize_rejoin_invite(value)
+            if error:
+                return False, error
+            await self.cog.config.guild(self.guild).rejoin_invite.set(normalized)
+            if normalized is None:
+                return True, "Rejoin invite cleared."
+            return True, f"Rejoin invite set to: {normalized}"
+
+        await interaction.response.send_modal(
+            DashboardValueModal(
+                self,
+                title="Set Rejoin Invite",
+                label="Invite URL or Code",
+                placeholder="discord.gg/CODE, CODE, or clear",
+                default_value=current or "",
+                handler=handle_submit,
+            )
+        )
+
+    async def _open_policy_action_modal(self, interaction: discord.Interaction, mode: str):
+        g = self.cog.config.guild(self.guild)
+        if mode == "denial":
+            current_raw = await g.denial_action()
+            current = self.cog._normalize_member_action(current_raw, allow_none=True)
+            choices = self.cog._DENIAL_ACTION_CHOICES
+            title = "Set Denial Action"
+            setter = g.denial_action
+            label = "Action (none, kick, tempban, ban)"
+            success_text = "Denial action set to: **{value}**."
+        else:
+            current_raw = await g.early_close_action()
+            current = self.cog._normalize_member_action(current_raw)
+            choices = self.cog._EARLY_CLOSE_ACTION_CHOICES
+            title = "Set Early Close Action"
+            setter = g.early_close_action
+            label = "Action (none, kick, tempban, ban)"
+            success_text = "Early close action set to: **{value}**."
+
+        async def handle_submit(
+            modal_interaction: discord.Interaction, value: str
+        ) -> Tuple[bool, str]:
+            selected = value.strip().lower()
+            if selected not in choices:
+                return False, f"Invalid action. Use one of: {', '.join(choices)}."
+            await setter.set(selected)
+            return True, success_text.format(value=selected)
+
+        await interaction.response.send_modal(
+            DashboardValueModal(
+                self,
+                title=title,
+                label=label,
+                placeholder=", ".join(choices),
+                default_value=current,
+                handler=handle_submit,
+            )
+        )
+
+    async def _open_tempban_duration_modal(self, interaction: discord.Interaction, mode: str):
+        g = self.cog.config.guild(self.guild)
+        if mode == "denial":
+            current = await g.denial_tempban_duration_seconds()
+            title = "Set Denial Tempban Duration"
+            setter = g.denial_tempban_duration_seconds
+            success_text = "Denial tempban duration set to {value}."
+        else:
+            current = await g.early_close_tempban_duration_seconds()
+            title = "Set Early Close Tempban Duration"
+            setter = g.early_close_tempban_duration_seconds
+            success_text = "Early close tempban duration set to {value}."
+        current = int(current if current is not None else 86400)
+
+        async def handle_submit(
+            modal_interaction: discord.Interaction, value: str
+        ) -> Tuple[bool, str]:
+            parsed_seconds = self.cog._parse_duration_to_seconds(value)
+            if parsed_seconds is None:
+                return False, "Invalid duration. Use formats like `30m`, `2h`, or `1d`."
+            parsed_seconds = max(
+                self.cog.TEMPBAN_MIN_SECONDS,
+                min(self.cog.TEMPBAN_MAX_SECONDS, parsed_seconds),
+            )
+            await setter.set(parsed_seconds)
+            return True, success_text.format(value=self.cog._format_timeout(parsed_seconds))
+
+        await interaction.response.send_modal(
+            DashboardValueModal(
+                self,
+                title=title,
+                label="Duration",
+                placeholder="Examples: 30m, 2h, 1d",
+                default_value=f"{current // 3600}h" if current % 3600 == 0 else str(current),
+                handler=handle_submit,
+            )
+        )
+
+    async def _open_dm_template_builder(self, interaction: discord.Interaction, action_id: str):
+        template_key = self.DM_TEMPLATE_ACTIONS[action_id]
+        display_name_map = {
+            "welcome_dm_embed": "Welcome DM",
+            "approval_dm_embed": "Approval DM",
+            "denial_dm_embed": "Denial DM",
+            "early_close_dm_embed": "Early Close DM",
+            "rejoin_dm_embed": "Rejoin DM",
+        }
+        defaults = self.cog._get_default_dm_embed_templates()
+        current = await getattr(self.cog.config.guild(self.guild), template_key)()
+        state = dict(defaults.get(template_key, {}))
+        if isinstance(current, dict):
+            state.update(current)
+        placeholders = self.cog._get_dm_template_placeholders(template_key)
+        fallback_title, fallback_color = self.cog._get_dm_embed_fallbacks(template_key)
+
+        builder_view = DMEmbedBuilderView(
+            self.cog,
+            self.guild,
+            interaction.user.id,
+            template_key=template_key,
+            state=state,
+            placeholder_keys=placeholders,
+            fallback_title=fallback_title,
+            fallback_color=fallback_color,
+        )
+        await builder_view.refresh_message()
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title=f"{display_name_map.get(template_key, 'DM')} Embed Builder",
+                description="Use the buttons below to configure, preview, and save this DM embed.",
+                color=self.embed_color,
+            ),
+            view=builder_view,
+            ephemeral=True,
+        )
+        builder_view.message = await interaction.original_response()
+        await builder_view.refresh_message()
+
+    async def _open_channel_modal(self, interaction: discord.Interaction, mode: str):
+        g = self.cog.config.guild(self.guild)
+        if mode == "log":
+            current_id = await g.log_channel()
+            title = "Set Log Channel"
+            setter = g.log_channel
+            clear_message = "Log channel cleared."
+            set_message = "Log channel set to {mention}."
+        elif mode == "lobby":
+            current_id = await g.lobby_channel_id()
+            title = "Set Lobby Channel"
+            setter = g.lobby_channel_id
+            clear_message = "Lobby channel cleared."
+            set_message = "Lobby channel set to {mention}."
+        else:
+            current_id = await g.review_channel_id()
+            title = "Set Review Channel"
+            setter = g.review_channel_id
+            clear_message = "Review channel cleared."
+            set_message = "Review channel set to {mention}."
+
+        current_channel = self.guild.get_channel(current_id) if current_id else None
+
+        async def handle_submit(
+            modal_interaction: discord.Interaction, value: str
+        ) -> Tuple[bool, str]:
+            channel, clear, error = self.cog._resolve_text_channel_input(self.guild, value)
+            if error:
+                return False, error
+            if clear:
+                await setter.set(None)
+                if mode == "lobby":
+                    await g.lobby_panel_message_id.set(None)
+                return True, clear_message
+            await setter.set(channel.id)
+            if mode == "lobby":
+                await g.lobby_panel_message_id.set(None)
+            return True, set_message.format(mention=channel.mention)
+
+        await interaction.response.send_modal(
+            DashboardValueModal(
+                self,
+                title=title,
+                label="Channel Mention or ID",
+                placeholder="Use #channel, channel ID, or clear",
+                default_value=current_channel.mention if current_channel else "",
+                handler=handle_submit,
+            )
+        )
+
+    async def _manage_lobby_embed(self, interaction: discord.Interaction):
+        existing = await self.cog.config.guild(self.guild).lobby_embed()
+        if existing is None:
+            existing = {}
+        self.cog._lobby_embed_builder_states[interaction.user.id] = {"embed_data": existing}
+        builder_view = LobbyEmbedBuilderView(self.cog, owner_user_id=interaction.user.id)
+        embed = discord.Embed(
+            title="Lobby Panel Embed Builder",
+            description="Use the buttons below to configure, preview, or save the embed shown in the lobby.",
+            color=self.embed_color,
+        )
+        if existing and existing.get("title"):
+            embed.add_field(
+                name="Current title",
+                value=existing.get("title", "Not set")[:1024],
+                inline=False,
+            )
+        await interaction.response.send_message(embed=embed, view=builder_view, ephemeral=True)
+        builder_view.message = await interaction.original_response()
+        await builder_view._refresh_embed(user_id=interaction.user.id)
+
+    async def _send_lobby_panel(self, interaction: discord.Interaction):
+        lobby_channel_id = await self.cog.config.guild(self.guild).lobby_channel_id()
+        if not lobby_channel_id:
+            await interaction.response.send_message(
+                "Configure a lobby channel first.",
+                ephemeral=True,
+            )
+            return
+        channel = self.guild.get_channel(lobby_channel_id)
+        if not channel or not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "Configured lobby channel could not be found.",
+                ephemeral=True,
+            )
+            return
+        msg = await self.cog.send_lobby_panel(channel)
+        if not msg:
+            await interaction.response.send_message(
+                "Failed to send lobby panel. Check channel permissions.",
+                ephemeral=True,
+            )
+            return
+        await self.cog.config.guild(self.guild).lobby_panel_message_id.set(msg.id)
+        await self.refresh_message(interaction=interaction, notice=f"Lobby panel sent to {channel.mention}.")
+
+    async def _open_field_manager(self, interaction: discord.Interaction):
+        view = FieldManagerView(self.cog)
+        fields = await self.cog.config.guild(self.guild).form_fields()
+        embed = discord.Embed(
+            title="Application Form Fields Manager",
+            description=(
+                "Use the buttons below to manage your application form fields. "
+                f"Forms may contain at most {MAX_FORM_FIELDS} fields."
+            ),
+            color=self.embed_color,
+        )
+        if not fields:
+            embed.add_field(
+                name="No Fields",
+                value="Add your first field with **Add Field**.",
+                inline=False,
+            )
+        else:
+            for i, field in enumerate(fields, 1):
+                field_type = field.get("type", "text")
+                required = field.get("required", True)
+                placeholder = field.get("placeholder", "")
+                confirm_text = field.get("confirm_text", "")
+                value_text = f"Type: {field_type}\nRequired: {'Yes' if required else 'No'}"
+                if placeholder:
+                    value_text += f"\nPlaceholder: {placeholder}"
+                if confirm_text:
+                    value_text += f"\nMust type: `{confirm_text}`"
+                embed.add_field(
+                    name=f"{i}. {field.get('label', field.get('name'))}",
+                    value=value_text[:1024],
+                    inline=False,
+                )
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    async def handle_action(self, interaction: discord.Interaction, action_id: str):
+        if action_id in self.TOGGLE_ACTIONS:
+            await self._toggle_bool_setting(interaction, action_id)
+            return
+        if action_id == "refresh":
+            await self.refresh_message(interaction=interaction)
+            return
+        if action_id == "set_cleanup_delay":
+            await self._open_cleanup_delay_modal(interaction)
+            return
+        if action_id == "set_kick_timeout":
+            await self._open_kick_timeout_modal(interaction)
+            return
+        if action_id == "set_rejoin_invite":
+            await self._open_rejoin_invite_modal(interaction)
+            return
+        if action_id == "set_denial_action":
+            await self._open_policy_action_modal(interaction, "denial")
+            return
+        if action_id == "set_early_close_action":
+            await self._open_policy_action_modal(interaction, "early_close")
+            return
+        if action_id == "set_denial_tempban":
+            await self._open_tempban_duration_modal(interaction, "denial")
+            return
+        if action_id == "set_early_close_tempban":
+            await self._open_tempban_duration_modal(interaction, "early_close")
+            return
+        if action_id in self.DM_TEMPLATE_ACTIONS:
+            await self._open_dm_template_builder(interaction, action_id)
+            return
+        if action_id == "set_log_channel":
+            await self._open_channel_modal(interaction, "log")
+            return
+        if action_id == "set_lobby_channel":
+            await self._open_channel_modal(interaction, "lobby")
+            return
+        if action_id == "set_review_channel":
+            await self._open_channel_modal(interaction, "review")
+            return
+        if action_id == "manage_lobby_embed":
+            await self._manage_lobby_embed(interaction)
+            return
+        if action_id == "send_lobby_panel":
+            await self._send_lobby_panel(interaction)
+            return
+        if action_id == "open_field_manager":
+            await self._open_field_manager(interaction)
+            return
+        await interaction.response.send_message("Unknown dashboard action.", ephemeral=True)
+
+
 class Applications(commands.Cog):
     """Server application system for member screening."""
 
@@ -1821,6 +2679,7 @@ class Applications(commands.Cog):
         self.config = Config.get_conf(
             self, identifier=9876543213, force_registration=True
         )
+        dm_defaults = self._get_default_dm_embed_templates()
 
         default_guild = {
             "enabled": False,
@@ -1846,6 +2705,12 @@ class Applications(commands.Cog):
             "early_close_send_dm": False,
             "early_close_tempban_duration_seconds": 86400,
             "approval_send_dm": False,
+            "welcome_dm_enabled": False,
+            "welcome_dm_embed": dm_defaults["welcome_dm_embed"],
+            "approval_dm_embed": dm_defaults["approval_dm_embed"],
+            "denial_dm_embed": dm_defaults["denial_dm_embed"],
+            "early_close_dm_embed": dm_defaults["early_close_dm_embed"],
+            "rejoin_dm_embed": dm_defaults["rejoin_dm_embed"],
             "debug_bypass_enabled": False,
             "debug_bypass_user_id": None,
             "pending_unbans": [],  # [{"user_id": int, "unban_at": str (iso)}, ...]
@@ -2198,6 +3063,357 @@ class Applications(commands.Cog):
         days = seconds // 86400
         return f"{days} day{'s' if days != 1 else ''}"
 
+    def _parse_duration_to_seconds(self, raw_value: str) -> Optional[int]:
+        """Parse durations like '30m', '2h', or '1 day' into seconds."""
+        if not raw_value:
+            return None
+        value = raw_value.strip().lower()
+        match = re.match(r"^(\d+(?:\.\d+)?)\s*([a-z]+)$", value)
+        if not match:
+            return None
+        amount = float(match.group(1))
+        unit = match.group(2)
+        unit_map = {
+            "s": 1,
+            "sec": 1,
+            "second": 1,
+            "seconds": 1,
+            "m": 60,
+            "min": 60,
+            "minute": 60,
+            "minutes": 60,
+            "h": 3600,
+            "hour": 3600,
+            "hours": 3600,
+            "d": 86400,
+            "day": 86400,
+            "days": 86400,
+        }
+        if unit not in unit_map or amount <= 0:
+            return None
+        return int(amount * unit_map[unit])
+
+    def _normalize_rejoin_invite(self, invite_value: str) -> Tuple[Optional[str], Optional[str]]:
+        """Normalize a rejoin invite input and return (value, error)."""
+        value = (invite_value or "").strip()
+        if not value:
+            return None, "Invite cannot be empty. Use `clear` to remove it."
+        if value.lower() in {"clear", "none", "off", "disable"}:
+            return None, None
+
+        invite_pattern = r"^(https?://)?(discord\.(gg|com/invite|li)/[a-zA-Z0-9]+)$"
+        if re.match(invite_pattern, value):
+            if value.startswith("http://") or value.startswith("https://"):
+                return value, None
+            return f"https://{value}", None
+        if re.match(r"^[a-zA-Z0-9]+$", value):
+            return f"https://discord.gg/{value}", None
+        return (
+            None,
+            "Invalid invite format. Use a full invite URL, invite code, or `clear`.",
+        )
+
+    def _resolve_text_channel_input(
+        self, guild: discord.Guild, raw_value: str
+    ) -> Tuple[Optional[discord.TextChannel], bool, Optional[str]]:
+        """Resolve a channel mention/ID input into a text channel."""
+        value = (raw_value or "").strip()
+        if not value:
+            return None, False, "Please provide a channel mention/ID or `clear`."
+        if value.lower() in {"clear", "none", "off", "disable"}:
+            return None, True, None
+        match = re.match(r"^<#(\d+)>$", value)
+        if match:
+            channel_id = int(match.group(1))
+        elif value.isdigit():
+            channel_id = int(value)
+        else:
+            return None, False, "Invalid channel format. Use `#channel`, channel ID, or `clear`."
+        channel = guild.get_channel(channel_id)
+        if not channel or not isinstance(channel, discord.TextChannel):
+            return None, False, "Channel not found or is not a text channel."
+        return channel, False, None
+
+    @staticmethod
+    def _get_default_dm_embed_templates() -> Dict[str, Dict[str, str]]:
+        return {
+            "welcome_dm_embed": {
+                "title": "Welcome to {guild_name}",
+                "description": (
+                    "To continue onboarding, please submit your application.\n"
+                    "{lobby_instructions}"
+                ),
+                "color_hex": "#5865F2",
+                "footer": "",
+                "thumbnail_url": "",
+            },
+            "approval_dm_embed": {
+                "title": "Application Approved",
+                "description": (
+                    "Your application was approved in **{guild_name}**.\n"
+                    "You should now have access based on the server's configured roles."
+                ),
+                "color_hex": "#57F287",
+                "footer": "",
+                "thumbnail_url": "",
+            },
+            "denial_dm_embed": {
+                "title": "Application Denied",
+                "description": "Your application was denied in **{guild_name}**.\n\nReason: {reason}",
+                "color_hex": "#ED4245",
+                "footer": "",
+                "thumbnail_url": "",
+            },
+            "early_close_dm_embed": {
+                "title": "Application Closed",
+                "description": (
+                    "Your application was closed before submission in **{guild_name}**.\n\n"
+                    "Reason: {reason}"
+                ),
+                "color_hex": "#FAA61A",
+                "footer": "",
+                "thumbnail_url": "",
+            },
+            "rejoin_dm_embed": {
+                "title": "Application Timeout",
+                "description": (
+                    "You were removed from **{guild_name}** because you did not submit "
+                    "an application within {duration} of joining.\n\n"
+                    "If you'd like to try again, you can rejoin using this invite link:\n"
+                    "{rejoin_invite}"
+                ),
+                "color_hex": "#FAA61A",
+                "footer": "",
+                "thumbnail_url": "",
+            },
+        }
+
+    @staticmethod
+    def _get_dm_embed_fallbacks(template_key: str) -> Tuple[str, str]:
+        fallback_map = {
+            "welcome_dm_embed": ("Welcome to {guild_name}", "#5865F2"),
+            "approval_dm_embed": ("Application Approved", "#57F287"),
+            "denial_dm_embed": ("Application Denied", "#ED4245"),
+            "early_close_dm_embed": ("Application Closed", "#FAA61A"),
+            "rejoin_dm_embed": ("Application Timeout", "#FAA61A"),
+        }
+        return fallback_map.get(template_key, ("Application Notice", "#5865F2"))
+
+    @staticmethod
+    def _get_dm_template_placeholders(template_key: str) -> List[str]:
+        common = ["guild_name", "member_name", "member_mention", "user_id"]
+        specific = {
+            "welcome_dm_embed": ["lobby_channel_mention", "lobby_instructions"],
+            "approval_dm_embed": [],
+            "denial_dm_embed": ["reason"],
+            "early_close_dm_embed": ["reason"],
+            "rejoin_dm_embed": ["duration", "rejoin_invite"],
+        }
+        return common + specific.get(template_key, [])
+
+    @staticmethod
+    def _render_dm_template(template: str, values: Dict[str, str]) -> str:
+        def replace(match: re.Match) -> str:
+            key = match.group(1)
+            return str(values.get(key, match.group(0)))
+
+        return re.sub(r"\{([a-zA-Z0-9_]+)\}", replace, template or "").strip()
+
+    def _build_dm_embed_from_state(
+        self,
+        state: Dict[str, str],
+        *,
+        values: Dict[str, str],
+        fallback_title: str,
+        fallback_color: str,
+    ) -> discord.Embed:
+        title_template = (state.get("title") or fallback_title).strip()
+        description_template = (state.get("description") or "").strip()
+        footer_template = (state.get("footer") or "").strip()
+        color_hex = (state.get("color_hex") or fallback_color).strip()
+        thumbnail_url = (state.get("thumbnail_url") or "").strip()
+
+        title = self._render_dm_template(title_template, values)[:256]
+        description = self._render_dm_template(description_template, values)[:4096]
+
+        try:
+            color = discord.Color.from_str(color_hex) if color_hex else discord.Color.blurple()
+        except ValueError:
+            color = discord.Color.blurple()
+
+        embed = discord.Embed(
+            title=title or None,
+            description=description or None,
+            color=color,
+            timestamp=discord.utils.utcnow(),
+        )
+        if footer_template:
+            embed.set_footer(text=self._render_dm_template(footer_template, values)[:2048])
+        if thumbnail_url and re.match(r"^https?://", thumbnail_url):
+            embed.set_thumbnail(url=thumbnail_url)
+        return embed
+
+    async def _get_dashboard_snapshot(self, guild: discord.Guild) -> Dict:
+        """Return a condensed settings snapshot for the interactive dashboard."""
+        g = self.config.guild(guild)
+        applications_raw = await g.applications()
+        applications = applications_raw if isinstance(applications_raw, dict) else {}
+        pending_count = sum(
+            1
+            for app in applications.values()
+            if isinstance(app, dict) and app.get("status") == "pending"
+        )
+
+        return {
+            "enabled": bool(await g.enabled()),
+            "approval_send_dm": bool(await g.approval_send_dm()),
+            "denial_send_dm": bool(await g.denial_send_dm()),
+            "early_close_send_dm": bool(await g.early_close_send_dm()),
+            "delete_interview_on_resolve": bool(await g.delete_interview_on_resolve()),
+            "welcome_dm_enabled": bool(await g.welcome_dm_enabled()),
+            "denial_action": self._normalize_member_action(
+                await g.denial_action(), allow_none=True
+            ),
+            "early_close_action": self._normalize_member_action(await g.early_close_action()),
+            "denial_tempban_seconds": int(await g.denial_tempban_duration_seconds() or 86400),
+            "early_close_tempban_seconds": int(
+                await g.early_close_tempban_duration_seconds() or 86400
+            ),
+            "cleanup_delay": int(await g.cleanup_delay() or 24),
+            "kick_timeout_seconds": int(await g.kick_timeout_seconds() or 86400),
+            "rejoin_invite": await g.rejoin_invite(),
+            "log_channel": await g.log_channel(),
+            "lobby_channel_id": await g.lobby_channel_id(),
+            "review_channel_id": await g.review_channel_id(),
+            "fields_count": len(await g.form_fields() or []),
+            "pending_count": pending_count,
+        }
+
+    def _build_dashboard_embed(
+        self,
+        guild: discord.Guild,
+        snapshot: Dict,
+        *,
+        color: Optional[discord.Color] = None,
+    ) -> discord.Embed:
+        """Build the dashboard embed from a settings snapshot."""
+        log_channel = (
+            guild.get_channel(snapshot.get("log_channel"))
+            if snapshot.get("log_channel")
+            else None
+        )
+        lobby_channel = (
+            guild.get_channel(snapshot.get("lobby_channel_id"))
+            if snapshot.get("lobby_channel_id")
+            else None
+        )
+        review_channel = (
+            guild.get_channel(snapshot.get("review_channel_id"))
+            if snapshot.get("review_channel_id")
+            else None
+        )
+
+        embed = discord.Embed(
+            title="Applications Dashboard",
+            description=(
+                "Use buttons to toggle settings and open input modals.\n"
+                "Type `clear` in channel/invite modals to unset values."
+            ),
+            color=color or discord.Color.blurple(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(
+            name="System",
+            value="Enabled" if snapshot.get("enabled") else "Disabled",
+            inline=True,
+        )
+        embed.add_field(
+            name="Approval DM",
+            value="On" if snapshot.get("approval_send_dm") else "Off",
+            inline=True,
+        )
+        embed.add_field(
+            name="Denial DM",
+            value="On" if snapshot.get("denial_send_dm") else "Off",
+            inline=True,
+        )
+        embed.add_field(
+            name="Early Close DM",
+            value="On" if snapshot.get("early_close_send_dm") else "Off",
+            inline=True,
+        )
+        embed.add_field(
+            name="Delete Interview on Resolve",
+            value="On" if snapshot.get("delete_interview_on_resolve") else "Off",
+            inline=True,
+        )
+        embed.add_field(
+            name="Welcome DM",
+            value="On" if snapshot.get("welcome_dm_enabled") else "Off",
+            inline=True,
+        )
+        embed.add_field(
+            name="Denial Action",
+            value=snapshot.get("denial_action", "kick"),
+            inline=True,
+        )
+        embed.add_field(
+            name="Early Close Action",
+            value=snapshot.get("early_close_action", "kick"),
+            inline=True,
+        )
+        embed.add_field(
+            name="Denial Tempban",
+            value=self._format_timeout(int(snapshot.get("denial_tempban_seconds", 86400))),
+            inline=True,
+        )
+        embed.add_field(
+            name="Early Close Tempban",
+            value=self._format_timeout(int(snapshot.get("early_close_tempban_seconds", 86400))),
+            inline=True,
+        )
+        embed.add_field(
+            name="Cleanup Delay",
+            value=f"{snapshot.get('cleanup_delay', 24)} hour(s)",
+            inline=True,
+        )
+        embed.add_field(
+            name="Kick Timeout",
+            value=self._format_timeout(int(snapshot.get("kick_timeout_seconds", 86400))),
+            inline=True,
+        )
+        embed.add_field(
+            name="Rejoin Invite",
+            value=snapshot.get("rejoin_invite") or "Not set",
+            inline=True,
+        )
+        embed.add_field(
+            name="Log Channel",
+            value=log_channel.mention if log_channel else "Not set",
+            inline=True,
+        )
+        embed.add_field(
+            name="Lobby Channel",
+            value=lobby_channel.mention if lobby_channel else "Not set",
+            inline=True,
+        )
+        embed.add_field(
+            name="Review Channel",
+            value=review_channel.mention if review_channel else "Not set",
+            inline=True,
+        )
+        embed.add_field(
+            name="Form Fields",
+            value=str(snapshot.get("fields_count", 0)),
+            inline=True,
+        )
+        embed.add_field(
+            name="Pending Applications",
+            value=str(snapshot.get("pending_count", 0)),
+            inline=True,
+        )
+        return embed
+
     # Tempban duration limits (seconds)
     TEMPBAN_MIN_SECONDS = 60
     TEMPBAN_MAX_SECONDS = 2592000  # 30 days
@@ -2221,15 +3437,82 @@ class Applications(commands.Cog):
 
     async def _send_approval_dm(self, guild: discord.Guild, member: discord.Member) -> None:
         """Optionally DM a user when their application is approved."""
+        defaults = self._get_default_dm_embed_templates()
+        configured = await self.config.guild(guild).approval_dm_embed()
+        state = dict(defaults["approval_dm_embed"])
+        if isinstance(configured, dict):
+            state.update(configured)
+        embed = self._build_dm_embed_from_state(
+            state,
+            values={
+                "guild_name": guild.name,
+                "member_name": member.display_name,
+                "member_mention": member.mention,
+                "user_id": str(member.id),
+            },
+            fallback_title="Application Approved",
+            fallback_color="#57F287",
+        )
+        await self._send_user_dm_embed(
+            member,
+            embed=embed,
+            context_label="approval",
+        )
+
+    async def _send_welcome_application_dm(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        lobby_channel: Optional[discord.TextChannel],
+    ) -> None:
+        """DM a new member with instructions on where to submit their application."""
+        defaults = self._get_default_dm_embed_templates()
+        configured = await self.config.guild(guild).welcome_dm_embed()
+        state = dict(defaults["welcome_dm_embed"])
+        if isinstance(configured, dict):
+            state.update(configured)
+        lobby_instructions = (
+            f"Use the **Start Application** button in {lobby_channel.mention}."
+            if lobby_channel
+            else "Ask a server admin where the application panel is located."
+        )
+        embed = self._build_dm_embed_from_state(
+            state,
+            values={
+                "guild_name": guild.name,
+                "member_name": member.display_name,
+                "member_mention": member.mention,
+                "user_id": str(member.id),
+                "lobby_channel_mention": lobby_channel.mention if lobby_channel else "Not configured",
+                "lobby_instructions": lobby_instructions,
+            },
+            fallback_title="Welcome to {guild_name}",
+            fallback_color="#5865F2",
+        )
+        await self._send_user_dm_embed(
+            member,
+            embed=embed,
+            context_label="welcome onboarding",
+        )
+
+    async def _send_user_dm_embed(
+        self,
+        member: discord.Member,
+        *,
+        embed: discord.Embed,
+        context_label: str,
+    ) -> None:
+        """Send a user DM embed."""
         try:
-            await member.send(
-                f"Your application was approved in **{guild.name}**. "
-                "You should now have access based on the server's configured roles."
-            )
+            await member.send(embed=embed)
         except discord.Forbidden:
-            log.warning("Could not DM user %s for approval - DMs may be disabled", member.id)
+            log.warning(
+                "Could not DM user %s for %s - DMs may be disabled",
+                member.id,
+                context_label,
+            )
         except discord.HTTPException as e:
-            log.error("Error sending approval DM to user %s: %s", member.id, e)
+            log.error("Error sending DM to user %s for %s: %s", member.id, context_label, e)
 
     async def _execute_member_action(
         self,
@@ -2240,25 +3523,40 @@ class Applications(commands.Cog):
         send_dm: bool,
         tempban_seconds: Optional[int] = None,
         context: str = "denial",
+        dm_reason: Optional[str] = None,
     ) -> None:
         """Execute configured member action (none/kick/tempban/ban). DM is sent before removal."""
         if member is None:
             log.warning("_execute_member_action: member is None, skipping action")
             return
 
-        if context == "denial":
-            dm_preface = "Your application was denied."
-        else:
-            dm_preface = "Your application was closed before you submitted."
-
         if send_dm:
-            dm_message = f"{dm_preface}\n\nReason: {reason}" if reason else dm_preface
-            try:
-                await member.send(dm_message)
-            except discord.Forbidden:
-                log.warning(f"Could not DM user {member.id} for {context} - DMs may be disabled")
-            except discord.HTTPException as e:
-                log.error(f"Error sending DM to user {member.id} for {context}: {e}")
+            template_key = (
+                "denial_dm_embed" if context == "denial" else "early_close_dm_embed"
+            )
+            defaults = self._get_default_dm_embed_templates()
+            template_state = dict(defaults[template_key])
+            configured = await getattr(self.config.guild(guild), template_key)()
+            if isinstance(configured, dict):
+                template_state.update(configured)
+            reason_text = (dm_reason if dm_reason is not None else reason) or "No reason provided."
+            embed = self._build_dm_embed_from_state(
+                template_state,
+                values={
+                    "guild_name": guild.name,
+                    "member_name": member.display_name,
+                    "member_mention": member.mention,
+                    "user_id": str(member.id),
+                    "reason": str(reason_text),
+                },
+                fallback_title="Application Denied" if context == "denial" else "Application Closed",
+                fallback_color="#ED4245" if context == "denial" else "#FAA61A",
+            )
+            await self._send_user_dm_embed(
+                member,
+                embed=embed,
+                context_label=context,
+            )
 
         if action == "none":
             return
@@ -2365,17 +3663,31 @@ class Applications(commands.Cog):
                 if rejoin_invite:
                     try:
                         duration_text = self._format_timeout(timeout_seconds)
-                        dm_message = (
-                            f"You were removed from {guild.name} because you did not submit "
-                            f"an application within {duration_text} of joining.\n\n"
-                            f"If you'd like to try again, you can rejoin using this invite link:\n"
-                            f"{rejoin_invite}"
+                        defaults = self._get_default_dm_embed_templates()
+                        template_state = dict(defaults["rejoin_dm_embed"])
+                        configured = await self.config.guild(guild).rejoin_dm_embed()
+                        if isinstance(configured, dict):
+                            template_state.update(configured)
+                        embed = self._build_dm_embed_from_state(
+                            template_state,
+                            values={
+                                "guild_name": guild.name,
+                                "member_name": user.display_name,
+                                "member_mention": user.mention,
+                                "user_id": str(user.id),
+                                "duration": duration_text,
+                                "rejoin_invite": rejoin_invite,
+                            },
+                            fallback_title="Application Timeout",
+                            fallback_color="#FAA61A",
                         )
-                        await user.send(dm_message)
-                    except discord.Forbidden:
-                        log.warning(f"Could not DM user {user_id} - DMs may be disabled")
-                    except discord.HTTPException as e:
-                        log.error(f"Error sending DM to user {user_id}: {e}")
+                        await self._send_user_dm_embed(
+                            user,
+                            embed=embed,
+                            context_label="rejoin notice",
+                        )
+                    except Exception as e:
+                        log.error("Error preparing rejoin DM for user %s: %s", user_id, e)
                 else:
                     log.warning(
                         f"No rejoin invite configured for guild {guild_id}. "
@@ -2555,7 +3867,7 @@ class Applications(commands.Cog):
         new_status: str,
         reason: Optional[str] = None,
     ) -> None:
-        """Edit the review channel message to show approved/denied and remove the view. Optional delete interview channel."""
+        """Mark resolved review entry and remove it after a short delay."""
         review_channel_id = await self.config.guild(guild).review_channel_id()
         review_message_id = app_data.get("review_message_id")
         if not review_channel_id or not review_message_id:
@@ -2583,6 +3895,17 @@ class Applications(commands.Cog):
             await msg.edit(content=content, embed=embed, view=None)
         except (discord.Forbidden, discord.HTTPException):
             pass
+
+        # Keep review channel focused on active applications by removing resolved entries quickly.
+        async def _delete_resolved_review_message_later(message: discord.Message):
+            await asyncio.sleep(5)
+            try:
+                await message.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+        self.bot.loop.create_task(_delete_resolved_review_message_later(msg))
+
         # Optionally delete interview channel
         if await self.config.guild(guild).delete_interview_on_resolve():
             interview_channel_id = app_data.get("interview_channel_id")
@@ -2831,6 +4154,9 @@ class Applications(commands.Cog):
         if not lobby_channel_id:
             log.warning("Lobby channel not configured for guild %s; skipping application onboarding", member.guild.id)
             return
+        lobby_channel = member.guild.get_channel(lobby_channel_id)
+        if lobby_channel and not isinstance(lobby_channel, discord.TextChannel):
+            lobby_channel = None
 
         # Check if user already has an active application
         applications = await self.config.guild(member.guild).applications()
@@ -2866,6 +4192,12 @@ class Applications(commands.Cog):
                 "joined_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
             }
         self._start_application_timer(member.guild.id, member.id)
+        if await self.config.guild(member.guild).welcome_dm_enabled():
+            await self._send_welcome_application_dm(
+                member.guild,
+                member,
+                lobby_channel=lobby_channel,
+            )
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
@@ -3366,23 +4698,16 @@ class Applications(commands.Cog):
             await self.config.guild(ctx.guild).rejoin_invite.set(None)
             await ctx.send("Rejoin invite link cleared.")
             return
-        
-        # Validate Discord invite format
-        # Discord invites can be discord.gg/CODE, discord.com/invite/CODE, or discord.li/CODE
-        invite_pattern = r'^(https?://)?(discord\.(gg|com/invite|li)/[a-zA-Z0-9]+)$'
-        if not re.match(invite_pattern, invite_url):
-            # Also check if it's just the code part
-            if re.match(r'^[a-zA-Z0-9]+$', invite_url):
-                invite_url = f"https://discord.gg/{invite_url}"
-            else:
-                await ctx.send(
-                    "❌ Invalid invite format. Please provide a valid Discord invite link "
-                    "(e.g., https://discord.gg/CODE or just the invite code)."
-                )
-                return
-        
-        await self.config.guild(ctx.guild).rejoin_invite.set(invite_url)
-        await ctx.send(f"Rejoin invite link set to: {invite_url}")
+
+        normalized, error = self._normalize_rejoin_invite(invite_url)
+        if error:
+            await ctx.send(f"❌ {error}")
+            return
+        await self.config.guild(ctx.guild).rejoin_invite.set(normalized)
+        if normalized is None:
+            await ctx.send("Rejoin invite link cleared.")
+            return
+        await ctx.send(f"Rejoin invite link set to: {normalized}")
 
     _DENIAL_ACTION_CHOICES = ("none", "kick", "tempban", "ban")
     _EARLY_CLOSE_ACTION_CHOICES = ("none", "kick", "tempban", "ban")
@@ -3453,6 +4778,26 @@ class Applications(commands.Cog):
             return
         await self.config.guild(ctx.guild).approval_send_dm.set(on_off)
         await ctx.send(f"Send DM on approval: **{'Yes' if on_off else 'No'}**.")
+
+    @_policy.command(name="welcomedm")
+    async def _welcome_dm(
+        self, ctx: commands.Context, on_off: Optional[bool] = None
+    ):
+        """Set whether to DM new members with application instructions on join.
+
+        Options:
+        - `true` / `false`
+        - Omit value to show current setting
+        """
+        if on_off is None:
+            current = await self.config.guild(ctx.guild).welcome_dm_enabled()
+            await ctx.send(
+                f"Send welcome DM on join: **{'Yes' if current else 'No'}**.\n"
+                "Available options: **true** or **false**."
+            )
+            return
+        await self.config.guild(ctx.guild).welcome_dm_enabled.set(on_off)
+        await ctx.send(f"Send welcome DM on join: **{'Yes' if on_off else 'No'}**.")
 
     @_policy_denial.command(name="tempbanduration")
     async def _denial_tempban_duration(
@@ -4030,6 +5375,18 @@ class Applications(commands.Cog):
 
         view.message = await ctx.send(embed=embed, view=view)
 
+    @_applications.command(name="dashboard", aliases=["panel"])
+    async def _dashboard(self, ctx: commands.Context):
+        """Open an interactive dashboard for common application settings."""
+        if not ctx.guild:
+            await ctx.send("This command can only be used in a server.")
+            return
+        view = ApplicationsDashboardView(self, ctx)
+        view.embed_color = await ctx.embed_color()
+        await view.initialize()
+        embed = view.build_embed()
+        view.message = await ctx.send(embed=embed, view=view)
+
     @_applications.command(name="settings")
     async def _settings(self, ctx: commands.Context):
         """Show current application system settings.
@@ -4070,6 +5427,7 @@ class Applications(commands.Cog):
         early_close_send_dm = await g.early_close_send_dm()
         early_close_tempban_seconds = await g.early_close_tempban_duration_seconds() or 86400
         approval_send_dm = await g.approval_send_dm()
+        welcome_dm_enabled = await g.welcome_dm_enabled()
         debug_bypass_enabled = await g.debug_bypass_enabled()
         debug_bypass_user_id = await g.debug_bypass_user_id()
         pending_unbans = await g.pending_unbans() or []
@@ -4169,6 +5527,11 @@ class Applications(commands.Cog):
         embed.add_field(
             name="Approval DM",
             value="Yes" if approval_send_dm else "No",
+            inline=True,
+        )
+        embed.add_field(
+            name="Welcome DM",
+            value="Yes" if welcome_dm_enabled else "No",
             inline=True,
         )
         embed.add_field(
@@ -4456,6 +5819,7 @@ class Applications(commands.Cog):
             denial_send_dm,
             tempban_seconds=denial_tempban_seconds,
             context="denial",
+            dm_reason=reason,
         )
 
         # Update review channel message (new flow): remove buttons, show denied
@@ -4582,6 +5946,7 @@ class Applications(commands.Cog):
             denial_send_dm,
             tempban_seconds=denial_tempban_seconds,
             context="denial",
+            dm_reason=reason,
         )
 
         # Send confirmation (interaction already deferred)
@@ -4723,6 +6088,7 @@ class Applications(commands.Cog):
                 early_send_dm,
                 tempban_seconds=early_tempban_seconds,
                 context="early_close",
+                dm_reason=None,
             )
             await self.log_application_event(
                 ctx.guild,
