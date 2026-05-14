@@ -554,6 +554,47 @@ class AutoVC(commands.Cog):
             f"Created VCs will be placed in {category.mention if category else 'the same category'}."
         )
 
+    @_autovcset.command(name="nametemplate")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def _set_name_template(
+        self,
+        ctx: commands.Context,
+        source_vc: discord.VoiceChannel,
+        *,
+        template: Optional[str] = None,
+    ):
+        """Set a name template for a source VC.
+
+        Variables: {num} for sequential numbering, {user} for the member's display name.
+        Leave template blank to clear (reverts to "Username's VC").
+
+        Examples:
+        - [p]autovcset nametemplate #Create-Squad Squad {num}
+        - [p]autovcset nametemplate #Create-Squad Game Room {num}
+        - [p]autovcset nametemplate #Create-Squad  (clears the template)
+        """
+        guild = ctx.guild
+        source_vcs = await self.config.guild(guild).source_vcs()
+
+        if str(source_vc.id) not in source_vcs:
+            await ctx.send(f"{source_vc.mention} is not configured as a source VC.")
+            return
+
+        cleaned = template.strip() if template else None
+        source_vcs[str(source_vc.id)]["name_template"] = cleaned
+        await self.config.guild(guild).source_vcs.set(source_vcs)
+
+        if cleaned:
+            example = cleaned.replace("{num}", "1").replace("{user}", ctx.author.display_name[:20])
+            await ctx.send(
+                f"Name template for {source_vc.mention} set to `{cleaned}`.\n"
+                f"Example output: **{discord.utils.escape_markdown(example)}**"
+            )
+        else:
+            await ctx.send(
+                f"Name template for {source_vc.mention} cleared. New VCs will be named `Username's VC`."
+            )
+
     @_autovcset.command(name="remove", aliases=["delete", "del"])
     @commands.admin_or_permissions(manage_guild=True)
     async def _remove_source_vc(
@@ -598,8 +639,10 @@ class AutoVC(commands.Cog):
                 category = guild.get_channel(category_id) if category_id else None
 
                 category_str = category.mention if category else "Unknown category"
+                name_template = config.get("name_template")
+                template_str = f" — template: `{name_template}`" if name_template else ""
                 message += (
-                    f"{source_vc.mention}: **{vc_type}** type → {category_str}\n"
+                    f"{source_vc.mention}: **{vc_type}** type → {category_str}{template_str}\n"
                 )
             except (ValueError, KeyError) as e:
                 log.error(f"Error processing source VC config: {e}")
@@ -1206,6 +1249,7 @@ class AutoVC(commands.Cog):
         """Create a new VC based on source VC configuration."""
         vc_type = source_config.get("type", "public")
         category_id = source_config.get("category_id")
+        name_template = source_config.get("name_template")
 
         # Get category
         category = guild.get_channel(category_id) if category_id else None
@@ -1215,9 +1259,22 @@ class AutoVC(commands.Cog):
                 log.warning(f"No category found for source VC {source_vc.id}")
                 return None
 
-        # Generate VC name (preserve spaces and special characters from display name)
+        # Generate VC name
         username = member.display_name[:20]
-        vc_name = f"{username}'s VC"
+        name_num: Optional[int] = None
+        if name_template:
+            created_vcs_snap = await self.config.guild(guild).created_vcs()
+            used_nums = {
+                v["name_num"]
+                for v in created_vcs_snap.values()
+                if v.get("source_vc_id") == source_vc.id and v.get("name_num") is not None
+            }
+            name_num = 1
+            while name_num in used_nums:
+                name_num += 1
+            vc_name = name_template.replace("{num}", str(name_num)).replace("{user}", username)[:100]
+        else:
+            vc_name = f"{username}'s VC"
 
         # Get member role for permissions
         member_role_id = await self.config.guild(guild).member_role_id()
@@ -1277,6 +1334,7 @@ class AutoVC(commands.Cog):
                 "role_id": None,
                 "type": vc_type,
                 "created_at": datetime.utcnow().isoformat(),
+                "name_num": name_num,
             }
             await self.config.guild(guild).created_vcs.set(created_vcs)
 
