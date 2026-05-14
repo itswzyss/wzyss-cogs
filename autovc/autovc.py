@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 
@@ -595,6 +596,134 @@ class AutoVC(commands.Cog):
                 f"Name template for {source_vc.mention} cleared. New VCs will be named `Username's VC`."
             )
 
+    @_autovcset.group(name="namepool")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def _name_pool(self, ctx: commands.Context):
+        """Manage the name pool for a source VC (used instead of the name template)."""
+        pass
+
+    @_name_pool.command(name="add")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def _name_pool_add(
+        self,
+        ctx: commands.Context,
+        source_vc: discord.VoiceChannel,
+        *,
+        name: str,
+    ):
+        """Add a name to the pool for a source VC.
+
+        Example: [p]autovcset namepool add #Create-Squad Alpha Squad
+        """
+        guild = ctx.guild
+        source_vcs = await self.config.guild(guild).source_vcs()
+        if str(source_vc.id) not in source_vcs:
+            await ctx.send(f"{source_vc.mention} is not configured as a source VC.")
+            return
+        pool: List[str] = source_vcs[str(source_vc.id)].setdefault("name_pool", [])
+        pool.append(name.strip()[:100])
+        await self.config.guild(guild).source_vcs.set(source_vcs)
+        await ctx.send(
+            f"Added **{discord.utils.escape_markdown(name.strip())}** to the pool for {source_vc.mention}. "
+            f"Pool now has {len(pool)} name(s)."
+        )
+
+    @_name_pool.command(name="remove")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def _name_pool_remove(
+        self,
+        ctx: commands.Context,
+        source_vc: discord.VoiceChannel,
+        index: int,
+    ):
+        """Remove a name from the pool by its number (use autovcset namepool show to see numbers).
+
+        Example: [p]autovcset namepool remove #Create-Squad 2
+        """
+        guild = ctx.guild
+        source_vcs = await self.config.guild(guild).source_vcs()
+        if str(source_vc.id) not in source_vcs:
+            await ctx.send(f"{source_vc.mention} is not configured as a source VC.")
+            return
+        pool: List[str] = source_vcs[str(source_vc.id)].get("name_pool", [])
+        if not pool:
+            await ctx.send(f"{source_vc.mention} has no name pool configured.")
+            return
+        if index < 1 or index > len(pool):
+            await ctx.send(f"Index must be between 1 and {len(pool)}.")
+            return
+        removed = pool.pop(index - 1)
+        source_vcs[str(source_vc.id)]["name_pool"] = pool
+        # Reset sequential counter so it doesn't skip positions
+        source_vcs[str(source_vc.id)]["name_pool_counter"] = 0
+        await self.config.guild(guild).source_vcs.set(source_vcs)
+        await ctx.send(
+            f"Removed **{discord.utils.escape_markdown(removed)}** from the pool for {source_vc.mention}."
+        )
+
+    @_name_pool.command(name="clear")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def _name_pool_clear(
+        self, ctx: commands.Context, source_vc: discord.VoiceChannel
+    ):
+        """Clear all names from the pool for a source VC."""
+        guild = ctx.guild
+        source_vcs = await self.config.guild(guild).source_vcs()
+        if str(source_vc.id) not in source_vcs:
+            await ctx.send(f"{source_vc.mention} is not configured as a source VC.")
+            return
+        source_vcs[str(source_vc.id)]["name_pool"] = []
+        source_vcs[str(source_vc.id)]["name_pool_counter"] = 0
+        await self.config.guild(guild).source_vcs.set(source_vcs)
+        await ctx.send(f"Name pool for {source_vc.mention} cleared.")
+
+    @_name_pool.command(name="mode")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def _name_pool_mode(
+        self,
+        ctx: commands.Context,
+        source_vc: discord.VoiceChannel,
+        mode: str,
+    ):
+        """Set the pool selection mode: sequential (in order) or random.
+
+        Example: [p]autovcset namepool mode #Create-Squad random
+        """
+        mode = mode.lower()
+        if mode not in ("sequential", "random"):
+            await ctx.send("Mode must be `sequential` or `random`.")
+            return
+        guild = ctx.guild
+        source_vcs = await self.config.guild(guild).source_vcs()
+        if str(source_vc.id) not in source_vcs:
+            await ctx.send(f"{source_vc.mention} is not configured as a source VC.")
+            return
+        source_vcs[str(source_vc.id)]["name_pool_mode"] = mode
+        await self.config.guild(guild).source_vcs.set(source_vcs)
+        await ctx.send(f"Name pool for {source_vc.mention} set to **{mode}** mode.")
+
+    @_name_pool.command(name="show")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def _name_pool_show(
+        self, ctx: commands.Context, source_vc: discord.VoiceChannel
+    ):
+        """Show the current name pool and mode for a source VC."""
+        guild = ctx.guild
+        source_vcs = await self.config.guild(guild).source_vcs()
+        if str(source_vc.id) not in source_vcs:
+            await ctx.send(f"{source_vc.mention} is not configured as a source VC.")
+            return
+        cfg = source_vcs[str(source_vc.id)]
+        pool: List[str] = cfg.get("name_pool", [])
+        mode = cfg.get("name_pool_mode", "sequential")
+        if not pool:
+            await ctx.send(f"{source_vc.mention} has no name pool configured.")
+            return
+        lines = "\n".join(f"{i + 1}. {name}" for i, name in enumerate(pool))
+        await ctx.send(
+            f"**Name pool for {source_vc.mention}** ({mode}):\n{lines}"
+        )
+
     @_autovcset.command(name="remove", aliases=["delete", "del"])
     @commands.admin_or_permissions(manage_guild=True)
     async def _remove_source_vc(
@@ -640,9 +769,18 @@ class AutoVC(commands.Cog):
 
                 category_str = category.mention if category else "Unknown category"
                 name_template = config.get("name_template")
-                template_str = f" — template: `{name_template}`" if name_template else ""
+                name_pool: List[str] = config.get("name_pool", [])
+                name_pool_mode = config.get("name_pool_mode", "sequential")
+                if name_pool:
+                    naming_str = f" — pool ({name_pool_mode}): {', '.join(f'`{n}`' for n in name_pool[:5])}"
+                    if len(name_pool) > 5:
+                        naming_str += f" +{len(name_pool) - 5} more"
+                elif name_template:
+                    naming_str = f" — template: `{name_template}`"
+                else:
+                    naming_str = ""
                 message += (
-                    f"{source_vc.mention}: **{vc_type}** type → {category_str}{template_str}\n"
+                    f"{source_vc.mention}: **{vc_type}** type → {category_str}{naming_str}\n"
                 )
             except (ValueError, KeyError) as e:
                 log.error(f"Error processing source VC config: {e}")
@@ -1262,7 +1400,19 @@ class AutoVC(commands.Cog):
         # Generate VC name
         username = member.display_name[:20]
         name_num: Optional[int] = None
-        if name_template:
+        name_pool: List[str] = source_config.get("name_pool", [])
+        if name_pool:
+            mode = source_config.get("name_pool_mode", "sequential")
+            if mode == "random":
+                vc_name = random.choice(name_pool)
+            else:
+                counter = source_config.get("name_pool_counter", 0)
+                vc_name = name_pool[counter % len(name_pool)]
+                source_vcs_fresh = await self.config.guild(guild).source_vcs()
+                if str(source_vc.id) in source_vcs_fresh:
+                    source_vcs_fresh[str(source_vc.id)]["name_pool_counter"] = counter + 1
+                    await self.config.guild(guild).source_vcs.set(source_vcs_fresh)
+        elif name_template:
             created_vcs_snap = await self.config.guild(guild).created_vcs()
             used_nums = {
                 v["name_num"]
