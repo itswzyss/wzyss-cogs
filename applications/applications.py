@@ -4463,6 +4463,69 @@ class Applications(commands.Cog):
 
         await ctx.send(f"❌ Denied {member.mention}'s application.")
 
+    @_applications.command(name="bypass")
+    async def _bypass(self, ctx: commands.Context, *members: discord.Member):
+        """Manually bypass the application process for one or more users.
+
+        The specified users are recorded as having submitted and been approved
+        without going through the normal application flow. Approval roles are
+        applied exactly as they would be after a normal approval.
+
+        Usage: `[p]applications bypass @user1 @user2 ...`
+        """
+        if not members:
+            await ctx.send("❌ Please specify at least one member to bypass.")
+            return
+
+        now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        results = []
+
+        for member in members:
+            guild_id = ctx.guild.id
+            user_id = member.id
+
+            async with self.config.guild(ctx.guild).applications() as apps:
+                existing = apps.get(str(user_id), {})
+                if isinstance(existing, dict) and existing.get("status") == "approved":
+                    results.append(f"⚠️ {member.mention} — already approved, skipped.")
+                    continue
+
+                apps[str(user_id)] = {
+                    "status": "approved",
+                    "submitted_at": now_iso,
+                    "approved_at": now_iso,
+                    "approved_by": ctx.author.id,
+                    "responses": {},
+                    "review_message_id": None,
+                    "interview_channel_id": None,
+                    "bypassed": True,
+                }
+
+            # Cancel any pending kick timer for this user
+            if guild_id in self.timer_tasks and user_id in self.timer_tasks[guild_id]:
+                task = self.timer_tasks[guild_id][user_id]
+                if not task.done():
+                    task.cancel()
+                del self.timer_tasks[guild_id][user_id]
+                if not self.timer_tasks[guild_id]:
+                    del self.timer_tasks[guild_id]
+
+            warning = await self._apply_approval_roles(ctx.guild, member)
+
+            await self.log_application_event(
+                ctx.guild, member, "approved", decision_maker=ctx.guild.get_member(ctx.author.id)
+            )
+
+            if await self.config.guild(ctx.guild).approval_send_dm():
+                await self._send_approval_dm(ctx.guild, member)
+
+            if warning:
+                results.append(f"✅ {member.mention} — bypassed. {warning}")
+            else:
+                results.append(f"✅ {member.mention} — bypassed and approved.")
+
+        await ctx.send("\n".join(results))
+
     async def approve_application_interaction(
         self, interaction: discord.Interaction, member: discord.Member
     ):
