@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing Media Channels! Use `[p]help mediachannelset` to configure it.",
+    "name": "MediaChannels",
+    "short": "Enforce media-focused posting in selected channels.",
+    "description": "Monitors configured channels and removes non-media chatter while allowing attachments, links, embeds, and stickers. Supports optional warning messages and configurable reply grace thresholds so brief discussion can happen after media posts.",
+    "tags": ["moderation", "media", "channels", "utility"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
