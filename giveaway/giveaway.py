@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import logging
 import random
 import time
@@ -28,30 +29,36 @@ CLAIM_CUSTOM_ID_PREFIX = "giveaway:claim:"
 
 
 class ClaimButton(Button):
-    """Persistent button for winner to claim. Only winner can use it."""
+    """Persistent button for winner to claim. Only winner can use it.
 
-    def __init__(self, cog: "Giveaway", message_id: int):
+    Works from the giveaway channel message or from a winner DM.
+    custom_id includes guild_id so claims from DMs can resolve the server.
+    """
+
+    def __init__(self, cog: "Giveaway", guild_id: int, message_id: int):
         super().__init__(
             label="Claim",
             style=discord.ButtonStyle.success,
             emoji="\u2705",
-            custom_id=f"{CLAIM_CUSTOM_ID_PREFIX}{message_id}",
+            custom_id=f"{CLAIM_CUSTOM_ID_PREFIX}{guild_id}:{message_id}",
         )
         self.cog = cog
+        self.guild_id = guild_id
         self.message_id = message_id
 
     async def callback(self, interaction: discord.Interaction):
-        await self.cog._handle_claim_click(interaction, self.message_id)
+        await self.cog._handle_claim_click(interaction, self.guild_id, self.message_id)
 
 
 class ClaimView(View):
     """View with a single Claim button; timeout=None for persistence."""
 
-    def __init__(self, cog: "Giveaway", message_id: int):
+    def __init__(self, cog: "Giveaway", guild_id: int, message_id: int):
         super().__init__(timeout=None)
         self.cog = cog
+        self.guild_id = guild_id
         self.message_id = message_id
-        self.add_item(ClaimButton(cog, message_id))
+        self.add_item(ClaimButton(cog, guild_id, message_id))
 
 
 # --- Modals for interactive builder ---
@@ -177,6 +184,82 @@ class SetDurationModal(Modal, title="Set Duration"):
             await self.builder_view.refresh(interaction)
 
 
+# Popular giveaway durations: (label, seconds, optional description)
+_DURATION_PRESETS: List[Tuple[str, int, str]] = [
+    ("1 day", 24 * 60 * 60, ""),
+    ("2 days", 2 * 24 * 60 * 60, ""),
+    ("3 days", 3 * 24 * 60 * 60, ""),
+    ("5 days", 5 * 24 * 60 * 60, ""),
+    ("1 week", 7 * 24 * 60 * 60, ""),
+    ("2 weeks", 14 * 24 * 60 * 60, ""),
+]
+
+
+class DurationSelectDropdown(Select["DurationSelectView"]):
+    """Dropdown of popular durations, plus Custom to open the modal."""
+
+    def __init__(self, cog: "Giveaway", guild_id: int, user_id: int, builder_view: "GiveawayBuilderView"):
+        self._cog = cog
+        self._guild_id = guild_id
+        self._user_id = user_id
+        self._builder_view = builder_view
+        options: List[discord.SelectOption] = []
+        for label, seconds, description in _DURATION_PRESETS:
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    value=str(seconds),
+                    description=description[:100] if description else None,
+                )
+            )
+        options.append(
+            discord.SelectOption(
+                label="Custom",
+                value="custom",
+                description="Enter a custom duration",
+            )
+        )
+        super().__init__(
+            placeholder="Select a duration...",
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self._user_id:
+            await interaction.response.send_message("Only the user who started the builder can do this.", ephemeral=True)
+            return
+        value = self.values[0] if self.values else ""
+        if value == "custom":
+            modal = SetDurationModal(self._cog, self._guild_id, self._user_id)
+            modal.builder_view = self._builder_view
+            await interaction.response.send_modal(modal)
+            return
+        try:
+            seconds = int(value)
+        except ValueError:
+            await interaction.response.send_message("Invalid duration selection.", ephemeral=True)
+            return
+        if seconds < 60:
+            await interaction.response.send_message("Duration must be at least 1 minute.", ephemeral=True)
+            return
+        await self._cog._set_draft_field(self._guild_id, self._user_id, "duration_seconds", seconds)
+        await interaction.response.defer(ephemeral=True)
+        await self._builder_view.refresh()
+        await interaction.followup.send(
+            f"Duration set to {humanize_timedelta(seconds=seconds)}.",
+            ephemeral=True,
+        )
+
+
+class DurationSelectView(View):
+    """Temporary view holding the duration dropdown (ephemeral)."""
+
+    def __init__(self, cog: "Giveaway", guild_id: int, user_id: int, builder_view: "GiveawayBuilderView"):
+        super().__init__(timeout=60)
+        self.add_item(DurationSelectDropdown(cog, guild_id, user_id, builder_view))
+
+
 class SetEmojiModal(Modal, title="Set Emoji"):
     def __init__(self, cog: "Giveaway", guild_id: int, user_id: int, default: str = "\U0001f389"):
         super().__init__()
@@ -202,17 +285,67 @@ class SetEmojiModal(Modal, title="Set Emoji"):
             await self.builder_view.refresh(interaction)
 
 
-class SetClaimModal(Modal, title="Set Claim"):
-    enable_input = TextInput(
-        label="Enable claim? (yes/no)",
-        placeholder="yes or no",
-        required=True,
-        max_length=5,
-    )
+class SetImagesModal(Modal, title="Set Images"):
+    def __init__(
+        self,
+        cog: "Giveaway",
+        guild_id: int,
+        user_id: int,
+        *,
+        thumbnail_default: str = "",
+        image_default: str = "",
+    ):
+        super().__init__()
+        self.cog = cog
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.thumbnail_input = TextInput(
+            label="Thumbnail URL (optional)",
+            placeholder="https://example.com/thumb.png — leave blank to clear",
+            required=False,
+            max_length=2000,
+            default=thumbnail_default[:2000] if thumbnail_default else None,
+        )
+        self.image_input = TextInput(
+            label="Main Image URL (optional)",
+            placeholder="https://example.com/image.png — leave blank to clear",
+            required=False,
+            max_length=2000,
+            default=image_default[:2000] if image_default else None,
+        )
+        self.add_item(self.thumbnail_input)
+        self.add_item(self.image_input)
+
+    @staticmethod
+    def _normalize_url(raw: str, label: str) -> Tuple[Optional[str], Optional[str]]:
+        value = (raw or "").strip()
+        if not value:
+            return None, None
+        if not (value.startswith("http://") or value.startswith("https://")):
+            return None, f"{label} URL must start with http:// or https://."
+        return value, None
+
+    async def on_submit(self, interaction: discord.Interaction):
+        thumbnail_url, thumb_err = self._normalize_url(self.thumbnail_input.value or "", "Thumbnail")
+        if thumb_err:
+            await interaction.response.send_message(thumb_err, ephemeral=True)
+            return
+        image_url, image_err = self._normalize_url(self.image_input.value or "", "Image")
+        if image_err:
+            await interaction.response.send_message(image_err, ephemeral=True)
+            return
+        await self.cog._set_draft_field(self.guild_id, self.user_id, "thumbnail_url", thumbnail_url)
+        await self.cog._set_draft_field(self.guild_id, self.user_id, "image_url", image_url)
+        await interaction.response.defer(ephemeral=True)
+        if getattr(self, "builder_view", None):
+            await self.builder_view.refresh(interaction)
+
+
+class SetClaimDurationModal(Modal, title="Set Claim Window"):
     claim_duration_input = TextInput(
         label="Claim window (e.g. 24h, 2d)",
         placeholder="24h",
-        required=False,
+        required=True,
         max_length=50,
     )
 
@@ -223,33 +356,118 @@ class SetClaimModal(Modal, title="Set Claim"):
         self.user_id = user_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        enable_str = (self.enable_input.value or "").strip().lower()
-        claim_enabled = enable_str in ("yes", "y", "true", "1")
-        await self.cog._set_draft_field(self.guild_id, self.user_id, "claim_enabled", claim_enabled)
-        claim_seconds = 0
-        if claim_enabled:
-            raw = (self.claim_duration_input.value or "").strip() or "24h"
-            try:
-                delta = parse_timedelta(
-                    raw,
-                    minimum=timedelta(seconds=60),
-                    maximum=timedelta(days=30),
-                    allowed_units=["days", "hours", "minutes", "seconds"],
-                )
-            except Exception:
-                delta = timedelta(hours=24)
-            if delta:
-                claim_seconds = int(delta.total_seconds())
+        raw = (self.claim_duration_input.value or "").strip()
+        try:
+            delta = parse_timedelta(
+                raw,
+                minimum=timedelta(seconds=60),
+                maximum=timedelta(days=30),
+                allowed_units=["days", "hours", "minutes", "seconds"],
+            )
+        except Exception:
+            delta = None
+        if not delta:
+            await interaction.response.send_message(
+                "Invalid claim window. Use e.g. 24h, 2d, 30m.",
+                ephemeral=True,
+            )
+            return
+        claim_seconds = int(delta.total_seconds())
+        await self.cog._set_draft_field(self.guild_id, self.user_id, "claim_enabled", True)
         await self.cog._set_draft_field(self.guild_id, self.user_id, "claim_seconds", claim_seconds)
         await interaction.response.defer(ephemeral=True)
         if getattr(self, "builder_view", None):
             await self.builder_view.refresh(interaction)
 
 
-class ChannelSelectDropdown(Select["ChannelSelectView"]):
-    """Dropdown to choose the giveaway channel (text channels + current channel)."""
+# Claim window presets: (label, value, description)
+# value "off" disables claim; "custom" opens the modal; otherwise seconds.
+_CLAIM_PRESETS: List[Tuple[str, str, str]] = [
+    ("Off", "off", "Do not require winners to claim"),
+    ("1 day", str(24 * 60 * 60), "Winners must claim within 1 day"),
+    ("2 days", str(2 * 24 * 60 * 60), "Winners must claim within 2 days"),
+]
 
-    def __init__(self, cog: "Giveaway", guild: discord.Guild, user_id: int, builder_view: "GiveawayBuilderView"):
+
+class ClaimSelectDropdown(Select["ClaimSelectView"]):
+    """Dropdown to enable/disable claim and pick a claim window."""
+
+    def __init__(self, cog: "Giveaway", guild_id: int, user_id: int, builder_view: "GiveawayBuilderView"):
+        self._cog = cog
+        self._guild_id = guild_id
+        self._user_id = user_id
+        self._builder_view = builder_view
+        options: List[discord.SelectOption] = [
+            discord.SelectOption(label=label, value=value, description=description[:100])
+            for label, value, description in _CLAIM_PRESETS
+        ]
+        options.append(
+            discord.SelectOption(
+                label="Custom",
+                value="custom",
+                description="Enter a custom claim window",
+            )
+        )
+        super().__init__(
+            placeholder="Select claim settings...",
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self._user_id:
+            await interaction.response.send_message("Only the user who started the builder can do this.", ephemeral=True)
+            return
+        value = self.values[0] if self.values else "off"
+        if value == "custom":
+            modal = SetClaimDurationModal(self._cog, self._guild_id, self._user_id)
+            modal.builder_view = self._builder_view
+            await interaction.response.send_modal(modal)
+            return
+        if value == "off":
+            await self._cog._set_draft_field(self._guild_id, self._user_id, "claim_enabled", False)
+            await self._cog._set_draft_field(self._guild_id, self._user_id, "claim_seconds", 0)
+            await interaction.response.defer(ephemeral=True)
+            await self._builder_view.refresh()
+            await interaction.followup.send("Claim is now disabled.", ephemeral=True)
+            return
+        try:
+            seconds = int(value)
+        except ValueError:
+            await interaction.response.send_message("Invalid claim selection.", ephemeral=True)
+            return
+        if seconds < 60:
+            await interaction.response.send_message("Claim window must be at least 1 minute.", ephemeral=True)
+            return
+        await self._cog._set_draft_field(self._guild_id, self._user_id, "claim_enabled", True)
+        await self._cog._set_draft_field(self._guild_id, self._user_id, "claim_seconds", seconds)
+        await interaction.response.defer(ephemeral=True)
+        await self._builder_view.refresh()
+        await interaction.followup.send(
+            f"Claim enabled ({humanize_timedelta(seconds=seconds)}).",
+            ephemeral=True,
+        )
+
+
+class ClaimSelectView(View):
+    """Temporary view holding the claim settings dropdown (ephemeral)."""
+
+    def __init__(self, cog: "Giveaway", guild_id: int, user_id: int, builder_view: "GiveawayBuilderView"):
+        super().__init__(timeout=60)
+        self.add_item(ClaimSelectDropdown(cog, guild_id, user_id, builder_view))
+
+
+class ChannelSelectDropdown(Select["ChannelSelectView"]):
+    """Dropdown to choose the giveaway channel from fuzzy results."""
+
+    def __init__(
+        self,
+        cog: "Giveaway",
+        guild: discord.Guild,
+        user_id: int,
+        builder_view: "GiveawayBuilderView",
+        channels: List[discord.TextChannel],
+    ):
         self._cog = cog
         self._guild_id = guild.id
         self._user_id = user_id
@@ -257,8 +475,7 @@ class ChannelSelectDropdown(Select["ChannelSelectView"]):
         options: List[discord.SelectOption] = [
             discord.SelectOption(label="Current channel", value="0", description="Post in the channel where you run the command"),
         ]
-        text_channels = [c for c in guild.text_channels if c.id is not None][:24]
-        for ch in text_channels:
+        for ch in channels[:24]:
             options.append(
                 discord.SelectOption(
                     label=ch.name[:100],
@@ -291,11 +508,53 @@ class ChannelSelectDropdown(Select["ChannelSelectView"]):
 
 
 class ChannelSelectView(View):
-    """Temporary view holding the channel dropdown (ephemeral)."""
+    """Temporary view holding the channel dropdown of fuzzy matches (ephemeral)."""
+
+    def __init__(
+        self,
+        cog: "Giveaway",
+        guild: discord.Guild,
+        user_id: int,
+        builder_view: "GiveawayBuilderView",
+        channels: List[discord.TextChannel],
+    ):
+        super().__init__(timeout=60)
+        self.add_item(ChannelSelectDropdown(cog, guild, user_id, builder_view, channels))
+
+
+class ChannelSearchModal(Modal, title="Find Channel"):
+    query_input = TextInput(
+        label="Channel search",
+        placeholder="giveaway, events, announcements...",
+        required=True,
+        max_length=100,
+    )
 
     def __init__(self, cog: "Giveaway", guild: discord.Guild, user_id: int, builder_view: "GiveawayBuilderView"):
-        super().__init__(timeout=60)
-        self.add_item(ChannelSelectDropdown(cog, guild, user_id, builder_view))
+        super().__init__()
+        self.cog = cog
+        self.guild = guild
+        self.user_id = user_id
+        self.builder_view = builder_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Only the user who started the builder can do this.", ephemeral=True)
+            return
+        query = (self.query_input.value or "").strip()
+        matches = self.cog._fuzzy_match_channels(self.guild, query, limit=24)
+        if not matches:
+            await interaction.response.send_message(
+                "No matching channels found. Try a different search.",
+                ephemeral=True,
+            )
+            return
+        view = ChannelSelectView(self.cog, self.guild, self.user_id, self.builder_view, matches)
+        await interaction.response.send_message(
+            f"Showing {len(matches)} channel match(es). Select one:",
+            view=view,
+            ephemeral=True,
+        )
 
 
 class GiveawayBuilderView(View):
@@ -354,8 +613,17 @@ class GiveawayBuilderView(View):
         claim_enabled = draft.get("claim_enabled", False)
         claim_seconds = draft.get("claim_seconds") or 0
         claim_str = humanize_timedelta(seconds=claim_seconds) if claim_seconds else "N/A"
+        dm_winners = bool(draft.get("dm_winners", False))
         ch_id = draft.get("channel_id")
         channel_str = guild.get_channel(ch_id).mention if ch_id else "Current channel"
+        thumbnail_url = draft.get("thumbnail_url")
+        thumbnail_str = thumbnail_url if thumbnail_url else "Not set"
+        if thumbnail_url and len(thumbnail_str) > 60:
+            thumbnail_str = thumbnail_str[:57] + "..."
+        image_url = draft.get("image_url")
+        image_str = image_url if image_url else "Not set"
+        if image_url and len(image_str) > 60:
+            image_str = image_str[:57] + "..."
 
         is_editing = self.edit_message_id is not None
         embed = discord.Embed(
@@ -371,6 +639,9 @@ class GiveawayBuilderView(View):
                 f"**Duration:** {duration_str}\n"
                 f"**Emoji:** {emoji}\n"
                 f"**Claim:** {'Yes' if claim_enabled else 'No'} ({claim_str})\n"
+                f"**DM Winners:** {'Yes' if dm_winners else 'No'}\n"
+                f"**Thumbnail:** {thumbnail_str}\n"
+                f"**Image:** {image_str}\n"
                 f"**Channel:** {channel_str}"
             ),
             inline=False,
@@ -388,7 +659,7 @@ class GiveawayBuilderView(View):
         except (discord.NotFound, discord.HTTPException):
             pass
 
-    @discord.ui.button(label="Set Prizes", style=discord.ButtonStyle.primary, emoji="\U0001f389", row=0)
+    @discord.ui.button(label="Prizes", style=discord.ButtonStyle.primary, emoji="\U0001f389", row=0)
     async def set_prize(self, interaction: discord.Interaction, button: Button):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("Only the user who started the builder can do this.", ephemeral=True)
@@ -397,7 +668,7 @@ class GiveawayBuilderView(View):
         modal.builder_view = self
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="Set Winners", style=discord.ButtonStyle.primary, emoji="\U0001f3c6", row=0)
+    @discord.ui.button(label="Winners", style=discord.ButtonStyle.primary, emoji="\U0001f3c6", row=0)
     async def set_winners(self, interaction: discord.Interaction, button: Button):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("Only the user who started the builder can do this.", ephemeral=True)
@@ -406,16 +677,57 @@ class GiveawayBuilderView(View):
         modal.builder_view = self
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="Set Duration", style=discord.ButtonStyle.primary, emoji="\u23f1\ufe0f", row=0)
+    @discord.ui.button(label="Duration", style=discord.ButtonStyle.primary, emoji="\u23f1\ufe0f", row=0)
     async def set_duration(self, interaction: discord.Interaction, button: Button):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("Only the user who started the builder can do this.", ephemeral=True)
             return
-        modal = SetDurationModal(self.cog, self.guild.id, self.user_id)
-        modal.builder_view = self
+        view = DurationSelectView(self.cog, self.guild.id, self.user_id, self)
+        await interaction.response.send_message(
+            "Select a duration for the giveaway:",
+            view=view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Channel", style=discord.ButtonStyle.primary, emoji="#\u20e3", row=0)
+    async def set_channel(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Only the user who started the builder can do this.", ephemeral=True)
+            return
+        if not interaction.guild:
+            await interaction.response.send_message("Could not resolve the server.", ephemeral=True)
+            return
+        modal = ChannelSearchModal(self.cog, interaction.guild, self.user_id, self)
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="Set Emoji", style=discord.ButtonStyle.secondary, emoji="\U0001f4ac", row=0)
+    @discord.ui.button(label="Claim", style=discord.ButtonStyle.secondary, emoji="\u2705", row=1)
+    async def set_claim(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Only the user who started the builder can do this.", ephemeral=True)
+            return
+        view = ClaimSelectView(self.cog, self.guild.id, self.user_id, self)
+        await interaction.response.send_message(
+            "Select claim settings:",
+            view=view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="DM", style=discord.ButtonStyle.secondary, emoji="\U0001f4e8", row=1)
+    async def set_winner_dm(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Only the user who started the builder can do this.", ephemeral=True)
+            return
+        draft = await self.cog._get_draft(self.guild.id, self.user_id)
+        dm_winners = bool(draft.get("dm_winners", False))
+        new_state = not dm_winners
+        await self.cog._set_draft_field(self.guild.id, self.user_id, "dm_winners", new_state)
+        await self.refresh(interaction)
+        await interaction.followup.send(
+            f"Winner DM is now {'enabled' if new_state else 'disabled'}.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Emoji", style=discord.ButtonStyle.secondary, emoji="\U0001f4ac", row=1)
     async def set_emoji(self, interaction: discord.Interaction, button: Button):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("Only the user who started the builder can do this.", ephemeral=True)
@@ -425,31 +737,23 @@ class GiveawayBuilderView(View):
         modal.builder_view = self
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="Set Claim", style=discord.ButtonStyle.secondary, emoji="\u2705", row=1)
-    async def set_claim(self, interaction: discord.Interaction, button: Button):
+    @discord.ui.button(label="Images", style=discord.ButtonStyle.secondary, emoji="\U0001f5bc\ufe0f", row=1)
+    async def set_images(self, interaction: discord.Interaction, button: Button):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("Only the user who started the builder can do this.", ephemeral=True)
             return
-        modal = SetClaimModal(self.cog, self.guild.id, self.user_id)
+        draft = await self.cog._get_draft(self.guild.id, self.user_id)
+        modal = SetImagesModal(
+            self.cog,
+            self.guild.id,
+            self.user_id,
+            thumbnail_default=draft.get("thumbnail_url") or "",
+            image_default=draft.get("image_url") or "",
+        )
         modal.builder_view = self
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="Set Channel", style=discord.ButtonStyle.secondary, emoji="#\u20e3", row=1)
-    async def set_channel(self, interaction: discord.Interaction, button: Button):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("Only the user who started the builder can do this.", ephemeral=True)
-            return
-        if not interaction.guild:
-            await interaction.response.send_message("Could not resolve the server.", ephemeral=True)
-            return
-        view = ChannelSelectView(self.cog, interaction.guild, self.user_id, self)
-        await interaction.response.send_message(
-            "Select a channel for the giveaway:",
-            view=view,
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="Preview", style=discord.ButtonStyle.secondary, emoji="\U0001f441\ufe0f", row=1)
+    @discord.ui.button(label="Preview", style=discord.ButtonStyle.secondary, emoji="\U0001f441\ufe0f", row=2)
     async def preview(self, interaction: discord.Interaction, button: Button):
         """Preview the giveaway as it will appear when launched."""
         if interaction.user.id != self.user_id:
@@ -486,6 +790,8 @@ class GiveawayBuilderView(View):
             "active",
             winner_count=winner_count,
             claim_seconds=claim_seconds,
+            thumbnail_url=draft.get("thumbnail_url"),
+            image_url=draft.get("image_url"),
         )
         await interaction.response.send_message(
             "Preview of your giveaway:",
@@ -591,8 +897,11 @@ class Giveaway(commands.Cog):
             "emoji": data.get("emoji") or "\U0001f389",
             "claim_enabled": bool(data.get("claim_enabled")),
             "claim_seconds": int(data.get("claim_seconds") or 0),
+            "dm_winners": bool(data.get("dm_winners", False)),
             "channel_id": data.get("channel_id"),
             "description": data.get("description"),
+            "thumbnail_url": data.get("thumbnail_url"),
+            "image_url": data.get("image_url"),
         }
         drafts = await self.config.guild(guild).giveaway_drafts()
         drafts[str(user_id)] = draft
@@ -663,6 +972,178 @@ class Giveaway(commands.Cog):
             return [int(wid)]
         return []
 
+    @staticmethod
+    def _fuzzy_match_channels(
+        guild: discord.Guild,
+        query: str,
+        *,
+        limit: int = 24,
+    ) -> List[discord.TextChannel]:
+        text_channels = [c for c in guild.text_channels if c.id is not None]
+        if not query:
+            return text_channels[:limit]
+        q = query.strip().lower()
+        if not q:
+            return text_channels[:limit]
+        scored: List[Tuple[float, discord.TextChannel]] = []
+        for ch in text_channels:
+            name = ch.name.lower()
+            if name == q:
+                score = 1.0
+            elif q in name:
+                score = 0.92
+            else:
+                score = difflib.SequenceMatcher(a=q, b=name).ratio()
+            if score >= 0.35:
+                scored.append((score, ch))
+        scored.sort(key=lambda item: (-item[0], item[1].position))
+        return [channel for _, channel in scored[:limit]]
+
+    def _format_prizes_field(self, prizes: List[str]) -> str:
+        if not prizes:
+            return "None"
+        prizes_text = "\n".join(f"• {p[:200]}" for p in prizes[:10])
+        if len(prizes) > 10:
+            prizes_text += f"\n• ... and {len(prizes) - 10} more"
+        return prizes_text[:1024]
+
+    @staticmethod
+    def _winner_mentions(guild: discord.Guild, winner_ids: List[int]) -> List[str]:
+        mentions: List[str] = []
+        for wid in winner_ids:
+            member = guild.get_member(wid)
+            mentions.append(member.mention if member else f"<@{wid}>")
+        return mentions
+
+    @staticmethod
+    def _claim_followup_text(giveaway_data: Dict[str, Any]) -> str:
+        if giveaway_data.get("dm_winners"):
+            return " Check your DMs to claim your prize."
+        return " Claim your prize using the button on the giveaway message above."
+
+    @staticmethod
+    def _chunk_winner_announcement(
+        mentions: List[str],
+        *,
+        prefix: str,
+        end_punct: str = "!",
+        suffix: str = "",
+        limit: int = 2000,
+    ) -> List[str]:
+        """Build one or more announcement messages; splits only if over the character limit."""
+        if not mentions:
+            return []
+        full = f"{prefix}{', '.join(mentions)}{end_punct}{suffix}"
+        if len(full) <= limit:
+            return [full]
+
+        chunks: List[str] = []
+        current_parts: List[str] = []
+        is_first_chunk = True
+
+        for i, mention in enumerate(mentions):
+            is_last = i == len(mentions) - 1
+            trial_parts = current_parts + [mention]
+            body = ", ".join(trial_parts)
+            text = f"{prefix}{body}" if is_first_chunk else body
+            if is_last:
+                text = f"{text}{end_punct}{suffix}"
+
+            if len(text) <= limit:
+                current_parts.append(mention)
+                continue
+
+            if current_parts:
+                body = ", ".join(current_parts)
+                chunks.append(f"{prefix}{body}" if is_first_chunk else body)
+                is_first_chunk = False
+                current_parts = [mention]
+            else:
+                # Extremely long single token; hard-truncate rather than fail.
+                overflow = f"{prefix}{mention}" if is_first_chunk else mention
+                if is_last:
+                    overflow = f"{overflow}{end_punct}{suffix}"
+                chunks.append(overflow[:limit])
+                is_first_chunk = False
+                current_parts = []
+
+        if current_parts:
+            body = ", ".join(current_parts)
+            text = f"{prefix}{body}" if is_first_chunk else body
+            chunks.append(f"{text}{end_punct}{suffix}")
+        return chunks
+
+    async def _send_winner_announcement(
+        self,
+        channel: discord.abc.Messageable,
+        guild: discord.Guild,
+        winner_ids: List[int],
+        *,
+        prefix: str,
+        end_punct: str = "!",
+        suffix: str = "",
+    ):
+        mentions = self._winner_mentions(guild, winner_ids)
+        for chunk in self._chunk_winner_announcement(
+            mentions,
+            prefix=prefix,
+            end_punct=end_punct,
+            suffix=suffix,
+        ):
+            await channel.send(chunk)
+
+    async def _dm_winners(
+        self,
+        guild: discord.Guild,
+        channel: Optional[discord.TextChannel],
+        message_id: int,
+        winner_ids: List[int],
+        giveaway_data: Dict[str, Any],
+        *,
+        is_reroll: bool = False,
+    ):
+        if not giveaway_data.get("dm_winners") or not winner_ids:
+            return
+        prize_names = self._prizes_list(giveaway_data)
+        claim_enabled = bool(giveaway_data.get("claim_enabled") and giveaway_data.get("claim_seconds"))
+        claim_seconds = int(giveaway_data.get("claim_seconds") or 0)
+        color = await self.bot.get_embed_color(guild)
+        for winner_id in winner_ids:
+            member = guild.get_member(winner_id)
+            if not member:
+                continue
+            if is_reroll:
+                description = f"You have been re-rolled as a winner in **{guild.name}**."
+            else:
+                description = f"You won a giveaway in **{guild.name}**!"
+            embed = discord.Embed(
+                title="You Won!",
+                description=description,
+                color=color,
+            )
+            embed.add_field(name="Prizes", value=self._format_prizes_field(prize_names), inline=False)
+            view = None
+            if claim_enabled:
+                embed.add_field(
+                    name="Claim",
+                    value=(
+                        f"Click **Claim** below within {humanize_timedelta(seconds=claim_seconds)}. "
+                        "If you do not claim in time, your prize will be re-rolled."
+                    ),
+                    inline=False,
+                )
+                # Same custom_id as the channel Claim button; the persistent view already handles it.
+                view = ClaimView(self, guild.id, message_id)
+            if channel:
+                jump_url = f"https://discord.com/channels/{guild.id}/{channel.id}/{message_id}"
+                embed.add_field(name="Giveaway", value=jump_url, inline=False)
+            else:
+                embed.set_footer(text=f"Hosted in {guild.name}")
+            try:
+                await member.send(embed=embed, view=view)
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
     async def _make_giveaway_embed(
         self,
         guild: discord.Guild,
@@ -678,13 +1159,12 @@ class Giveaway(commands.Cog):
         claimed_winner_ids: Optional[List[int]] = None,
         claim_deadline_ts: Optional[float] = None,
         claim_seconds: int = 0,
+        thumbnail_url: Optional[str] = None,
+        image_url: Optional[str] = None,
     ) -> discord.Embed:
         winner_ids = winner_ids or []
         claimed_winner_ids = claimed_winner_ids or []
-        if len(prizes) == 1:
-            title = (prizes[0][:256]) if prizes else "Giveaway"
-        else:
-            title = (prizes[0][:64] + "..." if len(prizes[0]) > 64 else prizes[0]) if prizes else "Giveaway"
+        title = "Giveaway"
         color = await self.bot.get_embed_color(guild)
         if status == "cancelled":
             embed = discord.Embed(
@@ -707,16 +1187,15 @@ class Giveaway(commands.Cog):
                 description=base_desc[:4096],
                 color=color,
             )
-            if len(prizes) > 1:
-                prizes_text = "\n".join(f"• {p[:200]}" for p in prizes[:10])
-                if len(prizes) > 10:
-                    prizes_text += f"\n• ... and {len(prizes) - 10} more"
-                embed.add_field(name="Prizes", value=prizes_text[:1024], inline=False)
+            embed.add_field(name="Prizes", value=self._format_prizes_field(prizes), inline=False)
             embed.add_field(name="Ends", value=f"<t:{int(end_ts)}:R>", inline=True)
-            embed.add_field(name="Entries", value=str(entries_count), inline=True)
             embed.add_field(name="Winners", value=str(winner_count), inline=True)
             host = guild.get_member(host_id)
             embed.set_footer(text=f"Hosted by {host.display_name if host else 'Unknown'} | React with {emoji} to enter")
+            if thumbnail_url:
+                embed.set_thumbnail(url=thumbnail_url)
+            if image_url:
+                embed.set_image(url=image_url)
             return embed
         # ended or claimed
         embed = discord.Embed(
@@ -724,12 +1203,7 @@ class Giveaway(commands.Cog):
             description=description or "Giveaway ended.",
             color=color,
         )
-        if len(prizes) > 1:
-            prizes_text = "\n".join(f"• {p[:200]}" for p in prizes[:10])
-            if len(prizes) > 10:
-                prizes_text += f"\n• ... and {len(prizes) - 10} more"
-            embed.add_field(name="Prizes", value=prizes_text[:1024], inline=False)
-        embed.add_field(name="Entries", value=str(entries_count), inline=True)
+        embed.add_field(name="Prizes", value=self._format_prizes_field(prizes), inline=False)
         if winner_ids:
             winner_mentions = []
             for wid in winner_ids:
@@ -754,6 +1228,10 @@ class Giveaway(commands.Cog):
                 embed.set_footer(text="All prizes have been claimed.")
         else:
             embed.add_field(name="Winner" + ("s" if winner_count != 1 else ""), value="No valid entries.", inline=True)
+        if thumbnail_url:
+            embed.set_thumbnail(url=thumbnail_url)
+        if image_url:
+            embed.set_image(url=image_url)
         return embed
 
     async def _end_giveaway_task(self, guild_id: int, message_id: int):
@@ -812,10 +1290,12 @@ class Giveaway(commands.Cog):
             claimed_winner_ids=[],
             claim_deadline_ts=time.time() + claim_seconds if claim_enabled and claim_seconds and winner_ids else None,
             claim_seconds=claim_seconds,
+            thumbnail_url=data.get("thumbnail_url"),
+            image_url=data.get("image_url"),
         )
         view = None
         if claim_enabled and claim_seconds and winner_ids:
-            view = ClaimView(self, message_id)
+            view = ClaimView(self, guild_id, message_id)
             self.bot.add_view(view, message_id=message_id)
         try:
             await message.edit(embed=embed, view=view)
@@ -823,16 +1303,23 @@ class Giveaway(commands.Cog):
             pass
         if winner_ids:
             try:
-                winner_mentions = []
-                for wid in winner_ids:
-                    m = guild.get_member(wid)
-                    winner_mentions.append(m.mention if m else f"<@{wid}>")
-                announcement = "Congratulations to the winner" + ("s" if len(winner_ids) != 1 else "") + ": " + ", ".join(winner_mentions) + "!"
-                if claim_enabled:
-                    announcement += " Claim your prize using the button on the giveaway message above."
-                await channel.send(announcement[:2000])
+                prefix = (
+                    "Congratulations to the winners: "
+                    if len(winner_ids) != 1
+                    else "Congratulations to the winner: "
+                )
+                suffix = self._claim_followup_text(data) if claim_enabled else ""
+                await self._send_winner_announcement(
+                    channel,
+                    guild,
+                    winner_ids,
+                    prefix=prefix,
+                    end_punct="!",
+                    suffix=suffix,
+                )
             except (discord.HTTPException, discord.Forbidden):
                 pass
+            await self._dm_winners(guild, channel, message_id, winner_ids, data)
         if claim_enabled and claim_seconds and winner_ids:
             delay = claim_seconds
             self._schedule_claim_task_impl(guild_id, message_id, delay)
@@ -863,27 +1350,39 @@ class Giveaway(commands.Cog):
         data = giveaways.get(str(message_id))
         if not data or data.get("status") != "ended":
             return
-        claimed_ids = data.get("claimed_winner_ids") or []
+        claimed_ids = [int(x) for x in (data.get("claimed_winner_ids") or [])]
+        # Preserve claimed winners in their original order.
         winner_ids = self._winner_ids_list(data)
+        claimed_ids = [wid for wid in winner_ids if wid in claimed_ids]
         if len(claimed_ids) >= len(winner_ids):
             return
+
+        unclaimed_count = len(winner_ids) - len(claimed_ids)
         entries = data.get("entries") or []
+        # Do not re-pick anyone who currently holds a winner seat (claimed or unclaimed).
         pool = [u for u in entries if u not in winner_ids]
-        if not pool:
-            return
-        winner_count = self._winner_count(data)
-        k = min(winner_count, len(pool))
-        new_winner_ids = random.sample(pool, k)
-        claim_seconds = data.get("claim_seconds") or 0
-        claim_deadline_ts = time.time() + claim_seconds
+        replacements = []
+        if pool and unclaimed_count > 0:
+            replacements = random.sample(pool, min(unclaimed_count, len(pool)))
+
+        new_winner_ids = claimed_ids + replacements
+        claim_seconds = int(data.get("claim_seconds") or 0)
+        has_unclaimed = bool(replacements)
+        claim_deadline_ts = (time.time() + claim_seconds) if has_unclaimed and claim_seconds > 0 else None
+        status = "claimed" if new_winner_ids and not has_unclaimed else "ended"
+        claimed = status == "claimed"
+
         async with self.config.guild(guild).giveaways() as gws:
             g = gws.get(str(message_id))
             if not g or g.get("status") != "ended":
                 return
             g["winner_id"] = new_winner_ids[0] if new_winner_ids else None
             g["winner_ids"] = new_winner_ids
-            g["claimed_winner_ids"] = []
+            g["claimed_winner_ids"] = list(claimed_ids)
             g["claim_deadline_ts"] = claim_deadline_ts
+            g["status"] = status
+            g["claimed"] = claimed
+
         channel_id = data.get("channel_id")
         channel = guild.get_channel(channel_id)
         if not channel:
@@ -892,6 +1391,7 @@ class Giveaway(commands.Cog):
             message = await channel.fetch_message(message_id)
         except (discord.NotFound, discord.Forbidden):
             return
+
         prizes = self._prizes_list(data)
         embed = await self._make_giveaway_embed(
             guild,
@@ -901,43 +1401,77 @@ class Giveaway(commands.Cog):
             data.get("emoji", "\U0001f389"),
             len(entries),
             data["host_id"],
-            "ended",
-            winner_count=winner_count,
+            status,
+            winner_count=max(len(new_winner_ids), 1),
             winner_ids=new_winner_ids,
-            claimed_winner_ids=[],
+            claimed_winner_ids=claimed_ids,
             claim_deadline_ts=claim_deadline_ts,
-            claim_seconds=claim_seconds,
+            claim_seconds=claim_seconds if has_unclaimed else 0,
+            thumbnail_url=data.get("thumbnail_url"),
+            image_url=data.get("image_url"),
         )
-        view = ClaimView(self, message_id)
-        self.bot.add_view(view, message_id=message_id)
+        view = None
+        if has_unclaimed:
+            view = ClaimView(self, guild_id, message_id)
+            self.bot.add_view(view, message_id=message_id)
         try:
             await message.edit(embed=embed, view=view)
         except discord.HTTPException:
             pass
-        if new_winner_ids and channel:
-            try:
-                winner_mentions = []
-                for wid in new_winner_ids:
-                    m = guild.get_member(wid)
-                    winner_mentions.append(m.mention if m else f"<@{wid}>")
-                announcement = (
-                    "Prize re-rolled. New winner" + ("s" if len(new_winner_ids) != 1 else "") + ": "
-                    + ", ".join(winner_mentions) + ". Claim your prize using the button on the giveaway message above."
+
+        forfeited_slots = unclaimed_count - len(replacements)
+        try:
+            if replacements:
+                prefix = (
+                    "Prize re-rolled. New winners: "
+                    if len(replacements) != 1
+                    else "Prize re-rolled. New winner: "
                 )
-                await channel.send(announcement[:2000])
-            except (discord.HTTPException, discord.Forbidden):
-                pass
-        if claim_seconds > 0:
+                await self._send_winner_announcement(
+                    channel,
+                    guild,
+                    replacements,
+                    prefix=prefix,
+                    end_punct=".",
+                    suffix=self._claim_followup_text(data),
+                )
+                await self._dm_winners(guild, channel, message_id, replacements, data, is_reroll=True)
+            if forfeited_slots > 0:
+                if not claimed_ids and not replacements:
+                    forfeit_msg = (
+                        "Claim window expired. The prize was not claimed and there were "
+                        "no alternate entrants to re-roll to."
+                    )
+                elif claimed_ids and not replacements:
+                    forfeit_msg = (
+                        "Claim window expired. Unclaimed prize(s) were forfeited "
+                        "(no alternate entrants remaining)."
+                    )
+                else:
+                    forfeit_msg = (
+                        f"{forfeited_slots} unclaimed prize(s) were forfeited "
+                        "(not enough alternate entrants remaining)."
+                    )
+                await channel.send(forfeit_msg)
+        except (discord.HTTPException, discord.Forbidden):
+            pass
+
+        if has_unclaimed and claim_seconds > 0:
             self._schedule_claim_task_impl(guild_id, message_id, claim_seconds)
 
-    async def _handle_claim_click(self, interaction: discord.Interaction, message_id: int):
-        if not interaction.guild:
-            await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+    async def _handle_claim_click(self, interaction: discord.Interaction, guild_id: int, message_id: int):
+        guild = self.bot.get_guild(guild_id) or interaction.guild
+        if not guild:
+            await interaction.response.send_message("Could not find the server for this giveaway.", ephemeral=True)
             return
-        giveaways = await self.config.guild(interaction.guild).giveaways()
+        giveaways = await self.config.guild(guild).giveaways()
         data = giveaways.get(str(message_id))
         if not data or data.get("status") != "ended":
             await interaction.response.send_message("This giveaway is no longer active.", ephemeral=True)
+            return
+        deadline = data.get("claim_deadline_ts")
+        if deadline is not None and time.time() > float(deadline):
+            await interaction.response.send_message("The claim window has expired.", ephemeral=True)
             return
         winner_ids = self._winner_ids_list(data)
         claimed_winner_ids = data.get("claimed_winner_ids") or []
@@ -947,33 +1481,53 @@ class Giveaway(commands.Cog):
         if interaction.user.id in claimed_winner_ids:
             await interaction.response.send_message("You have already claimed.", ephemeral=True)
             return
-        async with self.config.guild(interaction.guild).giveaways() as gws:
+        async with self.config.guild(guild).giveaways() as gws:
             g = gws.get(str(message_id))
             if not g:
                 await interaction.response.send_message("Giveaway no longer found.", ephemeral=True)
                 return
+            # Re-check deadline inside the lock against a possible timeout race.
+            deadline = g.get("claim_deadline_ts")
+            if deadline is not None and time.time() > float(deadline):
+                await interaction.response.send_message("The claim window has expired.", ephemeral=True)
+                return
+            if g.get("status") != "ended":
+                await interaction.response.send_message("This giveaway is no longer active.", ephemeral=True)
+                return
+            current_winners = self._winner_ids_list(g)
+            if interaction.user.id not in current_winners:
+                await interaction.response.send_message("Only a winner can claim.", ephemeral=True)
+                return
             g["claimed_winner_ids"] = g.get("claimed_winner_ids") or []
+            if interaction.user.id in g["claimed_winner_ids"]:
+                await interaction.response.send_message("You have already claimed.", ephemeral=True)
+                return
             g["claimed_winner_ids"].append(interaction.user.id)
-            if len(g["claimed_winner_ids"]) >= len(winner_ids):
+            if len(g["claimed_winner_ids"]) >= len(current_winners):
                 g["status"] = "claimed"
                 g["claimed"] = True
-        key = (interaction.guild.id, message_id, "claim")
+        key = (guild.id, message_id, "claim")
         task = self._end_tasks.pop(key, None)
         if task and not task.done():
             task.cancel()
-        channel = interaction.guild.get_channel(data["channel_id"])
+        # If claimed from DM and not all winners have claimed yet, keep scheduling for remaining.
+        data_after = await self.config.guild(guild).giveaways()
+        d = data_after.get(str(message_id)) or data
+        claimed_ids = d.get("claimed_winner_ids") or []
+        winner_ids_updated = self._winner_ids_list(d)
+        if d.get("status") == "ended" and d.get("claim_enabled") and d.get("claim_deadline_ts"):
+            remaining = max(0.0, float(d["claim_deadline_ts"]) - time.time())
+            if remaining > 0 and len(claimed_ids) < len(winner_ids_updated):
+                self._schedule_claim_task_impl(guild.id, message_id, remaining)
+        channel = guild.get_channel(data["channel_id"])
         if channel:
             try:
                 msg = await channel.fetch_message(message_id)
-                data_after = await self.config.guild(interaction.guild).giveaways()
-                d = data_after.get(str(message_id)) or data
                 prizes = self._prizes_list(d)
-                winner_ids_updated = self._winner_ids_list(d)
-                claimed_ids = d.get("claimed_winner_ids") or []
                 claim_deadline_ts = d.get("claim_deadline_ts")
                 claim_seconds = d.get("claim_seconds") or 0
                 embed = await self._make_giveaway_embed(
-                    interaction.guild,
+                    guild,
                     prizes,
                     d.get("description"),
                     d["end_ts"],
@@ -986,6 +1540,8 @@ class Giveaway(commands.Cog):
                     claimed_winner_ids=claimed_ids,
                     claim_deadline_ts=claim_deadline_ts if d.get("status") == "ended" else None,
                     claim_seconds=claim_seconds,
+                    thumbnail_url=d.get("thumbnail_url"),
+                    image_url=d.get("image_url"),
                 )
                 if d.get("status") == "claimed":
                     await msg.edit(embed=embed, view=None)
@@ -994,6 +1550,12 @@ class Giveaway(commands.Cog):
             except (discord.NotFound, discord.HTTPException):
                 pass
         await interaction.response.send_message("You have claimed your prize!", ephemeral=True)
+        # Disable the Claim button on the DM message if they claimed from there.
+        if interaction.message and interaction.guild is None:
+            try:
+                await interaction.message.edit(view=None)
+            except (discord.NotFound, discord.HTTPException):
+                pass
 
     async def _launch_from_draft(
         self,
@@ -1015,10 +1577,15 @@ class Giveaway(commands.Cog):
         emoji = draft.get("emoji") or "\U0001f389"
         claim_enabled = bool(draft.get("claim_enabled"))
         claim_seconds = int(draft.get("claim_seconds") or 0)
+        dm_winners = bool(draft.get("dm_winners", False))
         winner_count = self._winner_count(draft)
+        thumbnail_url = draft.get("thumbnail_url") or None
+        image_url = draft.get("image_url") or None
         end_ts = time.time() + duration_seconds
         embed = await self._make_giveaway_embed(
-            guild, prizes, description, end_ts, emoji, 0, user_id, "active", winner_count=winner_count, claim_seconds=claim_seconds
+            guild, prizes, description, end_ts, emoji, 0, user_id, "active",
+            winner_count=winner_count, claim_seconds=claim_seconds,
+            thumbnail_url=thumbnail_url, image_url=image_url,
         )
         try:
             message = await channel.send(embed=embed)
@@ -1043,6 +1610,9 @@ class Giveaway(commands.Cog):
             "status": "active",
             "claim_enabled": claim_enabled,
             "claim_seconds": claim_seconds,
+            "dm_winners": dm_winners,
+            "thumbnail_url": thumbnail_url,
+            "image_url": image_url,
             "claim_deadline_ts": None,
             "claimed": False,
         }
@@ -1053,12 +1623,12 @@ class Giveaway(commands.Cog):
         self._schedule_end_task(guild.id, message.id, delay)
         if interaction.response.is_done():
             await interaction.followup.send(
-                f"Giveaway started in {channel.mention}: {message.jump_url}",
+                f"Giveaway started: {message.jump_url}",
                 ephemeral=True,
             )
         else:
             await interaction.response.send_message(
-                f"Giveaway started in {channel.mention}: {message.jump_url}",
+                f"Giveaway started: {message.jump_url}",
                 ephemeral=True,
             )
         if builder_message:
@@ -1095,6 +1665,9 @@ class Giveaway(commands.Cog):
         winner_count = self._winner_count(draft)
         claim_enabled = bool(draft.get("claim_enabled"))
         claim_seconds = int(draft.get("claim_seconds") or 0)
+        dm_winners = bool(draft.get("dm_winners", False))
+        thumbnail_url = draft.get("thumbnail_url") or None
+        image_url = draft.get("image_url") or None
         end_ts = time.time() + duration_seconds
         entries = data.get("entries") or []
         channel_id = draft.get("channel_id")
@@ -1106,6 +1679,7 @@ class Giveaway(commands.Cog):
         embed = await self._make_giveaway_embed(
             guild, prizes, description, end_ts, emoji, len(entries), data["host_id"], "active",
             winner_count=winner_count, claim_seconds=claim_seconds,
+            thumbnail_url=thumbnail_url, image_url=image_url,
         )
         if target_channel.id == current_channel_id:
             async with self.config.guild(guild).giveaways() as gws:
@@ -1121,6 +1695,9 @@ class Giveaway(commands.Cog):
                 g["winner_count"] = winner_count
                 g["claim_enabled"] = claim_enabled
                 g["claim_seconds"] = claim_seconds
+                g["dm_winners"] = dm_winners
+                g["thumbnail_url"] = thumbnail_url
+                g["image_url"] = image_url
             self._cancel_tasks_for(guild.id, message_id)
             self._schedule_end_task(guild.id, message_id, max(0.0, end_ts - time.time()))
             try:
@@ -1161,6 +1738,9 @@ class Giveaway(commands.Cog):
                     "status": "active",
                     "claim_enabled": claim_enabled,
                     "claim_seconds": claim_seconds,
+                    "dm_winners": dm_winners,
+                    "thumbnail_url": thumbnail_url,
+                    "image_url": image_url,
                     "claim_deadline_ts": None,
                     "claimed": False,
                 }
@@ -1239,7 +1819,7 @@ class Giveaway(commands.Cog):
                 elif data.get("status") == "ended" and not data.get("claimed"):
                     if data.get("claim_enabled") and data.get("claim_deadline_ts"):
                         dl = data["claim_deadline_ts"]
-                        view = ClaimView(self, int(mid))
+                        view = ClaimView(self, guild.id, int(mid))
                         self.bot.add_view(view, message_id=int(mid))
                         delay = max(0.0, dl - now)
                         self._schedule_claim_task_impl(guild.id, int(mid), delay)
@@ -1284,8 +1864,17 @@ class Giveaway(commands.Cog):
         claim_enabled = draft.get("claim_enabled", False)
         claim_seconds = draft.get("claim_seconds") or 0
         claim_str = humanize_timedelta(seconds=claim_seconds) if claim_seconds else "N/A"
+        dm_winners = bool(draft.get("dm_winners", False))
         ch_id = draft.get("channel_id")
         channel_str = guild.get_channel(ch_id).mention if ch_id else "Current channel"
+        thumbnail_url = draft.get("thumbnail_url")
+        thumbnail_str = thumbnail_url if thumbnail_url else "Not set"
+        if thumbnail_url and len(thumbnail_str) > 60:
+            thumbnail_str = thumbnail_str[:57] + "..."
+        image_url = draft.get("image_url")
+        image_str = image_url if image_url else "Not set"
+        if image_url and len(image_str) > 60:
+            image_str = image_str[:57] + "..."
         embed = discord.Embed(
             title="\U0001f3aa Giveaway Builder",
             description="Use the buttons below to configure your giveaway.",
@@ -1299,6 +1888,9 @@ class Giveaway(commands.Cog):
                 f"**Duration:** {duration_str}\n"
                 f"**Emoji:** {emoji}\n"
                 f"**Claim:** {'Yes' if claim_enabled else 'No'} ({claim_str})\n"
+                f"**DM Winners:** {'Yes' if dm_winners else 'No'}\n"
+                f"**Thumbnail:** {thumbnail_str}\n"
+                f"**Image:** {image_str}\n"
                 f"**Channel:** {channel_str}"
             ),
             inline=False,
@@ -1306,7 +1898,7 @@ class Giveaway(commands.Cog):
         view.message = await ctx.send(embed=embed, view=view)
 
     def _parse_start_options(self, rest: str) -> Dict[str, Any]:
-        """Parse optional flags from rest string. Returns dict with prize(s), winners, channel_id, claim_seconds, emoji, description."""
+        """Parse optional flags from rest string."""
         rest = (rest or "").strip()
         options = {
             "prizes": [],
@@ -1315,6 +1907,9 @@ class Giveaway(commands.Cog):
             "claim_seconds": 0,
             "emoji": "\U0001f389",
             "description": None,
+            "dm_winners": False,
+            "thumbnail_url": None,
+            "image_url": None,
         }
         if not rest:
             return options
@@ -1360,6 +1955,17 @@ class Giveaway(commands.Cog):
                     options["emoji"] = value[:100]
             elif key == "description":
                 options["description"] = value or None
+            elif key == "thumbnail":
+                if value and (value.startswith("http://") or value.startswith("https://")):
+                    options["thumbnail_url"] = value[:2000]
+            elif key == "image":
+                if value and (value.startswith("http://") or value.startswith("https://")):
+                    options["image_url"] = value[:2000]
+            elif key in ("dm", "dmwinners"):
+                if not value:
+                    options["dm_winners"] = True
+                else:
+                    options["dm_winners"] = value.lower() in ("yes", "y", "true", "1", "on")
         return options
 
     @giveaway.command(name="start")
@@ -1373,7 +1979,7 @@ class Giveaway(commands.Cog):
     ):
         """Start a giveaway with optional flags.
 
-        **Usage:** `[p]giveaway start <duration> <prize> [--winners N] [--channel #channel] [--claim 24h] [--emoji EMOJI] [--description "text"]`
+        **Usage:** `[p]giveaway start <duration> <prize> [--winners N] [--channel #channel] [--claim 24h] [--dm yes] [--emoji EMOJI] [--thumbnail URL] [--image URL] [--description "text"]`
 
         **Examples:**
         - `[p]giveaway start 1d Nitro`
@@ -1420,8 +2026,13 @@ class Giveaway(commands.Cog):
         description = opts["description"]
         claim_seconds = opts["claim_seconds"]
         claim_enabled = claim_seconds >= 60
+        dm_winners = bool(opts.get("dm_winners"))
+        thumbnail_url = opts.get("thumbnail_url")
+        image_url = opts.get("image_url")
         embed = await self._make_giveaway_embed(
-            ctx.guild, prizes_list, description, end_ts, emoji, 0, ctx.author.id, "active", winner_count=winner_count, claim_seconds=claim_seconds
+            ctx.guild, prizes_list, description, end_ts, emoji, 0, ctx.author.id, "active",
+            winner_count=winner_count, claim_seconds=claim_seconds,
+            thumbnail_url=thumbnail_url, image_url=image_url,
         )
         try:
             message = await channel.send(embed=embed)
@@ -1446,6 +2057,9 @@ class Giveaway(commands.Cog):
             "status": "active",
             "claim_enabled": claim_enabled,
             "claim_seconds": claim_seconds,
+            "dm_winners": dm_winners,
+            "thumbnail_url": thumbnail_url,
+            "image_url": image_url,
             "claim_deadline_ts": None,
             "claimed": False,
         }
@@ -1453,7 +2067,7 @@ class Giveaway(commands.Cog):
             gws[str(message.id)] = giveaway_data
         delay = max(0.0, end_ts - time.time())
         self._schedule_end_task(ctx.guild.id, message.id, delay)
-        await ctx.send(f"Giveaway started in {channel.mention}: {message.jump_url}")
+        await ctx.send(f"Giveaway started: {message.jump_url}")
 
     @giveaway.command(name="reroll")
     @commands.admin_or_permissions(manage_guild=True)
@@ -1513,23 +2127,30 @@ class Giveaway(commands.Cog):
                     claimed_winner_ids=[],
                     claim_deadline_ts=time.time() + data.get("claim_seconds", 0),
                     claim_seconds=data.get("claim_seconds", 0),
+                    thumbnail_url=data.get("thumbnail_url"),
+                    image_url=data.get("image_url"),
                 )
-                view = ClaimView(self, mid)
+                view = ClaimView(self, ctx.guild.id, mid)
                 self.bot.add_view(view, message_id=mid)
                 await msg.edit(embed=embed, view=view)
                 if new_winner_ids and data.get("claim_enabled") and data.get("claim_seconds"):
                     try:
-                        winner_mentions = []
-                        for wid in new_winner_ids:
-                            m = ctx.guild.get_member(wid)
-                            winner_mentions.append(m.mention if m else f"<@{wid}>")
-                        announcement = (
-                            "Rerolled! New winner" + ("s" if len(new_winner_ids) != 1 else "") + ": "
-                            + ", ".join(winner_mentions) + ". Claim your prize using the button on the giveaway message above."
+                        prefix = (
+                            "Rerolled! New winners: "
+                            if len(new_winner_ids) != 1
+                            else "Rerolled! New winner: "
                         )
-                        await channel.send(announcement[:2000])
+                        await self._send_winner_announcement(
+                            channel,
+                            ctx.guild,
+                            new_winner_ids,
+                            prefix=prefix,
+                            end_punct=".",
+                            suffix=self._claim_followup_text(data),
+                        )
                     except (discord.HTTPException, discord.Forbidden):
                         pass
+                await self._dm_winners(ctx.guild, channel, mid, new_winner_ids, data, is_reroll=True)
             except (discord.NotFound, discord.HTTPException):
                 pass
         if data.get("claim_enabled") and data.get("claim_seconds"):
@@ -1620,8 +2241,17 @@ class Giveaway(commands.Cog):
             claim_enabled = draft.get("claim_enabled", False)
             claim_seconds = draft.get("claim_seconds") or 0
             claim_str = humanize_timedelta(seconds=claim_seconds) if claim_seconds else "N/A"
+            dm_winners = bool(draft.get("dm_winners", False))
             ch_id = draft.get("channel_id")
             channel_str = ctx.guild.get_channel(ch_id).mention if ch_id else "Current channel"
+            thumbnail_url = draft.get("thumbnail_url")
+            thumbnail_str = thumbnail_url if thumbnail_url else "Not set"
+            if thumbnail_url and len(thumbnail_str) > 60:
+                thumbnail_str = thumbnail_str[:57] + "..."
+            image_url = draft.get("image_url")
+            image_str = image_url if image_url else "Not set"
+            if image_url and len(image_str) > 60:
+                image_str = image_str[:57] + "..."
             embed = discord.Embed(
                 title="\U0001f3aa Giveaway Builder (Editing)",
                 description="Use the buttons below to update the giveaway.",
@@ -1635,6 +2265,9 @@ class Giveaway(commands.Cog):
                     f"**Duration:** {duration_str}\n"
                     f"**Emoji:** {emoji}\n"
                     f"**Claim:** {'Yes' if claim_enabled else 'No'} ({claim_str})\n"
+                    f"**DM Winners:** {'Yes' if dm_winners else 'No'}\n"
+                    f"**Thumbnail:** {thumbnail_str}\n"
+                    f"**Image:** {image_str}\n"
                     f"**Channel:** {channel_str}"
                 ),
                 inline=False,
@@ -1664,6 +2297,8 @@ class Giveaway(commands.Cog):
                     "active",
                     winner_count=self._winner_count(d),
                     claim_seconds=claim_seconds,
+                    thumbnail_url=d.get("thumbnail_url"),
+                    image_url=d.get("image_url"),
                 )
                 await msg.edit(embed=embed)
             except (discord.NotFound, discord.HTTPException):
