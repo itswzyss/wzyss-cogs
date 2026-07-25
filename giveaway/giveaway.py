@@ -850,6 +850,7 @@ class Giveaway(commands.Cog):
         }
         self.config.register_guild(**default_guild)
         self._end_tasks: Dict[_TaskKey, asyncio.Task] = {}
+        self._restore_task: Optional[asyncio.Task] = None
         log.info("Giveaway cog initialized")
 
     async def _get_draft(self, guild_id: int, user_id: int) -> Dict[str, Any]:
@@ -935,6 +936,30 @@ class Giveaway(commands.Cog):
                 self._end_tasks.pop(self._task_key(guild_id, message_id), None)
 
         self._end_tasks[self._task_key(guild_id, message_id)] = self.bot.loop.create_task(run())
+
+    async def _collect_entries_from_message(
+        self,
+        message: discord.Message,
+        emoji: str,
+    ) -> List[int]:
+        """Build entrant list from the message reactions (source of truth after restarts)."""
+        entries: List[int] = []
+        for reaction in message.reactions:
+            if str(reaction.emoji) != emoji:
+                continue
+            try:
+                async for user in reaction.users():
+                    if user.bot:
+                        continue
+                    if user.id not in entries:
+                        entries.append(user.id)
+            except (discord.HTTPException, discord.Forbidden) as e:
+                log.warning(
+                    "Could not fetch reaction users for message %s: %s",
+                    message.id,
+                    e,
+                )
+        return entries
 
     async def _add_reaction_safe(self, message: discord.Message, emoji: str):
         try:
@@ -1254,7 +1279,14 @@ class Giveaway(commands.Cog):
             async with self.config.guild(guild).giveaways() as gws:
                 gws.pop(str(message_id), None)
             return
-        entries = data.get("entries") or []
+        emoji = data.get("emoji", "\U0001f389")
+        # Prefer live reactions so entries survive bot downtime / daily restarts.
+        reaction_entries = await self._collect_entries_from_message(message, emoji)
+        stored_entries = data.get("entries") or []
+        if reaction_entries:
+            entries = reaction_entries
+        else:
+            entries = list(stored_entries)
         winner_count = self._winner_count(data)
         winner_ids = []
         if entries:
@@ -1281,7 +1313,7 @@ class Giveaway(commands.Cog):
             prizes,
             data.get("description"),
             data["end_ts"],
-            data.get("emoji", "\U0001f389"),
+            emoji,
             len(entries),
             data["host_id"],
             "ended",
@@ -1808,23 +1840,104 @@ class Giveaway(commands.Cog):
                 g["entries"] = entries
 
     async def cog_load(self):
+        # Guild cache is often empty during cog_load on bot startup; restore after ready.
+        self._restore_task = asyncio.create_task(self._restore_giveaways())
+
+    async def _restore_giveaways(self):
+        """Reschedule active/ended giveaways after restart; end any that are already overdue."""
+        try:
+            await self.bot.wait_until_ready()
+        except asyncio.CancelledError:
+            return
+        now = time.time()
+        restored_active = 0
+        ended_overdue = 0
+        restored_claims = 0
         for guild in self.bot.guilds:
-            giveaways = await self.config.guild(guild).giveaways()
-            now = time.time()
+            try:
+                giveaways = await self.config.guild(guild).giveaways()
+            except Exception:
+                log.exception("Failed to load giveaways for guild %s during restore", guild.id)
+                continue
             for mid, data in list(giveaways.items()):
-                if data.get("status") == "active":
-                    end_ts = data.get("end_ts") or 0
-                    delay = max(0.0, end_ts - now)
-                    self._schedule_end_task(guild.id, int(mid), delay)
-                elif data.get("status") == "ended" and not data.get("claimed"):
-                    if data.get("claim_enabled") and data.get("claim_deadline_ts"):
-                        dl = data["claim_deadline_ts"]
-                        view = ClaimView(self, guild.id, int(mid))
-                        self.bot.add_view(view, message_id=int(mid))
-                        delay = max(0.0, dl - now)
-                        self._schedule_claim_task_impl(guild.id, int(mid), delay)
+                try:
+                    message_id = int(mid)
+                    if data.get("status") == "active":
+                        end_ts = float(data.get("end_ts") or 0)
+                        delay = max(0.0, end_ts - now)
+                        if delay <= 0:
+                            log.info(
+                                "Restoring overdue giveaway %s in guild %s (ending now)",
+                                message_id,
+                                guild.id,
+                            )
+                            await self._end_giveaway_task(guild.id, message_id)
+                            ended_overdue += 1
+                        else:
+                            # Sync stored entries from live reactions while we're online.
+                            await self._sync_active_entries(guild, message_id, data)
+                            self._schedule_end_task(guild.id, message_id, delay)
+                            restored_active += 1
+                    elif data.get("status") == "ended" and not data.get("claimed"):
+                        if data.get("claim_enabled") and data.get("claim_deadline_ts"):
+                            dl = float(data["claim_deadline_ts"])
+                            view = ClaimView(self, guild.id, message_id)
+                            self.bot.add_view(view, message_id=message_id)
+                            delay = max(0.0, dl - now)
+                            if delay <= 0:
+                                log.info(
+                                    "Restoring overdue claim timeout for giveaway %s in guild %s",
+                                    message_id,
+                                    guild.id,
+                                )
+                                await self._claim_timeout_task(guild.id, message_id)
+                            else:
+                                self._schedule_claim_task_impl(guild.id, message_id, delay)
+                            restored_claims += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception(
+                        "Failed to restore giveaway %s in guild %s",
+                        mid,
+                        guild.id,
+                    )
+        log.info(
+            "Giveaway restore complete: %s active scheduled, %s overdue ended, %s claim timers restored",
+            restored_active,
+            ended_overdue,
+            restored_claims,
+        )
+
+    async def _sync_active_entries(
+        self,
+        guild: discord.Guild,
+        message_id: int,
+        data: Dict[str, Any],
+    ):
+        """Refresh stored entries from message reactions for an active giveaway."""
+        channel = guild.get_channel(data.get("channel_id"))
+        if not channel:
+            return
+        try:
+            message = await channel.fetch_message(message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+        emoji = data.get("emoji", "\U0001f389")
+        entries = await self._collect_entries_from_message(message, emoji)
+        async with self.config.guild(guild).giveaways() as gws:
+            g = gws.get(str(message_id))
+            if g and g.get("status") == "active":
+                g["entries"] = entries
 
     async def cog_unload(self):
+        restore_task = getattr(self, "_restore_task", None)
+        if restore_task and not restore_task.done():
+            restore_task.cancel()
+            try:
+                await restore_task
+            except (asyncio.CancelledError, Exception):
+                pass
         for task in self._end_tasks.values():
             if not task.done():
                 task.cancel()
