@@ -4900,9 +4900,6 @@ class Applications(commands.Cog):
 
         while True:
             try:
-                # Wait 1 hour before checking again
-                await asyncio.sleep(3600)
-
                 log.debug("Running application cleanup check")
 
                 for guild in self.bot.guilds:
@@ -4982,6 +4979,9 @@ class Applications(commands.Cog):
 
                     except Exception as e:
                         log.error(f"Error in cleanup loop for guild {guild.name}: {e}", exc_info=True)
+
+                # Wait 1 hour before checking again
+                await asyncio.sleep(3600)
 
             except asyncio.CancelledError:
                 log.info("Cleanup loop cancelled")

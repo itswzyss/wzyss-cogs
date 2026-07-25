@@ -337,15 +337,38 @@ class Remindme(commands.Cog):
                     log.warning("Remindme: channel gone, could not DM user %s", user_id)
 
     async def cog_load(self) -> None:
+        self._restore_task = asyncio.create_task(self._restore_timers())
+
+    async def _restore_timers(self) -> None:
+        # Guild/channel cache is often incomplete during cog_load on bot startup; restore after ready.
+        try:
+            await self.bot.wait_until_ready()
+        except asyncio.CancelledError:
+            return
         timers = await _get_timers(self.config)
         now = time.time()
         for t in timers:
             tid = t.get("id")
+            if not tid:
+                continue
             end_ts = t.get("end_ts", 0)
-            if tid and end_ts > now:
+            if end_ts > now:
                 self._schedule_timer(tid)
+            else:
+                log.info("Restoring overdue reminder %s (firing now)", tid)
+                try:
+                    await self._fire_timer(tid)
+                except Exception:
+                    log.exception("Failed to fire overdue reminder %s", tid)
 
     async def cog_unload(self) -> None:
+        restore_task = getattr(self, "_restore_task", None)
+        if restore_task and not restore_task.done():
+            restore_task.cancel()
+            try:
+                await restore_task
+            except (asyncio.CancelledError, Exception):
+                pass
         for task in self._timer_tasks.values():
             if not task.done():
                 task.cancel()

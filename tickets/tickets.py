@@ -356,10 +356,28 @@ class Tickets(commands.Cog):
 
     async def cog_load(self):
         """Re-schedule tasks for open tickets."""
+        self._restore_task = asyncio.create_task(self._restore_tickets())
+
+    async def _restore_tickets(self):
+        # Guild cache is often empty during cog_load on bot startup; restore after ready.
+        try:
+            await self.bot.wait_until_ready()
+        except asyncio.CancelledError:
+            return
         for guild in self.bot.guilds:
-            await self._restart_tasks_for_guild(guild)
+            try:
+                await self._restart_tasks_for_guild(guild)
+            except Exception:
+                log.exception("Failed to restore ticket tasks for guild %s", guild.id)
 
     async def cog_unload(self):
+        restore_task = getattr(self, "_restore_task", None)
+        if restore_task and not restore_task.done():
+            restore_task.cancel()
+            try:
+                await restore_task
+            except (asyncio.CancelledError, Exception):
+                pass
         for task in list(self._auto_assign_tasks.values()):
             if not task.done():
                 task.cancel()
@@ -389,9 +407,16 @@ class Tickets(commands.Cog):
                 continue
             created_at = data.get("created_at") or 0
             if delay_sec and created_at:
-                remaining = max(0, delay_sec - (now - created_at))
+                remaining = max(0.0, delay_sec - (now - created_at))
                 if remaining > 0:
                     self._schedule_auto_assign(guild.id, cid, remaining)
+                else:
+                    log.info(
+                        "Restoring overdue auto-assign for ticket channel %s in guild %s (assigning now)",
+                        cid,
+                        guild.id,
+                    )
+                    await self._run_auto_assign(guild.id, cid)
             if inact_sec and inact_sec > 0:
                 self._ensure_inactivity_loop(guild.id)
         return
