@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a **Red-DiscordBot cog repository** — a collection of 16 custom cogs (plugins) for [Red-DiscordBot](https://github.com/Cog-Creators/Red-DiscordBot) v3.4.0+. There is no build system, test runner, or package manager. Cogs are loaded directly into a running Red bot instance via `[p]cog install` / `[p]cog load`.
+This is a **Red-DiscordBot cog repository** — a collection of custom cogs (plugins) for [Red-DiscordBot](https://github.com/Cog-Creators/Red-DiscordBot) v3.4.0+. There is no build system, test runner, or package manager. Cogs are loaded directly into a running Red bot instance via `[p]cog install` / `[p]cog load`.
 
 ## Development Workflow
 

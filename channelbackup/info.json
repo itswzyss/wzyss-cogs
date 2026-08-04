@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing ChannelBackup! Use `[p]help channelbackup` to see commands. Requires Manage Channels (or admin).",
+    "name": "ChannelBackup",
+    "short": "Backup and restore channel structure, settings, and permissions.",
+    "description": "Creates named backups of a guild's categories, text channels, voice channels, stage channels, and forums — including per-channel and per-category permission overwrites. Restore updates existing channels by ID (and optionally recreates missing ones) without deleting channels that are not in the backup.",
+    "tags": ["channels", "backup", "permissions", "utility", "moderation"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}

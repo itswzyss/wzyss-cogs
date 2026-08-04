@@ -55,6 +55,15 @@ Manage booster-dependent custom roles and boost notifications. Tracks configured
 
 ---
 
+### ChannelBackup
+**Install:** `[p]cog install wzyss-cogs channelbackup`
+
+Backup and restore channel structure, settings, and permissions. Creates named backups of categories, text/news channels, voice channels, stage channels, and forums — including per-channel and per-category permission overwrites. Restore updates existing channels by ID (optionally recreates missing ones) without deleting channels absent from the backup.
+
+**Tags:** channels, backup, permissions, utility, moderation
+
+---
+
 ### ChannelNotify
 **Install:** `[p]cog install wzyss-cogs channelnotify`
 
