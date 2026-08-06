@@ -15,9 +15,10 @@ To install this cog, run the following commands in your Red bot:
 ## Features
 
 - **Three VC Types**: Public, Personal, and Private
+- **Interactive Setup Dashboard**: `[p]autovcset setup` — add, edit, and remove source VCs and configure the member role entirely through buttons and dropdowns
 - **Automatic VC Creation**: Creates VCs when users join source channels
 - **Owner Management**: Personal and Private VCs have owners; control is via bot commands and VC chat buttons only (no Discord role, so 2FA-for-mods is not triggered)
-- **VC Commands**: Owners use `[p]autovc lock`, `[p]autovc name`, etc. (user commands); admins use `[p]autovcset add`, etc. (admin commands)
+- **VC Commands**: Owners use `[p]autovc lock`, `[p]autovc name`, etc. (user commands)
 - **VC Chat Controls**: Auto-posted embeds with buttons in each personal/private VC text chat
 - **Automatic Cleanup**: Empty VCs are automatically deleted
 - **Owner Claiming**: Users can claim VCs after owner leaves (5-minute wait)
@@ -26,49 +27,37 @@ To install this cog, run the following commands in your Red bot:
 
 ## Setup
 
-### 1. Configure Source VCs
-
-Source VCs are the voice channels that trigger automatic VC creation when users join them.
-
-#### Add a Source VC
+### 1. Open the Setup Dashboard
 
 ```
-[p]autovcset add <source_vc> <type> [category]
+[p]autovcset setup
 ```
 
-**Types:**
-- `public` - Anyone can join, no owner
-- `personal` - Owner-controlled, visible to everyone by default
-- `private` - Owner-controlled, hidden by default
+This opens an interactive, menu-driven dashboard (buttons + dropdowns) for admins with **Manage Server** permission:
 
-**Examples:**
-```
-[p]autovcset add #Create Public public
-[p]autovcset add #Create Personal personal
-[p]autovcset add #Create Private private #Private-VCs
-```
+- **Add Source VC** — search for a voice channel by name, pick its type (`Public`, `Personal`, or `Private`) from a dropdown, then pick a category (or default to the VC's own category)
+- **Edit Source VC** — pick a configured source from a dropdown to open its editor, where you can change its type and category (dropdowns, apply instantly), set a name template or name pool, or delete it
+- **Remove Source VC** — pick a source and confirm to remove it
+- **Member Role** — pick the @Member role (if your server uses one instead of @everyone), or clear it
 
-If you don't specify a category, created VCs will be placed in the same category as the source VC.
+All changes apply immediately — there's no separate "save" step.
 
-#### List Source VCs
+#### Editing Naming
+
+From a source's editor, **Set Name Template** opens a text field for a template using `{num}` (sequential number) and `{user}` (member's display name); leave it blank to clear. **Manage Name Pool** opens a sub-panel to add/remove names, clear the pool, and switch between `sequential` and `random` selection mode via dropdown.
+
+### 2. View Settings
 
 ```
 [p]autovcset list
+[p]autovcset settings
 ```
 
-Shows all configured source VCs and their types.
+`list` shows all configured source VCs and their types; `settings` shows a summary (source VC count, active VCs, member role).
 
-#### Remove a Source VC
+### 3. Configure Member Role via Command (Optional)
 
-```
-[p]autovcset remove <source_vc>
-```
-
-Removes a source VC from the configuration.
-
-### 2. Configure Member Role (Optional)
-
-If your server uses a @Member role instead of @everyone for base permissions, configure it:
+The dashboard's **Member Role** button covers this interactively, but a quick command is also available:
 
 ```
 [p]autovcset memberrole @Member
@@ -79,14 +68,6 @@ To clear and use @everyone instead:
 ```
 [p]autovcset memberrole
 ```
-
-### 3. View Settings
-
-```
-[p]autovcset settings
-```
-
-Shows current configuration including source VCs count, active VCs, and member role.
 
 ## VC Types Explained
 
@@ -176,11 +157,10 @@ When you use **slash commands** for user commands, AutoVC replies **ephemerally 
 
 ### Admin Commands (autovcset)
 
-- `[p]autovcset add <source_vc> <type> [category]` - Add a source VC
-- `[p]autovcset remove <source_vc>` - Remove a source VC
+- `[p]autovcset setup` - Open the interactive setup dashboard (add/edit/remove source VCs, member role)
 - `[p]autovcset list` - List all source VCs
 - `[p]autovcset settings` - Show current settings
-- `[p]autovcset memberrole [role]` - Set or clear member role
+- `[p]autovcset memberrole [role]` - Set or clear member role (quick command; also available in the dashboard)
 
 ### User Commands (autovc)
 

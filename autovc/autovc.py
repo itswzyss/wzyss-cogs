@@ -342,6 +342,780 @@ class AccessManagementView(View):
         await interaction.followup.send("Select a user to revoke access from:", view=view, ephemeral=True)
 
 
+def _bound_button(
+    label: str,
+    style: discord.ButtonStyle,
+    emoji: Optional[str],
+    callback,
+    row: Optional[int] = None,
+) -> Button:
+    """Build a Button with a pre-bound async callback (for dynamically assembled views)."""
+    btn = Button(label=label, style=style, emoji=emoji, row=row)
+    btn.callback = callback
+    return btn
+
+
+class _GhostChannel:
+    """Stand-in for a configured source VC whose Discord channel was deleted, so it can still be selected."""
+
+    def __init__(self, channel_id: int):
+        self.id = channel_id
+        self.name = f"Deleted channel ({channel_id})"
+        self.mention = f"`{channel_id}`"
+        self.category = None
+
+
+class TypeSelect(discord.ui.Select):
+    """Static dropdown for the three AutoVC source types."""
+
+    def __init__(self, on_choose, current: Optional[str] = None):
+        options = [
+            discord.SelectOption(
+                label="Public", value="public", emoji="🔓",
+                description="Anyone can join, no owner",
+                default=(current == "public"),
+            ),
+            discord.SelectOption(
+                label="Personal", value="personal", emoji="🙋",
+                description="Owner-controlled, visible by default",
+                default=(current == "personal"),
+            ),
+            discord.SelectOption(
+                label="Private", value="private", emoji="🔒",
+                description="Owner-controlled, hidden by default",
+                default=(current == "private"),
+            ),
+        ]
+        super().__init__(placeholder="Choose a VC type...", options=options)
+        self._on_choose = on_choose
+
+    async def callback(self, interaction: discord.Interaction):
+        await self._on_choose(interaction, self.values[0])
+
+
+class ModeSelect(discord.ui.Select):
+    """Static dropdown for name pool selection mode."""
+
+    def __init__(self, on_choose, current: str = "sequential"):
+        options = [
+            discord.SelectOption(
+                label="Sequential", value="sequential",
+                description="Use names in order", default=(current == "sequential"),
+            ),
+            discord.SelectOption(
+                label="Random", value="random",
+                description="Pick a random name each time", default=(current == "random"),
+            ),
+        ]
+        super().__init__(placeholder="Pool selection mode...", options=options)
+        self._on_choose = on_choose
+
+    async def callback(self, interaction: discord.Interaction):
+        await self._on_choose(interaction, self.values[0])
+
+
+class CategorySelect(discord.ui.Select):
+    """Dropdown of guild categories, optionally with a 'use this VC's own category' option."""
+
+    def __init__(
+        self,
+        categories: List[discord.CategoryChannel],
+        on_choose,
+        own_category: Optional[discord.CategoryChannel] = None,
+        current_category_id: Optional[int] = None,
+    ):
+        options = []
+        if own_category is not None:
+            options.append(
+                discord.SelectOption(
+                    label=f"Use this VC's category ({own_category.name})"[:100],
+                    value="__own__",
+                    default=(current_category_id is None),
+                )
+            )
+        remaining = 25 - len(options)
+        for c in categories[:remaining]:
+            options.append(
+                discord.SelectOption(
+                    label=c.name[:100],
+                    value=str(c.id),
+                    default=(current_category_id is not None and current_category_id == c.id),
+                )
+            )
+        super().__init__(placeholder="Choose a category...", options=options)
+        self._on_choose = on_choose
+        self._own_category = own_category
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+        category = self._own_category if value == "__own__" else interaction.guild.get_channel(int(value))
+        await self._on_choose(interaction, category)
+
+
+class PickerSelect(discord.ui.Select):
+    """Generic dropdown of arbitrary objects (channels, roles, ...) by id."""
+
+    def __init__(self, items: List, item_label, on_select, allow_clear: bool = False, clear_label: str = "Clear"):
+        options = []
+        if allow_clear:
+            options.append(discord.SelectOption(label=clear_label[:100], value="__clear__", emoji="🚫"))
+        max_items = 25 - len(options)
+        for item in items[:max_items]:
+            options.append(discord.SelectOption(label=item_label(item)[:100], value=str(item.id)))
+        super().__init__(placeholder="Choose one...", options=options, min_values=1, max_values=1)
+        self._items_by_id = {str(item.id): item for item in items}
+        self._on_select = on_select
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+        obj = None if value == "__clear__" else self._items_by_id.get(value)
+        await self._on_select(interaction, obj)
+
+
+class PickerResultView(View):
+    """Ephemeral view holding a single PickerSelect."""
+
+    def __init__(self, items: List, item_label, on_select, allow_clear: bool = False, clear_label: str = "Clear", timeout: int = 60):
+        super().__init__(timeout=timeout)
+        self.add_item(PickerSelect(items, item_label, on_select, allow_clear=allow_clear, clear_label=clear_label))
+
+
+class PickerSearchModal(Modal):
+    """Generic 'search then select' modal, used when a candidate list may exceed 25 entries."""
+
+    def __init__(
+        self,
+        title: str,
+        items: List,
+        item_label,
+        on_select,
+        allow_clear: bool = False,
+        clear_label: str = "Clear",
+        empty_msg: str = "No matches found.",
+    ):
+        super().__init__(title=title[:45])
+        self.items = items
+        self.item_label = item_label
+        self.on_select = on_select
+        self.allow_clear = allow_clear
+        self.clear_label = clear_label
+        self.empty_msg = empty_msg
+        self.query_input = TextInput(
+            label="Search (leave blank to show all)",
+            required=False,
+            max_length=100,
+        )
+        self.add_item(self.query_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        query = self.query_input.value.strip().lower()
+        matches = [i for i in self.items if not query or query in self.item_label(i).lower()]
+        if not matches and not self.allow_clear:
+            await interaction.response.send_message(self.empty_msg, ephemeral=True)
+            return
+        max_items = 25 - (1 if self.allow_clear else 0)
+        truncated = len(matches) > max_items
+        note = "\n*Showing first results — refine your search to narrow down.*" if truncated else ""
+        view = PickerResultView(matches, self.item_label, self.on_select, allow_clear=self.allow_clear, clear_label=self.clear_label)
+        await interaction.response.send_message(f"Select one:{note}", view=view, ephemeral=True)
+
+
+class ConfirmView(View):
+    """Generic Yes/No confirmation view, restricted to the user who triggered it."""
+
+    def __init__(self, user_id: int, on_confirm, on_cancel=None, timeout: int = 60):
+        super().__init__(timeout=timeout)
+        self.user_id = user_id
+        self.on_confirm = on_confirm
+        self.on_cancel = on_cancel
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This confirmation isn't for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger, emoji="✅")
+    async def confirm(self, interaction: discord.Interaction, button: Button):
+        await self.on_confirm(interaction)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️")
+    async def cancel(self, interaction: discord.Interaction, button: Button):
+        if self.on_cancel:
+            await self.on_cancel(interaction)
+        else:
+            await interaction.response.edit_message(content="Cancelled.", embed=None, view=None)
+
+
+class NameTemplateModal(Modal):
+    """Modal for setting/clearing a source VC's name template."""
+
+    def __init__(self, editor: "SourceEditorView", current: str):
+        super().__init__(title="Set Name Template")
+        self.editor = editor
+        self.template_input = TextInput(
+            label="Template ({num}, {user})",
+            placeholder="e.g. Squad {num}  (blank = default naming)",
+            required=False,
+            max_length=100,
+            default=current or None,
+        )
+        self.add_item(self.template_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        editor = self.editor
+        source_vcs, cfg = await editor._get_cfg(guild)
+        if not cfg:
+            await interaction.response.send_message("This source VC no longer exists.", ephemeral=True)
+            return
+        cfg["name_template"] = self.template_input.value.strip() or None
+        source_vcs[str(editor.source_vc_id)] = cfg
+        await editor.cog.config.guild(guild).source_vcs.set(source_vcs)
+        embed, view = await editor.build(guild)
+        await interaction.response.edit_message(embed=embed, view=view)
+        await editor.dashboard.refresh()
+
+
+class AddNameModal(Modal, title="Add Name to Pool"):
+    """Modal for adding a single name to a source VC's name pool."""
+
+    name_input = TextInput(label="Name", max_length=100, required=True)
+
+    def __init__(self, pool_view: "NamePoolView"):
+        super().__init__()
+        self.pool_view = pool_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        editor = self.pool_view.editor
+        source_vcs, cfg = await editor._get_cfg(guild)
+        if not cfg:
+            await interaction.response.send_message("This source VC no longer exists.", ephemeral=True)
+            return
+        pool: List[str] = cfg.setdefault("name_pool", [])
+        pool.append(self.name_input.value.strip()[:100])
+        source_vcs[str(editor.source_vc_id)] = cfg
+        await editor.cog.config.guild(guild).source_vcs.set(source_vcs)
+        embed, view = await self.pool_view.build(guild)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class NamePoolView(View):
+    """Sub-view for managing a source VC's name pool, reached from SourceEditorView."""
+
+    def __init__(self, editor: "SourceEditorView"):
+        super().__init__(timeout=300)
+        self.editor = editor
+
+    async def build(self, guild: discord.Guild):
+        _, cfg = await self.editor._get_cfg(guild)
+        self.clear_items()
+
+        if not cfg:
+            embed = discord.Embed(title="Source VC no longer exists", color=discord.Color.red())
+            self.add_item(_bound_button("Close", discord.ButtonStyle.secondary, "↩️", self._back_to_editor_cb()))
+            return embed, self
+
+        pool: List[str] = cfg.get("name_pool", [])
+        mode = cfg.get("name_pool_mode", "sequential")
+        vc = guild.get_channel(self.editor.source_vc_id)
+
+        embed = discord.Embed(
+            title=f"Name Pool: {vc.name if vc else self.editor.source_vc_id}",
+            color=await self.editor.cog.bot.get_embed_color(guild),
+        )
+        if pool:
+            lines = "\n".join(f"{i + 1}. {name}" for i, name in enumerate(pool))
+            if len(lines) > 1024:
+                lines = lines[:1000] + "\n…(truncated)"
+            embed.add_field(name=f"Names ({len(pool)})", value=lines, inline=False)
+        else:
+            embed.add_field(name="Names", value="No names in pool yet. Add one below.", inline=False)
+        embed.add_field(name="Mode", value=mode, inline=False)
+        embed.set_footer(text="If the pool is empty, the name template (or default naming) is used instead.")
+
+        self.add_item(ModeSelect(self._on_mode_change, current=mode))
+        self.add_item(_bound_button("Add Name", discord.ButtonStyle.success, "➕", self._on_add_name))
+        if pool:
+            self.add_item(_bound_button("Remove Name", discord.ButtonStyle.secondary, "➖", self._on_remove_name))
+            self.add_item(_bound_button("Clear Pool", discord.ButtonStyle.danger, "🗑️", self._on_clear_pool))
+        self.add_item(_bound_button("Back", discord.ButtonStyle.secondary, "↩️", self._back_to_editor_cb()))
+        return embed, self
+
+    def _back_to_editor_cb(self):
+        async def cb(interaction: discord.Interaction):
+            embed, view = await self.editor.build(interaction.guild)
+            await interaction.response.edit_message(content=None, embed=embed, view=view)
+        return cb
+
+    async def _on_mode_change(self, interaction: discord.Interaction, mode: str):
+        guild = interaction.guild
+        source_vcs, cfg = await self.editor._get_cfg(guild)
+        if not cfg:
+            await interaction.response.send_message("This source VC no longer exists.", ephemeral=True)
+            return
+        cfg["name_pool_mode"] = mode
+        source_vcs[str(self.editor.source_vc_id)] = cfg
+        await self.editor.cog.config.guild(guild).source_vcs.set(source_vcs)
+        embed, view = await self.build(guild)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def _on_add_name(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(AddNameModal(self))
+
+    async def _on_remove_name(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        _, cfg = await self.editor._get_cfg(guild)
+        pool: List[str] = (cfg or {}).get("name_pool", [])
+        if not pool:
+            await interaction.response.send_message("Pool is empty.", ephemeral=True)
+            return
+
+        options = [
+            discord.SelectOption(label=name[:100], value=str(i))
+            for i, name in enumerate(pool[:25])
+        ]
+        select = discord.ui.Select(placeholder="Choose a name to remove...", options=options)
+        pool_view = self
+
+        async def on_remove(sel_interaction: discord.Interaction):
+            idx = int(select.values[0])
+            source_vcs, cfg2 = await pool_view.editor._get_cfg(guild)
+            pool2: List[str] = (cfg2 or {}).get("name_pool", [])
+            if cfg2 and idx < len(pool2):
+                removed = pool2.pop(idx)
+                cfg2["name_pool"] = pool2
+                cfg2["name_pool_counter"] = 0
+                source_vcs[str(pool_view.editor.source_vc_id)] = cfg2
+                await pool_view.editor.cog.config.guild(guild).source_vcs.set(source_vcs)
+                log.info(f"Removed name '{removed}' from pool for source VC {pool_view.editor.source_vc_id}")
+            embed, view = await pool_view.build(guild)
+            await sel_interaction.response.edit_message(content=None, embed=embed, view=view)
+
+        select.callback = on_remove
+        remove_view = View(timeout=120)
+        remove_view.add_item(select)
+        remove_view.add_item(_bound_button("Cancel", discord.ButtonStyle.secondary, "↩️", self._back_to_pool_cb()))
+        await interaction.response.edit_message(content="Select a name to remove:", embed=None, view=remove_view)
+
+    def _back_to_pool_cb(self):
+        async def cb(interaction: discord.Interaction):
+            embed, view = await self.build(interaction.guild)
+            await interaction.response.edit_message(content=None, embed=embed, view=view)
+        return cb
+
+    async def _on_clear_pool(self, interaction: discord.Interaction):
+        guild = interaction.guild
+
+        async def on_confirm(confirm_interaction: discord.Interaction):
+            source_vcs, cfg = await self.editor._get_cfg(guild)
+            if cfg:
+                cfg["name_pool"] = []
+                cfg["name_pool_counter"] = 0
+                source_vcs[str(self.editor.source_vc_id)] = cfg
+                await self.editor.cog.config.guild(guild).source_vcs.set(source_vcs)
+            embed, view = await self.build(guild)
+            await confirm_interaction.response.edit_message(content=None, embed=embed, view=view)
+
+        async def on_cancel(cancel_interaction: discord.Interaction):
+            embed, view = await self.build(guild)
+            await cancel_interaction.response.edit_message(content=None, embed=embed, view=view)
+
+        view = ConfirmView(interaction.user.id, on_confirm, on_cancel)
+        await interaction.response.edit_message(
+            content="Clear the entire name pool? This cannot be undone.", embed=None, view=view
+        )
+
+
+class SourceEditorView(View):
+    """Interactive editor for a single configured source VC, reached from AutoVCDashboardView."""
+
+    def __init__(self, cog: "AutoVC", dashboard: "AutoVCDashboardView", guild_id: int, source_vc_id: int):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.dashboard = dashboard
+        self.guild_id = guild_id
+        self.source_vc_id = source_vc_id
+
+    async def _get_cfg(self, guild: discord.Guild):
+        source_vcs = await self.cog.config.guild(guild).source_vcs()
+        return source_vcs, source_vcs.get(str(self.source_vc_id))
+
+    async def build(self, guild: discord.Guild):
+        source_vcs, cfg = await self._get_cfg(guild)
+        vc = guild.get_channel(self.source_vc_id)
+        self.clear_items()
+
+        if not cfg:
+            embed = discord.Embed(
+                title="Source VC no longer exists",
+                description="This configuration was already removed.",
+                color=discord.Color.red(),
+            )
+            self.add_item(_bound_button("Close", discord.ButtonStyle.secondary, "↩️", self._on_close))
+            return embed, self
+
+        if not vc:
+            embed = discord.Embed(
+                title="Source channel deleted",
+                description=(
+                    f"The channel (ID `{self.source_vc_id}`) no longer exists. "
+                    "You can remove this stale configuration."
+                ),
+                color=discord.Color.orange(),
+            )
+            self.add_item(_bound_button("Delete Source", discord.ButtonStyle.danger, "🗑️", self._on_delete))
+            self.add_item(_bound_button("Close", discord.ButtonStyle.secondary, "↩️", self._on_close))
+            return embed, self
+
+        category = guild.get_channel(cfg.get("category_id")) if cfg.get("category_id") else None
+        name_template = cfg.get("name_template")
+        name_pool: List[str] = cfg.get("name_pool", [])
+        name_pool_mode = cfg.get("name_pool_mode", "sequential")
+
+        embed = discord.Embed(
+            title=f"Editing: {vc.name}",
+            color=await self.cog.bot.get_embed_color(guild),
+        )
+        embed.add_field(name="Type", value=cfg.get("type", "unknown"), inline=True)
+        embed.add_field(name="Category", value=category.mention if category else "Unknown", inline=True)
+        if name_pool:
+            preview = ", ".join(f"`{n}`" for n in name_pool[:10])
+            if len(name_pool) > 10:
+                preview += f" +{len(name_pool) - 10} more"
+            embed.add_field(name=f"Name Pool ({name_pool_mode})", value=preview, inline=False)
+        elif name_template:
+            embed.add_field(name="Name Template", value=f"`{name_template}`", inline=False)
+        else:
+            embed.add_field(name="Naming", value="Default (Username's VC)", inline=False)
+        embed.set_footer(text="Changes apply immediately.")
+
+        self.add_item(TypeSelect(self._on_type_change, current=cfg.get("type")))
+
+        categories = sorted(guild.categories, key=lambda c: c.position)
+        if categories:
+            self.add_item(
+                CategorySelect(categories, self._on_category_change, current_category_id=cfg.get("category_id"))
+            )
+
+        self.add_item(_bound_button("Set Name Template", discord.ButtonStyle.secondary, "📝", self._on_set_template))
+        self.add_item(_bound_button("Manage Name Pool", discord.ButtonStyle.secondary, "🎲", self._on_manage_pool))
+        self.add_item(_bound_button("Delete Source", discord.ButtonStyle.danger, "🗑️", self._on_delete))
+        self.add_item(_bound_button("Close", discord.ButtonStyle.secondary, "↩️", self._on_close))
+        return embed, self
+
+    async def _refresh(self, interaction: discord.Interaction):
+        embed, view = await self.build(interaction.guild)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def _on_type_change(self, interaction: discord.Interaction, vc_type: str):
+        guild = interaction.guild
+        source_vcs, cfg = await self._get_cfg(guild)
+        if not cfg:
+            await interaction.response.send_message("This source VC no longer exists.", ephemeral=True)
+            return
+        cfg["type"] = vc_type
+        source_vcs[str(self.source_vc_id)] = cfg
+        await self.cog.config.guild(guild).source_vcs.set(source_vcs)
+        await self._refresh(interaction)
+        await self.dashboard.refresh()
+
+    async def _on_category_change(self, interaction: discord.Interaction, category: Optional[discord.CategoryChannel]):
+        if category is None:
+            await interaction.response.send_message("No category selected.", ephemeral=True)
+            return
+        guild = interaction.guild
+        source_vcs, cfg = await self._get_cfg(guild)
+        if not cfg:
+            await interaction.response.send_message("This source VC no longer exists.", ephemeral=True)
+            return
+        cfg["category_id"] = category.id
+        source_vcs[str(self.source_vc_id)] = cfg
+        await self.cog.config.guild(guild).source_vcs.set(source_vcs)
+        await self._refresh(interaction)
+        await self.dashboard.refresh()
+
+    async def _on_set_template(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        _, cfg = await self._get_cfg(guild)
+        current = (cfg or {}).get("name_template") or ""
+        await interaction.response.send_modal(NameTemplateModal(self, current))
+
+    async def _on_manage_pool(self, interaction: discord.Interaction):
+        pool_view = NamePoolView(self)
+        embed, view = await pool_view.build(interaction.guild)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def _on_delete(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        vc = guild.get_channel(self.source_vc_id)
+        name = vc.mention if vc else f"`{self.source_vc_id}`"
+        dashboard = self.dashboard
+
+        async def on_confirm(confirm_interaction: discord.Interaction):
+            g = confirm_interaction.guild
+            source_vcs = await self.cog.config.guild(g).source_vcs()
+            source_vcs.pop(str(self.source_vc_id), None)
+            await self.cog.config.guild(g).source_vcs.set(source_vcs)
+            await confirm_interaction.response.edit_message(
+                content=f"🗑️ Removed {name} as a source VC.", embed=None, view=None
+            )
+            await dashboard.refresh()
+
+        async def on_cancel(cancel_interaction: discord.Interaction):
+            embed, view = await self.build(cancel_interaction.guild)
+            await cancel_interaction.response.edit_message(content=None, embed=embed, view=view)
+
+        view = ConfirmView(interaction.user.id, on_confirm, on_cancel)
+        await interaction.response.edit_message(
+            content=f"Remove {name} as a source VC? This cannot be undone.", embed=None, view=view
+        )
+
+    async def _on_close(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content="Closed.", embed=None, view=None)
+
+
+class AddSourceTypeView(View):
+    """Second step of the Add Source VC wizard: pick a type, then a category."""
+
+    def __init__(self, cog: "AutoVC", dashboard: "AutoVCDashboardView", source_vc: discord.VoiceChannel):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.dashboard = dashboard
+        self.source_vc = source_vc
+        self.add_item(TypeSelect(self._on_type))
+
+    async def _on_type(self, interaction: discord.Interaction, vc_type: str):
+        guild = interaction.guild
+        categories = sorted(guild.categories, key=lambda c: c.position)
+        own_category = self.source_vc.category
+        if not categories and not own_category:
+            await interaction.response.send_message(
+                "This server has no categories and this VC isn't in one — a category is required.",
+                ephemeral=True,
+            )
+            return
+
+        cog, dashboard, source_vc = self.cog, self.dashboard, self.source_vc
+
+        async def finalize(cat_interaction: discord.Interaction, category: Optional[discord.CategoryChannel]):
+            chosen = category or own_category
+            source_vcs = await cog.config.guild(guild).source_vcs()
+            source_vcs[str(source_vc.id)] = {"type": vc_type, "category_id": chosen.id}
+            await cog.config.guild(guild).source_vcs.set(source_vcs)
+            await cat_interaction.response.edit_message(
+                content=f"✅ Added {source_vc.mention} as a **{vc_type}** source VC → {chosen.mention}.",
+                view=None,
+            )
+            await dashboard.refresh()
+
+        view = View(timeout=120)
+        view.add_item(CategorySelect(categories, finalize, own_category=own_category))
+        await interaction.response.edit_message(content="Select a category for created VCs:", view=view)
+
+
+class AutoVCDashboardView(View):
+    """Main interactive setup dashboard for AutoVC admins."""
+
+    def __init__(self, cog: "AutoVC", guild_id: int):
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.message: Optional[discord.Message] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            return False
+        if (
+            member.guild_permissions.manage_guild
+            or await self.cog.bot.is_owner(member)
+            or await self.cog.bot.is_admin(member)
+        ):
+            return True
+        await interaction.response.send_message(
+            "You need the Manage Server permission to use this.", ephemeral=True
+        )
+        return False
+
+    async def on_timeout(self):
+        if self.message:
+            for item in self.children:
+                item.disabled = True
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+    async def build_embed(self, guild: discord.Guild) -> discord.Embed:
+        source_vcs = await self.cog.config.guild(guild).source_vcs()
+        created_vcs = await self.cog.config.guild(guild).created_vcs()
+        member_role_id = await self.cog.config.guild(guild).member_role_id()
+
+        embed = discord.Embed(
+            title="🔧 AutoVC Setup",
+            description="Configure the voice channels that automatically spawn new VCs when joined.",
+            color=await self.cog.bot.get_embed_color(guild),
+        )
+
+        if not source_vcs:
+            embed.add_field(
+                name="Source VCs",
+                value="None configured yet. Use **Add Source VC** to get started.",
+                inline=False,
+            )
+        else:
+            lines = [
+                self.cog._source_summary_line(guild, int(vc_id), cfg)
+                for vc_id, cfg in source_vcs.items()
+            ]
+            value = "\n".join(lines)
+            if len(value) > 1024:
+                value = value[:1000] + "\n…(truncated)"
+            embed.add_field(name=f"Source VCs ({len(source_vcs)})", value=value, inline=False)
+
+        if member_role_id:
+            role = guild.get_role(member_role_id)
+            role_str = role.mention if role else f"Role ID {member_role_id} (not found)"
+        else:
+            role_str = "@everyone (default)"
+        embed.add_field(name="Member Role", value=role_str, inline=True)
+        embed.add_field(name="Active VCs", value=str(len(created_vcs)), inline=True)
+        embed.set_footer(text="Buttons below apply changes immediately.")
+        return embed
+
+    async def refresh(self, interaction: Optional[discord.Interaction] = None):
+        guild = self.cog.bot.get_guild(self.guild_id)
+        if not guild:
+            return
+        embed = await self.build_embed(guild)
+        if interaction and not interaction.response.is_done():
+            await interaction.response.edit_message(embed=embed, view=self)
+        elif self.message:
+            try:
+                await self.message.edit(embed=embed, view=self)
+            except discord.NotFound:
+                pass
+
+    @discord.ui.button(label="Add Source VC", style=discord.ButtonStyle.success, emoji="➕", row=0)
+    async def add_source(self, interaction: discord.Interaction, button: Button):
+        guild = interaction.guild
+        source_vcs = await self.cog.config.guild(guild).source_vcs()
+        available = [vc for vc in guild.voice_channels if str(vc.id) not in source_vcs]
+        if not available:
+            await interaction.response.send_message(
+                "Every voice channel in this server is already configured as a source VC.",
+                ephemeral=True,
+            )
+            return
+        dashboard = self
+
+        async def on_choose(vc_interaction: discord.Interaction, vc):
+            if vc is None:
+                return
+            view = AddSourceTypeView(self.cog, dashboard, vc)
+            await vc_interaction.response.edit_message(content=f"Selected {vc.mention}. Choose a type:", view=view)
+
+        modal = PickerSearchModal(
+            title="Select Source VC",
+            items=available,
+            item_label=lambda c: c.name,
+            on_select=on_choose,
+            empty_msg="No matching voice channels found.",
+        )
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Edit Source VC", style=discord.ButtonStyle.secondary, emoji="✏️", row=0)
+    async def edit_source(self, interaction: discord.Interaction, button: Button):
+        guild = interaction.guild
+        source_vcs = await self.cog.config.guild(guild).source_vcs()
+        if not source_vcs:
+            await interaction.response.send_message("No source VCs are configured yet.", ephemeral=True)
+            return
+        items = [guild.get_channel(int(vc_id)) or _GhostChannel(int(vc_id)) for vc_id in source_vcs]
+        dashboard = self
+
+        async def on_choose(sel_interaction: discord.Interaction, vc):
+            editor = SourceEditorView(self.cog, dashboard, guild.id, vc.id)
+            embed, view = await editor.build(sel_interaction.guild)
+            await sel_interaction.response.edit_message(content=None, embed=embed, view=view)
+
+        view = PickerResultView(items, lambda c: c.name, on_choose)
+        await interaction.response.send_message("Select a source VC to edit:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="Remove Source VC", style=discord.ButtonStyle.danger, emoji="🗑️", row=0)
+    async def remove_source(self, interaction: discord.Interaction, button: Button):
+        guild = interaction.guild
+        source_vcs = await self.cog.config.guild(guild).source_vcs()
+        if not source_vcs:
+            await interaction.response.send_message("No source VCs are configured yet.", ephemeral=True)
+            return
+        items = [guild.get_channel(int(vc_id)) or _GhostChannel(int(vc_id)) for vc_id in source_vcs]
+        dashboard = self
+
+        async def on_choose(sel_interaction: discord.Interaction, vc):
+            name = vc.mention
+
+            async def on_confirm(confirm_interaction: discord.Interaction):
+                g = confirm_interaction.guild
+                svcs = await self.cog.config.guild(g).source_vcs()
+                svcs.pop(str(vc.id), None)
+                await self.cog.config.guild(g).source_vcs.set(svcs)
+                await confirm_interaction.response.edit_message(
+                    content=f"🗑️ Removed {name} as a source VC.", view=None
+                )
+                await dashboard.refresh()
+
+            async def on_cancel(cancel_interaction: discord.Interaction):
+                await cancel_interaction.response.edit_message(content="Cancelled.", view=None)
+
+            confirm_view = ConfirmView(sel_interaction.user.id, on_confirm, on_cancel)
+            await sel_interaction.response.edit_message(
+                content=f"Remove {name} as a source VC? This cannot be undone.", view=confirm_view
+            )
+
+        view = PickerResultView(items, lambda c: c.name, on_choose)
+        await interaction.response.send_message("Select a source VC to remove:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="Member Role", style=discord.ButtonStyle.primary, emoji="🎭", row=1)
+    async def member_role(self, interaction: discord.Interaction, button: Button):
+        guild = interaction.guild
+        roles = [r for r in guild.roles if not r.is_default() and not r.managed]
+        dashboard = self
+
+        async def on_choose(sel_interaction: discord.Interaction, role: Optional[discord.Role]):
+            await self.cog.config.guild(guild).member_role_id.set(role.id if role else None)
+            msg = f"Member role set to {role.mention}." if role else "Member role cleared. Using @everyone."
+            await sel_interaction.response.edit_message(content=msg, view=None)
+            await dashboard.refresh()
+
+        if len(roles) <= 24:
+            view = PickerResultView(roles, lambda r: r.name, on_choose, allow_clear=True, clear_label="Use @everyone")
+            await interaction.response.send_message("Select the member role:", view=view, ephemeral=True)
+        else:
+            modal = PickerSearchModal(
+                title="Search Member Role",
+                items=roles,
+                item_label=lambda r: r.name,
+                on_select=on_choose,
+                allow_clear=True,
+                clear_label="Use @everyone",
+            )
+            await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, emoji="🔄", row=1)
+    async def refresh_btn(self, interaction: discord.Interaction, button: Button):
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.secondary, emoji="✖️", row=1)
+    async def close_btn(self, interaction: discord.Interaction, button: Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+
 class AutoVC(commands.Cog):
     """Automatically create voice channels when members join source VCs."""
 
@@ -388,6 +1162,26 @@ class AutoVC(commands.Cog):
         if getattr(ctx, "interaction", None) and ephemeral:
             return await ctx.send(content, embed=embed, ephemeral=True, **kwargs)
         return await ctx.send(content, embed=embed, **kwargs)
+
+    def _source_summary_line(self, guild: discord.Guild, source_vc_id: int, cfg: dict) -> str:
+        """Build a one-line summary of a configured source VC for lists/embeds."""
+        source_vc = guild.get_channel(source_vc_id)
+        if not source_vc:
+            return f"❌ VC ID `{source_vc_id}` (channel not found)"
+        vc_type = cfg.get("type", "unknown")
+        category_id = cfg.get("category_id")
+        category = guild.get_channel(category_id) if category_id else None
+        category_str = category.mention if category else "Unknown category"
+        name_template = cfg.get("name_template")
+        name_pool: List[str] = cfg.get("name_pool", [])
+        name_pool_mode = cfg.get("name_pool_mode", "sequential")
+        if name_pool:
+            naming_str = f" — pool ({name_pool_mode}, {len(name_pool)} name(s))"
+        elif name_template:
+            naming_str = f" — template: `{name_template}`"
+        else:
+            naming_str = ""
+        return f"{source_vc.mention}: **{vc_type}** → {category_str}{naming_str}"
 
     async def _get_panel_embed(self, guild: discord.Guild) -> discord.Embed:
         """Build the VC panel embed."""
@@ -499,249 +1293,20 @@ class AutoVC(commands.Cog):
     @commands.guild_only()
     @commands.admin_or_permissions(manage_guild=True)
     async def _autovcset(self, ctx: commands.Context):
-        """AutoVC admin: source VCs, settings, member role."""
+        """AutoVC admin: use `setup` for the interactive dashboard."""
         pass
 
-    @_autovcset.command(name="add")
+    @_autovcset.command(name="setup")
     @commands.admin_or_permissions(manage_guild=True)
-    async def _add_source_vc(
-        self,
-        ctx: commands.Context,
-        source_vc: discord.VoiceChannel,
-        vc_type: str,
-        category: Optional[discord.CategoryChannel] = None,
-    ):
-        """Add a source VC with specified type.
-        
-        Types: public, personal, private
-        
-        Examples:
-        - [p]autovcset add #Create Public public
-        - [p]autovcset add #Create Personal personal
-        - [p]autovcset add #Create Private private #Private-VCs
+    async def _setup(self, ctx: commands.Context):
+        """Open the interactive AutoVC setup dashboard.
+
+        Add, edit, and remove source VCs, and configure the member role,
+        all from a single menu-driven panel.
         """
-        vc_type = vc_type.lower()
-        if vc_type not in ["public", "personal", "private"]:
-            await ctx.send(
-                "Invalid type. Must be one of: `public`, `personal`, or `private`"
-            )
-            return
-
-        guild = ctx.guild
-        source_vc_id = source_vc.id
-
-        # Determine category
-        if category is None:
-            category = source_vc.category
-            if category is None:
-                await ctx.send(
-                    "Source VC must be in a category, or you must specify a category."
-                )
-                return
-            category_id = category.id
-        else:
-            category_id = category.id
-
-        # Get current source VCs
-        source_vcs = await self.config.guild(guild).source_vcs()
-        source_vcs[str(source_vc_id)] = {
-            "type": vc_type,
-            "category_id": category_id,
-        }
-        await self.config.guild(guild).source_vcs.set(source_vcs)
-
-        await ctx.send(
-            f"Source VC {source_vc.mention} configured as **{vc_type}** type.\n"
-            f"Created VCs will be placed in {category.mention if category else 'the same category'}."
-        )
-
-    @_autovcset.command(name="nametemplate")
-    @commands.admin_or_permissions(manage_guild=True)
-    async def _set_name_template(
-        self,
-        ctx: commands.Context,
-        source_vc: discord.VoiceChannel,
-        *,
-        template: Optional[str] = None,
-    ):
-        """Set a name template for a source VC.
-
-        Variables: {num} for sequential numbering, {user} for the member's display name.
-        Leave template blank to clear (reverts to "Username's VC").
-
-        Examples:
-        - [p]autovcset nametemplate #Create-Squad Squad {num}
-        - [p]autovcset nametemplate #Create-Squad Game Room {num}
-        - [p]autovcset nametemplate #Create-Squad  (clears the template)
-        """
-        guild = ctx.guild
-        source_vcs = await self.config.guild(guild).source_vcs()
-
-        if str(source_vc.id) not in source_vcs:
-            await ctx.send(f"{source_vc.mention} is not configured as a source VC.")
-            return
-
-        cleaned = template.strip() if template else None
-        source_vcs[str(source_vc.id)]["name_template"] = cleaned
-        await self.config.guild(guild).source_vcs.set(source_vcs)
-
-        if cleaned:
-            example = cleaned.replace("{num}", "1").replace("{user}", ctx.author.display_name[:20])
-            await ctx.send(
-                f"Name template for {source_vc.mention} set to `{cleaned}`.\n"
-                f"Example output: **{discord.utils.escape_markdown(example)}**"
-            )
-        else:
-            await ctx.send(
-                f"Name template for {source_vc.mention} cleared. New VCs will be named `Username's VC`."
-            )
-
-    @_autovcset.group(name="namepool")
-    @commands.admin_or_permissions(manage_guild=True)
-    async def _name_pool(self, ctx: commands.Context):
-        """Manage the name pool for a source VC (used instead of the name template)."""
-        pass
-
-    @_name_pool.command(name="add")
-    @commands.admin_or_permissions(manage_guild=True)
-    async def _name_pool_add(
-        self,
-        ctx: commands.Context,
-        source_vc: discord.VoiceChannel,
-        *,
-        name: str,
-    ):
-        """Add a name to the pool for a source VC.
-
-        Example: [p]autovcset namepool add #Create-Squad Alpha Squad
-        """
-        guild = ctx.guild
-        source_vcs = await self.config.guild(guild).source_vcs()
-        if str(source_vc.id) not in source_vcs:
-            await ctx.send(f"{source_vc.mention} is not configured as a source VC.")
-            return
-        pool: List[str] = source_vcs[str(source_vc.id)].setdefault("name_pool", [])
-        pool.append(name.strip()[:100])
-        await self.config.guild(guild).source_vcs.set(source_vcs)
-        await ctx.send(
-            f"Added **{discord.utils.escape_markdown(name.strip())}** to the pool for {source_vc.mention}. "
-            f"Pool now has {len(pool)} name(s)."
-        )
-
-    @_name_pool.command(name="remove")
-    @commands.admin_or_permissions(manage_guild=True)
-    async def _name_pool_remove(
-        self,
-        ctx: commands.Context,
-        source_vc: discord.VoiceChannel,
-        index: int,
-    ):
-        """Remove a name from the pool by its number (use autovcset namepool show to see numbers).
-
-        Example: [p]autovcset namepool remove #Create-Squad 2
-        """
-        guild = ctx.guild
-        source_vcs = await self.config.guild(guild).source_vcs()
-        if str(source_vc.id) not in source_vcs:
-            await ctx.send(f"{source_vc.mention} is not configured as a source VC.")
-            return
-        pool: List[str] = source_vcs[str(source_vc.id)].get("name_pool", [])
-        if not pool:
-            await ctx.send(f"{source_vc.mention} has no name pool configured.")
-            return
-        if index < 1 or index > len(pool):
-            await ctx.send(f"Index must be between 1 and {len(pool)}.")
-            return
-        removed = pool.pop(index - 1)
-        source_vcs[str(source_vc.id)]["name_pool"] = pool
-        # Reset sequential counter so it doesn't skip positions
-        source_vcs[str(source_vc.id)]["name_pool_counter"] = 0
-        await self.config.guild(guild).source_vcs.set(source_vcs)
-        await ctx.send(
-            f"Removed **{discord.utils.escape_markdown(removed)}** from the pool for {source_vc.mention}."
-        )
-
-    @_name_pool.command(name="clear")
-    @commands.admin_or_permissions(manage_guild=True)
-    async def _name_pool_clear(
-        self, ctx: commands.Context, source_vc: discord.VoiceChannel
-    ):
-        """Clear all names from the pool for a source VC."""
-        guild = ctx.guild
-        source_vcs = await self.config.guild(guild).source_vcs()
-        if str(source_vc.id) not in source_vcs:
-            await ctx.send(f"{source_vc.mention} is not configured as a source VC.")
-            return
-        source_vcs[str(source_vc.id)]["name_pool"] = []
-        source_vcs[str(source_vc.id)]["name_pool_counter"] = 0
-        await self.config.guild(guild).source_vcs.set(source_vcs)
-        await ctx.send(f"Name pool for {source_vc.mention} cleared.")
-
-    @_name_pool.command(name="mode")
-    @commands.admin_or_permissions(manage_guild=True)
-    async def _name_pool_mode(
-        self,
-        ctx: commands.Context,
-        source_vc: discord.VoiceChannel,
-        mode: str,
-    ):
-        """Set the pool selection mode: sequential (in order) or random.
-
-        Example: [p]autovcset namepool mode #Create-Squad random
-        """
-        mode = mode.lower()
-        if mode not in ("sequential", "random"):
-            await ctx.send("Mode must be `sequential` or `random`.")
-            return
-        guild = ctx.guild
-        source_vcs = await self.config.guild(guild).source_vcs()
-        if str(source_vc.id) not in source_vcs:
-            await ctx.send(f"{source_vc.mention} is not configured as a source VC.")
-            return
-        source_vcs[str(source_vc.id)]["name_pool_mode"] = mode
-        await self.config.guild(guild).source_vcs.set(source_vcs)
-        await ctx.send(f"Name pool for {source_vc.mention} set to **{mode}** mode.")
-
-    @_name_pool.command(name="show")
-    @commands.admin_or_permissions(manage_guild=True)
-    async def _name_pool_show(
-        self, ctx: commands.Context, source_vc: discord.VoiceChannel
-    ):
-        """Show the current name pool and mode for a source VC."""
-        guild = ctx.guild
-        source_vcs = await self.config.guild(guild).source_vcs()
-        if str(source_vc.id) not in source_vcs:
-            await ctx.send(f"{source_vc.mention} is not configured as a source VC.")
-            return
-        cfg = source_vcs[str(source_vc.id)]
-        pool: List[str] = cfg.get("name_pool", [])
-        mode = cfg.get("name_pool_mode", "sequential")
-        if not pool:
-            await ctx.send(f"{source_vc.mention} has no name pool configured.")
-            return
-        lines = "\n".join(f"{i + 1}. {name}" for i, name in enumerate(pool))
-        await ctx.send(
-            f"**Name pool for {source_vc.mention}** ({mode}):\n{lines}"
-        )
-
-    @_autovcset.command(name="remove", aliases=["delete", "del"])
-    @commands.admin_or_permissions(manage_guild=True)
-    async def _remove_source_vc(
-        self, ctx: commands.Context, source_vc: discord.VoiceChannel
-    ):
-        """Remove a source VC configuration."""
-        guild = ctx.guild
-        source_vc_id = source_vc.id
-
-        source_vcs = await self.config.guild(guild).source_vcs()
-        if str(source_vc_id) not in source_vcs:
-            await ctx.send(f"{source_vc.mention} is not configured as a source VC.")
-            return
-
-        del source_vcs[str(source_vc_id)]
-        await self.config.guild(guild).source_vcs.set(source_vcs)
-
-        await ctx.send(f"Removed {source_vc.mention} from source VCs.")
+        view = AutoVCDashboardView(self, ctx.guild.id)
+        embed = await view.build_embed(ctx.guild)
+        view.message = await self._ctx_send(ctx, embed=embed, view=view, ephemeral=True)
 
     @_autovcset.command(name="list")
     @commands.admin_or_permissions(manage_guild=True)
@@ -754,39 +1319,15 @@ class AutoVC(commands.Cog):
             await ctx.send("No source VCs are configured.")
             return
 
-        message = "**Configured Source VCs:**\n\n"
+        lines = []
         for source_vc_id_str, config in source_vcs.items():
             try:
-                source_vc_id = int(source_vc_id_str)
-                source_vc = guild.get_channel(source_vc_id)
-                if not source_vc:
-                    message += f"❌ VC ID `{source_vc_id}` (channel not found)\n"
-                    continue
-
-                vc_type = config.get("type", "unknown")
-                category_id = config.get("category_id")
-                category = guild.get_channel(category_id) if category_id else None
-
-                category_str = category.mention if category else "Unknown category"
-                name_template = config.get("name_template")
-                name_pool: List[str] = config.get("name_pool", [])
-                name_pool_mode = config.get("name_pool_mode", "sequential")
-                if name_pool:
-                    naming_str = f" — pool ({name_pool_mode}): {', '.join(f'`{n}`' for n in name_pool[:5])}"
-                    if len(name_pool) > 5:
-                        naming_str += f" +{len(name_pool) - 5} more"
-                elif name_template:
-                    naming_str = f" — template: `{name_template}`"
-                else:
-                    naming_str = ""
-                message += (
-                    f"{source_vc.mention}: **{vc_type}** type → {category_str}{naming_str}\n"
-                )
+                lines.append(self._source_summary_line(guild, int(source_vc_id_str), config))
             except (ValueError, KeyError) as e:
                 log.error(f"Error processing source VC config: {e}")
                 continue
 
-        await ctx.send(message)
+        await ctx.send("**Configured Source VCs:**\n\n" + "\n".join(lines))
 
     @_autovcset.command(name="settings")
     @commands.admin_or_permissions(manage_guild=True)
