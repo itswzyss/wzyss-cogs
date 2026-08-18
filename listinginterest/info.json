@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing ListingInterest! Set a category and notify targets with [p]listinginterestset, then use [p]listinginterest reply or bind to attach interest buttons to listings.",
+    "name": "ListingInterest",
+    "short": "Interest buttons on product listings that open private channels and notify sellers.",
+    "description": "Attach an interest button to listings via bot reply or by binding a bot-owned message. When clicked, creates a private channel for the buyer and configured staff/sellers, optionally pings users/roles in-channel, and DMs users (roles expanded to members). Managers can close interest channels.",
+    "tags": ["listings", "sales", "utility", "moderation"],
+    "requirements": [],
+    "min_bot_version": "3.4.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}

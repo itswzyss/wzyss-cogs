@@ -17,6 +17,7 @@ Full documentation for each cog in the Wzyss-Cogs repository for Red-DiscordBot.
 | [FixupXNudge](fixupxnudge.md) | Gently nudge users to use fixupx.com for X/Twitter post links. |
 | [Giveaway](giveaway.md) | Reaction-based giveaways with optional claim system. |
 | [LFG](lfg.md) | Looking for Group: register availability per game, see who's available, notify via DM, request games. |
+| [ListingInterest](listinginterest.md) | Interest buttons on product listings that open private channels and notify sellers. |
 | [LinkReplacer](linkreplacer.md) | Replace links with configured alternatives. |
 | [MassRole](massrole.md) | Assign roles to all members of a role or everyone on the server. |
 | [Remindme](remindme.md) | Set timers and get pinged or DMed when they complete. |

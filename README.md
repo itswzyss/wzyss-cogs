@@ -125,6 +125,15 @@ Looking for Group: register availability per game, see who's available, notify v
 
 ---
 
+### ListingInterest
+**Install:** `[p]cog install wzyss-cogs listinginterest`
+
+Interest buttons on product listings. Reply to a human post or bind a bot-owned message; clicks open a private channel and can ping and/or DM configured users and role members.
+
+**Tags:** listings, sales, utility, moderation
+
+---
+
 ### LinkReplacer
 **Install:** `[p]cog install wzyss-cogs linkreplacer`
 
