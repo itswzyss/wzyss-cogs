@@ -3,19 +3,25 @@ import json
 import logging
 import random
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import discord
-from discord.ui import View
+from discord.ui import Button, View
 from redbot.core import Config, commands
 from redbot.core.bot import Red
+from redbot.core.commands.converter import parse_timedelta
+from redbot.core.utils.chat_formatting import humanize_timedelta
 
 log = logging.getLogger("red.wzyss-cogs.counting")
 
 LEADERBOARD_PAGE_SIZE = 10
 LEADERBOARD_MULTI_TOP = 10
 LEADERBOARD_MAX_FIELDS_PER_EMBED = 25
+SAVE_CUSTOM_ID_PREFIX = "counting:save:"
+SAVE_TIMEOUT_MAX = timedelta(days=7)
+SAVE_BUTTON_LABEL = "Use a Save \U0001F6E1"
 
 # #region agent log
 _AGENT_DEBUG_LOG = Path(__file__).resolve().parent.parent / "debug-bfac2e.log"
@@ -138,85 +144,62 @@ class CountingLeaderboardView(View):
         await interaction.response.edit_message(embed=self.pages[self.page_index], view=self)
 
 
-class SaveView(View):
-    """Button presented after a ruin; any user with a Save can click to undo the count reset."""
+def _save_button_view(
+    channel_id: int,
+    *,
+    disabled: bool = False,
+    label: str = SAVE_BUTTON_LABEL,
+) -> View:
+    """Persistent save button. Clicks are handled by Counting.on_interaction."""
+    view = View(timeout=None)
+    view.add_item(
+        Button(
+            label=label[:80],
+            style=discord.ButtonStyle.success,
+            custom_id=f"{SAVE_CUSTOM_ID_PREFIX}{channel_id}",
+            disabled=disabled,
+        )
+    )
+    return view
 
-    def __init__(
-        self,
-        cog: "Counting",
-        guild_id: int,
-        channel_id: int,
-        pre_ruin_count: int,
-        *,
-        timeout: float = 60.0,
-    ):
-        super().__init__(timeout=timeout)
-        self.cog = cog
-        self.guild_id = guild_id
-        self.channel_id = channel_id
-        self.pre_ruin_count = pre_ruin_count
-        self.used = False
-        self.message: Optional[discord.Message] = None
 
-    async def on_timeout(self) -> None:
-        self.use_save_button.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except (discord.Forbidden, discord.NotFound):
-                pass
+def _save_used_label(display_name: str) -> str:
+    prefix = "Save used by "
+    max_name = 80 - len(prefix)
+    if len(display_name) > max_name:
+        display_name = display_name[: max_name - 1] + "\u2026"
+    return prefix + display_name
 
-    @discord.ui.button(label="Use a Save \U0001F6E1", style=discord.ButtonStyle.success)
-    async def use_save_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        if self.used:
-            await interaction.response.send_message("A save has already been used!", ephemeral=True)
-            return
 
-        guild = interaction.guild
-        member = interaction.user
-        inventory = await self.cog.config.member(member).inventory()
-        saves = inventory.get("save", 0)
-
-        if saves <= 0:
-            await interaction.response.send_message(
-                "You don't have any saves! Earn them by counting frequently.", ephemeral=True
+def _parse_save_timeout(raw: str) -> Optional[int]:
+    """Parse a save-window duration. Returns seconds, 0 for never, or None if invalid."""
+    text = raw.strip().lower()
+    if text in ("0", "off", "none", "never", "disable"):
+        return 0
+    try:
+        seconds = int(text)
+    except ValueError:
+        try:
+            delta = parse_timedelta(
+                raw.strip(),
+                minimum=timedelta(seconds=1),
+                maximum=SAVE_TIMEOUT_MAX,
+                allowed_units=["weeks", "days", "hours", "minutes", "seconds"],
             )
-            return
+        except Exception:
+            return None
+        if delta is None:
+            return None
+        return int(delta.total_seconds())
+    if seconds < 0 or seconds > int(SAVE_TIMEOUT_MAX.total_seconds()):
+        return None
+    return seconds
 
-        self.used = True
-        inventory["save"] = saves - 1
-        await self.cog.config.member(member).inventory.set(inventory)
 
-        channels = await self.cog.config.guild(guild).channels()
-        cid_str = str(self.channel_id)
-        if cid_str in channels:
-            channels[cid_str]["current"] = self.pre_ruin_count
-            channels[cid_str]["last_user"] = None
-            channels[cid_str]["consecutive_count"] = 0
-            channels[cid_str]["consecutive_user"] = None
-            _sync_goal_announcement_to_current(channels[cid_str])
-            await self.cog.config.guild(guild).channels.set(channels)
-
-        button.disabled = True
-        button.label = f"Save used by {member.display_name}"
-        await interaction.response.edit_message(view=self)
-        self.stop()
-
-        channel = guild.get_channel(self.channel_id)
-        if channel:
-            try:
-                embed = discord.Embed(
-                    description=(
-                        f"\U0001F6E1 {member.mention} used a **Save**! The count has been restored to "
-                        f"**{self.pre_ruin_count}**. Next count: **{self.pre_ruin_count + 1}**."
-                    ),
-                    color=discord.Color.green(),
-                )
-                await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=True))
-            except (discord.Forbidden, discord.NotFound):
-                pass
+def _format_save_timeout(seconds: int) -> str:
+    if seconds <= 0:
+        return "Never"
+    return humanize_timedelta(seconds=seconds)
 
 
 class Counting(commands.Cog):
@@ -235,6 +218,7 @@ class Counting(commands.Cog):
             "saves_max_per_user": 3,
             "saves_drop_chance": 0.01,  # 1% per valid count
             "saves_participation_threshold": 100,  # lifetime counts needed to be eligible for drops
+            "saves_use_timeout": 60,  # seconds to use a save after a ruin; 0 = never expires
             # channel_id -> {"roles": {role_id: previous send_messages value before shutdown lock}}
             "shutdown_lock_state": {},
         }
@@ -252,6 +236,7 @@ class Counting(commands.Cog):
         self.reaction_task: Optional[asyncio.Task] = None
         self._queue_lock = asyncio.Lock()  # Lock for thread-safe queue operations
         self._channel_locks: Dict[int, asyncio.Lock] = {}  # Per-channel lock for on_message atomicity
+        self._save_expiry_tasks: Dict[Tuple[int, int], asyncio.Task] = {}  # (guild_id, channel_id)
 
         # Channel description update task
         self.description_update_task: Optional[asyncio.Task] = None
@@ -408,6 +393,7 @@ class Counting(commands.Cog):
         restored = await self._restore_counting_channels_after_startup()
         if restored:
             log.info("Counting cog startup restored send permissions in %s channel(s)", restored)
+        await self._restore_pending_saves()
 
     async def cog_load(self):
         """Restore counting channel permissions after bot startup/reload."""
@@ -709,6 +695,7 @@ class Counting(commands.Cog):
         ruin_counts = dict(ch_cfg.get("channel_ruin_counts") or {})
         ruin_counts[uid_str] = ruin_counts.get(uid_str, 0) + 1
         channels[cid_str]["channel_ruin_counts"] = ruin_counts
+        old_pending = channels[cid_str].pop("pending_save", None)
         await self.config.guild(guild).channels.set(channels)
 
         if pre_ruin_count > highest_record:
@@ -718,6 +705,18 @@ class Counting(commands.Cog):
 
         guild_data = await self.config.guild(guild).all()
         saves_enabled = guild_data.get("saves_enabled", False)
+        try:
+            timeout_seconds = int(guild_data.get("saves_use_timeout", 60))
+        except (TypeError, ValueError):
+            timeout_seconds = 60
+        if timeout_seconds < 0:
+            timeout_seconds = 0
+
+        if old_pending:
+            self._cancel_save_expiry(guild.id, channel.id)
+            old_mid = old_pending.get("message_id")
+            if old_mid:
+                await self._disable_save_message(channel, channel.id, old_mid, "No longer valid")
 
         try:
             color = discord.Color.red()
@@ -725,11 +724,34 @@ class Counting(commands.Cog):
             embed.set_footer(text=f"Count reached: {pre_ruin_count}")
 
             if saves_enabled and pre_ruin_count > 0:
-                view = SaveView(self, guild.id, channel.id, pre_ruin_count)
+                expires_at = (time.time() + timeout_seconds) if timeout_seconds > 0 else None
+                if timeout_seconds > 0:
+                    embed.add_field(
+                        name="Save",
+                        value=(
+                            "Click **Use a Save** to restore this count. "
+                            f"Expires <t:{int(expires_at)}:R>."
+                        ),
+                        inline=False,
+                    )
+                else:
+                    embed.add_field(
+                        name="Save",
+                        value="Click **Use a Save** to restore this count. This does not expire.",
+                        inline=False,
+                    )
+
+                view = _save_button_view(channel.id)
                 msg = await channel.send(
                     embed=embed, view=view, allowed_mentions=discord.AllowedMentions(users=True)
                 )
-                view.message = msg
+                channels[cid_str]["pending_save"] = {
+                    "pre_ruin_count": pre_ruin_count,
+                    "expires_at": expires_at,
+                    "message_id": msg.id,
+                }
+                await self.config.guild(guild).channels.set(channels)
+                self._schedule_save_expiry(guild.id, channel.id, expires_at)
             else:
                 await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=True))
         except discord.Forbidden:
@@ -770,6 +792,257 @@ class Counting(commands.Cog):
                 await member.send(embed=embed)
             except (discord.Forbidden, discord.HTTPException):
                 pass
+
+    def _get_channel_lock(self, channel_id: int) -> asyncio.Lock:
+        lock = self._channel_locks.get(channel_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._channel_locks[channel_id] = lock
+        return lock
+
+    def _cancel_save_expiry(self, guild_id: int, channel_id: int) -> None:
+        task = self._save_expiry_tasks.pop((guild_id, channel_id), None)
+        if task and not task.done():
+            task.cancel()
+
+    def _schedule_save_expiry(
+        self, guild_id: int, channel_id: int, expires_at: Optional[float]
+    ) -> None:
+        self._cancel_save_expiry(guild_id, channel_id)
+        if expires_at is None:
+            return
+
+        async def _wait_and_expire() -> None:
+            delay = expires_at - time.time()
+            try:
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                await self._expire_pending_save(guild_id, channel_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(
+                    "Error expiring save button for guild %s channel %s",
+                    guild_id,
+                    channel_id,
+                )
+
+        self._save_expiry_tasks[(guild_id, channel_id)] = asyncio.create_task(_wait_and_expire())
+
+    async def _restore_pending_saves(self) -> None:
+        """Re-schedule or expire save buttons that were pending across a restart."""
+        now = time.time()
+        for guild in self.bot.guilds:
+            channels = await self.config.guild(guild).channels()
+            for cid_str, ch_cfg in channels.items():
+                pending = ch_cfg.get("pending_save")
+                if not pending:
+                    continue
+                try:
+                    channel_id = int(cid_str)
+                except (TypeError, ValueError):
+                    continue
+                expires_at = pending.get("expires_at")
+                if expires_at is not None and now >= expires_at:
+                    await self._expire_pending_save(guild.id, channel_id)
+                else:
+                    self._schedule_save_expiry(guild.id, channel_id, expires_at)
+
+    async def _disable_save_message(
+        self,
+        channel: discord.abc.Messageable,
+        channel_id: int,
+        message_id: int,
+        label: str,
+    ) -> None:
+        try:
+            msg = await channel.fetch_message(message_id)
+            await msg.edit(view=_save_button_view(channel_id, disabled=True, label=label))
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
+
+    async def _expire_pending_save(self, guild_id: int, channel_id: int) -> None:
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            return
+        message_id = None
+        async with self._get_channel_lock(channel_id):
+            channels = await self.config.guild(guild).channels()
+            cid_str = str(channel_id)
+            ch_cfg = channels.get(cid_str)
+            if not ch_cfg:
+                return
+            pending = ch_cfg.get("pending_save")
+            if not pending:
+                return
+            expires_at = pending.get("expires_at")
+            if expires_at is None or time.time() < expires_at:
+                return
+            message_id = pending.get("message_id")
+            ch_cfg.pop("pending_save", None)
+            await self.config.guild(guild).channels.set(channels)
+
+        self._cancel_save_expiry(guild_id, channel_id)
+        channel = guild.get_channel(channel_id)
+        if isinstance(channel, discord.TextChannel) and message_id:
+            await self._disable_save_message(channel, channel_id, message_id, "Save expired")
+
+    async def _edit_save_button(
+        self,
+        interaction: discord.Interaction,
+        channel_id: int,
+        *,
+        disabled: bool = False,
+        label: str = SAVE_BUTTON_LABEL,
+    ) -> None:
+        try:
+            await interaction.edit_original_response(
+                view=_save_button_view(channel_id, disabled=disabled, label=label)
+            )
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
+
+    async def _handle_save_use(self, interaction: discord.Interaction, channel_id: int) -> None:
+        guild = interaction.guild
+        member = interaction.user
+        if not guild or not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "This can only be used in a server.", ephemeral=True
+            )
+            return
+
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+
+        restarted_from = None
+        pre_ruin_count = 0
+
+        async with self._get_channel_lock(channel_id):
+            guild_data = await self.config.guild(guild).all()
+            if not guild_data.get("saves_enabled", False):
+                await self._edit_save_button(interaction, channel_id, disabled=True, label="Saves disabled")
+                await interaction.followup.send(
+                    "The save system is not enabled on this server.", ephemeral=True
+                )
+                return
+
+            channels = guild_data.get("channels") or {}
+            cid_str = str(channel_id)
+            ch_cfg = channels.get(cid_str)
+            if not ch_cfg:
+                await self._edit_save_button(interaction, channel_id, disabled=True, label="Save unavailable")
+                await interaction.followup.send(
+                    "This channel is not configured for counting.", ephemeral=True
+                )
+                return
+
+            pending = ch_cfg.get("pending_save")
+            if not pending:
+                await self._edit_save_button(interaction, channel_id, disabled=True, label="Save unavailable")
+                await interaction.followup.send(
+                    "This save is no longer available.", ephemeral=True
+                )
+                return
+
+            expires_at = pending.get("expires_at")
+            if expires_at is not None and time.time() >= expires_at:
+                ch_cfg.pop("pending_save", None)
+                await self.config.guild(guild).channels.set(channels)
+                self._cancel_save_expiry(guild.id, channel_id)
+                await self._edit_save_button(interaction, channel_id, disabled=True, label="Save expired")
+                await interaction.followup.send("This save has expired.", ephemeral=True)
+                return
+
+            pre_ruin_count = _int_from_config(pending.get("pre_ruin_count"))
+            if pre_ruin_count is None:
+                await self._edit_save_button(interaction, channel_id, disabled=True, label="Save unavailable")
+                await interaction.followup.send(
+                    "This save is no longer available.", ephemeral=True
+                )
+                return
+
+            current = _int_from_config(ch_cfg.get("current")) or 0
+            if current >= pre_ruin_count:
+                ch_cfg.pop("pending_save", None)
+                await self.config.guild(guild).channels.set(channels)
+                self._cancel_save_expiry(guild.id, channel_id)
+                await self._edit_save_button(
+                    interaction, channel_id, disabled=True, label="Save no longer needed"
+                )
+                await interaction.followup.send(
+                    (
+                        f"The count has already reached **{current}**, which is at least as high as "
+                        f"the saved count of **{pre_ruin_count}**. Your save was not used."
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            inventory = await self.config.member(member).inventory()
+            saves = inventory.get("save", 0)
+            if saves <= 0:
+                await self._edit_save_button(interaction, channel_id)
+                await interaction.followup.send(
+                    "You don't have any saves! Earn them by counting frequently.",
+                    ephemeral=True,
+                )
+                return
+
+            inventory["save"] = saves - 1
+            await self.config.member(member).inventory.set(inventory)
+
+            restarted_from = current if current > 0 else None
+            ch_cfg["current"] = pre_ruin_count
+            ch_cfg["last_user"] = None
+            ch_cfg["consecutive_count"] = 0
+            ch_cfg["consecutive_user"] = None
+            ch_cfg["segment_contributions"] = {}
+            ch_cfg.pop("pending_save", None)
+            _sync_goal_announcement_to_current(ch_cfg)
+            await self.config.guild(guild).channels.set(channels)
+            self._cancel_save_expiry(guild.id, channel_id)
+
+        await self._edit_save_button(
+            interaction,
+            channel_id,
+            disabled=True,
+            label=_save_used_label(member.display_name),
+        )
+
+        channel = guild.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
+        if restarted_from is not None:
+            description = (
+                f"\U0001F6E1 {member.mention} used a **Save**! A new count had already reached "
+                f"**{restarted_from}** and has been overwritten. The count is restored to "
+                f"**{pre_ruin_count}**. Next count: **{pre_ruin_count + 1}**."
+            )
+        else:
+            description = (
+                f"\U0001F6E1 {member.mention} used a **Save**! The count has been restored to "
+                f"**{pre_ruin_count}**. Next count: **{pre_ruin_count + 1}**."
+            )
+        try:
+            embed = discord.Embed(description=description, color=discord.Color.green())
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions(users=True))
+        except (discord.Forbidden, discord.NotFound):
+            pass
+
+    @commands.Cog.listener()
+    async def on_interaction(self, interaction: discord.Interaction):
+        if getattr(interaction.type, "value", interaction.type) != 3:
+            return
+        custom_id = (interaction.data or {}).get("custom_id") or ""
+        if not custom_id.startswith(SAVE_CUSTOM_ID_PREFIX):
+            return
+        if interaction.response.is_done():
+            return
+        try:
+            channel_id = int(custom_id[len(SAVE_CUSTOM_ID_PREFIX) :].strip())
+        except ValueError:
+            return
+        await self._handle_save_use(interaction, channel_id)
 
     @commands.group(name="countingset", aliases=["countset"])
     @commands.guild_only()
@@ -1314,6 +1587,40 @@ class Counting(commands.Cog):
         await self.config.guild(ctx.guild).saves_participation_threshold.set(threshold)
         await ctx.send(embed=discord.Embed(description=f"Participation threshold set to {threshold} lifetime counts.", color=color))
 
+    @_saves.command(name="timeout")
+    async def _saves_timeout(self, ctx: commands.Context, duration: str):
+        """Set how long a save can be used after the count is ruined.
+
+        The save button stays available for this long (including across bot restarts).
+        Use `0`, `never`, or `off` for no expiry.
+
+        Usage: [p]countingset saves timeout <duration>
+
+        Examples:
+        [p]countingset saves timeout 60
+        [p]countingset saves timeout 5m
+        [p]countingset saves timeout 1h
+        [p]countingset saves timeout never
+        """
+        color = await ctx.embed_color()
+        seconds = _parse_save_timeout(duration)
+        if seconds is None:
+            max_label = _format_save_timeout(int(SAVE_TIMEOUT_MAX.total_seconds()))
+            await ctx.send(embed=discord.Embed(
+                description=(
+                    "Invalid duration. Use a number of seconds, a duration like `5m` or `1h`, "
+                    f"or `never`. Maximum is {max_label}."
+                ),
+                color=color,
+            ))
+            return
+        await self.config.guild(ctx.guild).saves_use_timeout.set(seconds)
+        if seconds <= 0:
+            desc = "Save buttons will no longer expire. They remain until used or the count is ruined again."
+        else:
+            desc = f"Save buttons now expire after {_format_save_timeout(seconds)}."
+        await ctx.send(embed=discord.Embed(description=desc, color=color))
+
     @_saves.command(name="give")
     async def _saves_give(self, ctx: commands.Context, user: discord.Member, amount: int = 1):
         """Give saves to a user.
@@ -1369,12 +1676,14 @@ class Counting(commands.Cog):
         max_saves = guild_data.get("saves_max_per_user", 3)
         drop_chance = guild_data.get("saves_drop_chance", 0.01)
         threshold = guild_data.get("saves_participation_threshold", 100)
+        timeout_seconds = int(guild_data.get("saves_use_timeout", 60) or 0)
         color = await ctx.embed_color()
         embed = discord.Embed(title="Save System Settings", color=color)
         embed.add_field(name="Status", value="Enabled" if enabled else "Disabled", inline=True)
         embed.add_field(name="Max saves per user", value=str(max_saves), inline=True)
         embed.add_field(name="Drop chance", value=f"{drop_chance:.2%} per valid count", inline=True)
         embed.add_field(name="Participation threshold", value=f"{threshold} lifetime counts", inline=True)
+        embed.add_field(name="Save use timeout", value=_format_save_timeout(timeout_seconds), inline=True)
         await ctx.send(embed=embed)
 
     @commands.command(name="countinginventory", aliases=["cinv", "mysaves"])
@@ -1606,10 +1915,7 @@ class Counting(commands.Cog):
         channel = message.channel
         channel_id = channel.id
 
-        if channel_id not in self._channel_locks:
-            self._channel_locks[channel_id] = asyncio.Lock()
-
-        async with self._channel_locks[channel_id]:
+        async with self._get_channel_lock(channel_id):
             await self._process_counting_message(message, guild, channel, channel_id)
 
     async def _process_counting_message(
@@ -1851,6 +2157,10 @@ class Counting(commands.Cog):
             self.reaction_task.cancel()
         if self.description_update_task and not self.description_update_task.done():
             self.description_update_task.cancel()
+        for task in self._save_expiry_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._save_expiry_tasks.clear()
         log.info(
             "Counting cog unloaded, background tasks stopped, %s counting channel(s) locked",
             locked,
