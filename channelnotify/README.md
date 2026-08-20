@@ -2,6 +2,16 @@
 
 Automatically ping configured roles when any message is sent in specified channels. This is particularly useful for creators posting to social media - when they link an X post, etc., in a channel, roles will be automatically pinged.
 
+Full documentation: [docs/channelnotify.md](../docs/channelnotify.md)
+
+## Installation
+
+```
+[p]repo add wzyss-cogs https://github.com/itswzyss/wzyss-cogs
+[p]cog install wzyss-cogs channelnotify
+[p]load channelnotify
+```
+
 ## Features
 
 - Configure multiple channels with role notifications

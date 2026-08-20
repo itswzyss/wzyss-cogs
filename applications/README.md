@@ -2,12 +2,14 @@
 
 A Red-DiscordBot cog that implements a server application system where new members must apply before gaining full access to the server. Similar to Discord's built-in Server Applications feature.
 
+Command reference: [docs/applications.md](../docs/applications.md)
+
 ## Installation
 
 To install this cog, run the following commands in your Red bot:
 
 ```
-[p]repo add wzyss-cogs https://github.com/yourusername/wzyss-cogs
+[p]repo add wzyss-cogs https://github.com/itswzyss/wzyss-cogs
 [p]cog install wzyss-cogs applications
 [p]load applications
 ```

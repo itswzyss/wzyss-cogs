@@ -2,6 +2,8 @@
 
 Automatically creates voice channels when members join configured "source" voice channels. Supports three VC types: Public (anyone can join), Personal (owner-controlled, visible), and Private (owner-controlled, hidden). Features automatic cleanup, owner claiming, and owner controls through commands and VC chat buttons.
 
+Command reference: [docs/autovc.md](../docs/autovc.md)
+
 ## Installation
 
 To install this cog, run the following commands in your Red bot:

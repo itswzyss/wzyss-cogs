@@ -2,6 +2,8 @@
 
 Manage booster-dependent custom roles and configurable boost notifications.
 
+Cog folder: [boostutils/README.md](../boostutils/README.md)
+
 ## Description
 
 BoostUtils tracks configured custom roles that require entitlement from either:

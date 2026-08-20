@@ -2,6 +2,8 @@
 
 A Red-DiscordBot cog that automatically replaces text using regex.
 
+Full documentation: [docs/textreplace.md](../docs/textreplace.md)
+
 ## Installation
 
 To install this cog, run the following commands in your Red bot:

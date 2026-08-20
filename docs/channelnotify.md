@@ -4,17 +4,20 @@
 
 ## Description
 
-Automatically pings configured roles when any message is sent in specified channels. Useful for creators posting to social media - when they link an X post, etc., in a channel, roles will be pinged. Supports multiple channels and roles per channel with configurable cooldowns.
+When any non-bot message is posted in a watched channel, configured roles are pinged once per cooldown. Typical use: a socials channel where a creator posts a link.
 
 ## Install
 
 ```
 [p]cog install wzyss-cogs channelnotify
+[p]load channelnotify
 ```
+
+Cog folder: [channelnotify/README.md](../channelnotify/README.md)
 
 ## Requirements
 
-None.
+None. The bot needs **Send Messages** and **Mention Roles** in those channels.
 
 ## Tags
 
@@ -22,4 +25,18 @@ notifications, utility, roles, channels
 
 ## Commands
 
-See `[p]help channelnotify` to see available commands.
+`[p]channelnotify` (alias `chnotify`) and `[p]channelnotifyset` (alias `chnotifyset`). Requires **Manage Server**.
+
+| Command | Description |
+|---------|-------------|
+| `[p]channelnotify <channel> <role> [roles…]` | Watch a channel (same as `channelnotifyset add`) |
+| `[p]channelnotifyset add <channel> <role> [roles…]` | Same as above |
+| `[p]channelnotifyset remove <channel>` | Stop watching |
+| `[p]channelnotifyset list` | List channels and roles |
+| `[p]channelnotifyset cooldown <channel> <minutes>` | Per-channel cooldown (default 5) |
+| `[p]channelnotifyset defaultcooldown <minutes>` | Default for newly added channels |
+
+## Notes
+
+- Cooldown is per channel.
+- Deleted roles are skipped when listing.

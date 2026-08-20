@@ -2,13 +2,15 @@
 
 A Red-DiscordBot cog that automatically replaces links with configured alternatives.
 
+Full documentation: [docs/linkreplacer.md](../docs/linkreplacer.md)
+
 ## Installation
 
 To install this cog, run the following commands in your Red bot:
 
 ```
-[p]repo add linkreplacer https://github.com/yourusername/red-discord-link-replacer
-[p]cog install linkreplacer
+[p]repo add wzyss-cogs https://github.com/itswzyss/wzyss-cogs
+[p]cog install wzyss-cogs linkreplacer
 [p]load linkreplacer
 ```
 

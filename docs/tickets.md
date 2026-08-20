@@ -2,6 +2,8 @@
 
 **Short description:** Button-based support tickets with embeds and management controls.
 
+Cog folder: [tickets/README.md](../tickets/README.md)
+
 ## Description
 
 Ticket system with a customizable embed and button to create tickets. Users create tickets only by clicking the "Create ticket" button in the configured panel channel; there are no user-facing prefix or slash commands. Each ticket gets a dedicated channel under a configurable category. Ticket managers can claim and close tickets via buttons. Optional auto-assign (add roles to the ticket after a delay) and inactivity auto-close (close ticket after no messages for a set time) are supported. When a ticket is closed, a transcript can be sent to a configured log channel.

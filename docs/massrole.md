@@ -4,17 +4,20 @@
 
 ## Description
 
-Assign a role to all members of a specific role, or assign a role to everyone on the server. Handles Discord rate limits gracefully with automatic retries.
+Bulk-assign a role to everyone who already has another role, or to every member. Confirms with reactions, tracks progress, and retries on Discord rate limits.
 
 ## Install
 
 ```
 [p]cog install wzyss-cogs massrole
+[p]load massrole
 ```
+
+Cog folder: [massrole/README.md](../massrole/README.md)
 
 ## Requirements
 
-None.
+None. The bot needs **Manage Roles**. The role to assign must be **below** the bot's top role.
 
 ## Tags
 
@@ -22,4 +25,14 @@ roles, utility, moderation
 
 ## Commands
 
-See `[p]help massrole` to see available commands.
+Group `[p]massrole` (alias `mr`). Requires **Manage Roles**.
+
+| Command | Description |
+|---------|-------------|
+| `[p]massrole torole <have_role> <assign_role>` | Assign `assign_role` to everyone who has `have_role` |
+| `[p]massrole toall <assign_role>` | Assign to every member (`ta`, `everyone`) |
+
+## Notes
+
+- React ✅ to confirm or ❌ to cancel (60s).
+- Useful when migrating to an access-role layout.

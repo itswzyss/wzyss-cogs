@@ -2,6 +2,8 @@
 
 **Short description:** Interest buttons on product listings that open private channels and notify sellers.
 
+Cog folder: [listinginterest/README.md](../listinginterest/README.md)
+
 ## Description
 
 Attach an “I’m interested” button to product listings without a storefront. Admins can either have the bot **reply** to a human-posted listing with a button message, or **bind** a button onto a bot-owned message (e.g. after reposting with an embed cog).

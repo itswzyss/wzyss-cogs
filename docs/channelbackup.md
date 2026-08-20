@@ -2,6 +2,8 @@
 
 **Short description:** Backup and restore channel structure, settings, and permissions.
 
+Cog folder: [channelbackup/README.md](../channelbackup/README.md)
+
 ## Description
 
 Creates named backups of a guild's categories, text/news channels, voice channels, stage channels, and forums. Each backup includes channel settings and per-channel / per-category permission overwrites so you can recover from a bad configuration.
