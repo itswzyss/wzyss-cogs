@@ -20,6 +20,7 @@ Install a cog with:
 | [BoosterRole](boosterrole.md) | Track booster custom roles and remove them when a user stops boosting. |
 | [BoostUtils](boostutils.md) | Manage booster-dependent custom roles and configurable boost notifications. |
 | [ChannelBackup](channelbackup.md) | Backup and restore channel structure, settings, and permissions. |
+| [ChannelMigrate](channelmigrate.md) | Copy every message from a channel to a channel in another server for migrations. |
 | [ChannelNotify](channelnotify.md) | Automatically ping roles when messages are sent in configured channels. |
 | [Clear](clear.md) | Clear/purge messages in a channel (by count, after message, between messages, or by user). |
 | [Counting](counting.md) | Count upwards in channels with optional math expressions, ruin mode, and saves. |

@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing ChannelMigrate! Start with `[p]migrate start <source> <destination>`. You need Administrator in both servers, and the bot needs Read Message History in the source and Manage Webhooks in the destination.",
+    "name": "ChannelMigrate",
+    "short": "Copy every message from a channel to a channel in another server for migrations.",
+    "description": "Reposts a channel's full message history, oldest first, into a channel in another server using webhooks that keep each author's name and avatar. Copies attachments, bot embeds, and replies, saves progress after every message so it resumes after restarts, and can keep mirroring new messages live until you stop it. Controlled from a button panel; restricted to members with Administrator in both servers.",
+    "tags": ["migration", "messages", "archive", "webhook", "mirror", "administration"],
+    "requirements": [],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}

@@ -24,6 +24,7 @@ Each cog folder has its own `README.md`. Full command and setup docs live in [`d
 | [BoosterRole](boosterrole/README.md) | Remove a booster's custom role when they stop boosting. [Docs](docs/boosterrole.md) |
 | [BoostUtils](boostutils/README.md) | Tracked booster/linked-role custom roles and boost announcements. [Docs](docs/boostutils.md) |
 | [ChannelBackup](channelbackup/README.md) | Backup and restore channel structure, settings, and permissions. [Docs](docs/channelbackup.md) |
+| [ChannelMigrate](channelmigrate/README.md) | Copy a channel's full message history to another server via webhooks, with optional live mirroring. [Docs](docs/channelmigrate.md) |
 | [ChannelNotify](channelnotify/README.md) | Ping roles when messages are posted in watched channels. [Docs](docs/channelnotify.md) |
 | [Clear](clear/README.md) | Purge messages by count, user, after a message, or between messages. [Docs](docs/clear.md) |
 | [Counting](counting/README.md) | Count upwards with math expressions, ruin mode, and saves. [Docs](docs/counting.md) |
