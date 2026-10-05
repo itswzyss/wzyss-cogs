@@ -34,5 +34,6 @@ Install a cog with:
 | [Remindme](remindme.md) | Set timers and get pinged or DMed when they complete. |
 | [RoleToggle](roletoggle.md) | Post self-role toggle buttons when configured roles are pinged. |
 | [SelfRoles](selfroles.md) | Interactive builder for self-assignable roles with buttons, reactions, and commands. |
+| [ServerTemplate](servertemplate.md) | Back up a server's roles, channels, permissions, and settings and replicate them to other servers. |
 | [TextReplace](textreplace.md) | Replace text using Regex. |
 | [Tickets](tickets.md) | Button-based support tickets with embeds and management controls. |

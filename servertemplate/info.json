@@ -1,0 +1,13 @@
+{
+    "author": ["Wzyss"],
+    "install_msg": "Thank you for installing ServerTemplate! Open the panel with `[p]servertemplate panel`. Only members with the Administrator permission can use it, and the bot needs Administrator to apply templates.",
+    "name": "ServerTemplate",
+    "short": "Back up a server's roles, channels, permissions, and settings and replicate them to other servers.",
+    "description": "Capture a server's roles, categories, channels, permission overwrites, server settings, name/icon, and emojis into templates that are stored across every server the bot is in. Apply a template to any server through an interactive button panel, in Merge mode (update and create) or Replace mode (mirror exactly, deleting extras), with a preview of every change first. Restricted to members with the Administrator permission.",
+    "tags": ["backup", "template", "clone", "roles", "channels", "permissions", "administration"],
+    "requirements": [],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}

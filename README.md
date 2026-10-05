@@ -38,6 +38,7 @@ Each cog folder has its own `README.md`. Full command and setup docs live in [`d
 | [Remindme](remindme/README.md) | Timers with channel ping or DM; presets persist across restarts. [Docs](docs/remindme.md) |
 | [RoleToggle](roletoggle/README.md) | Post a self-role button when a mapped role is pinged. [Docs](docs/roletoggle.md) |
 | [SelfRoles](selfroles/README.md) | Button/reaction/command self-assignable roles with exclusive groups. [Docs](docs/selfroles.md) |
+| [ServerTemplate](servertemplate/README.md) | Back up or clone roles, channels, permissions, and settings across servers. [Docs](docs/servertemplate.md) |
 | [TextReplace](textreplace/README.md) | Regex text replacement via webhook repost. [Docs](docs/textreplace.md) |
 | [Tickets](tickets/README.md) | Button-based support tickets with claim/close and transcripts. [Docs](docs/tickets.md) |
 
